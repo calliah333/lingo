@@ -10,6 +10,11 @@ export type AppPreferences = {
   theme: Theme;
   fontFamily: FontFamily;
   fontSize: number;
+  /** Transcript nickname column width, in characters. */
+  nickWidth: number;
+  /** Custom networks sidebar width in px; `null` uses the responsive default. */
+  sidebarWidth: number | null;
+  sidebarCollapsed: boolean;
   browserNotifications: boolean;
   notificationSound: boolean;
   highlights: string[];
@@ -29,6 +34,10 @@ export type FontFamily = keyof typeof fontFamilies;
 
 export const minFontSize = 10;
 export const maxFontSize = 20;
+export const minNickWidth = 4;
+export const maxNickWidth = 32;
+export const minSidebarWidth = 160;
+export const maxSidebarWidth = 520;
 
 const storageKey = 'lingo-preferences';
 
@@ -42,6 +51,9 @@ const defaults: AppPreferences = {
   theme: 'dark',
   fontFamily: 'default',
   fontSize: 13,
+  nickWidth: 12,
+  sidebarWidth: null,
+  sidebarCollapsed: false,
   browserNotifications: false,
   notificationSound: false,
   highlights: [],
@@ -79,6 +91,11 @@ export function loadPreferences(): AppPreferences {
     fontFamily: isFontFamily(value.fontFamily) ? value.fontFamily : defaults.fontFamily,
     fontSize: typeof value.fontSize === 'number' && Number.isInteger(value.fontSize)
       && value.fontSize >= minFontSize && value.fontSize <= maxFontSize ? value.fontSize : defaults.fontSize,
+    nickWidth: typeof value.nickWidth === 'number' && Number.isInteger(value.nickWidth)
+      && value.nickWidth >= minNickWidth && value.nickWidth <= maxNickWidth ? value.nickWidth : defaults.nickWidth,
+    sidebarWidth: typeof value.sidebarWidth === 'number' && Number.isFinite(value.sidebarWidth)
+      ? clampSidebarWidth(value.sidebarWidth) : defaults.sidebarWidth,
+    sidebarCollapsed: typeof value.sidebarCollapsed === 'boolean' ? value.sidebarCollapsed : defaults.sidebarCollapsed,
     browserNotifications: typeof value.browserNotifications === 'boolean' ? value.browserNotifications : defaults.browserNotifications,
     notificationSound: typeof value.notificationSound === 'boolean' ? value.notificationSound : defaults.notificationSound,
     highlights: [...new Set(highlights.filter((item): item is string => typeof item === 'string')
@@ -93,7 +110,11 @@ export function savePreferences(preferences: AppPreferences): void {
   } catch { /* Browser storage may be unavailable. */ }
 }
 
-/** Theme and fonts live on <html> so styles apply before and outside React. */
+export function clampSidebarWidth(width: number): number {
+  return Math.round(Math.min(maxSidebarWidth, Math.max(minSidebarWidth, width)));
+}
+
+/** Theme, fonts, and layout sizes live on <html> so styles apply before and outside React. */
 export function applyAppearance(preferences: AppPreferences): void {
   const root = document.documentElement;
   root.dataset.theme = preferences.theme;
@@ -101,4 +122,7 @@ export function applyAppearance(preferences: AppPreferences): void {
   if (stack) root.style.setProperty('--mono', stack);
   else root.style.removeProperty('--mono');
   root.style.setProperty('--font-size', `${preferences.fontSize}px`);
+  root.style.setProperty('--nick-width', `${preferences.nickWidth}ch`);
+  if (preferences.sidebarWidth === null) root.style.removeProperty('--sidebar-width');
+  else root.style.setProperty('--sidebar-width', `${preferences.sidebarWidth}px`);
 }

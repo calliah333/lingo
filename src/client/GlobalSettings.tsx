@@ -1,6 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import ThemePicker from './ThemePicker';
-import { fontFamilies, maxFontSize, minFontSize, type AppPreferences, type FontFamily } from './preferences';
+import {
+  fontFamilies, maxFontSize, maxNickWidth, minFontSize, minNickWidth, type AppPreferences, type FontFamily,
+} from './preferences';
 
 type AccountSession = { id: string; createdAt: number; expiresAt: number; current: boolean };
 type GlobalSettingsProps = {
@@ -174,6 +176,12 @@ export default function GlobalSettings({ preferences, onChange, onEnableNotifica
         onChange={(event) => update('fontSize', Number(event.target.value))}>
         {Array.from({ length: maxFontSize - minFontSize + 1 }, (_, index) => minFontSize + index)
           .map((size) => <option key={size} value={size}>{size}px</option>)}
+      </select>
+      <label className="settings-field" htmlFor="nick-width">Nickname column width</label>
+      <select id="nick-width" value={preferences.nickWidth}
+        onChange={(event) => update('nickWidth', Number(event.target.value))}>
+        {Array.from({ length: maxNickWidth - minNickWidth + 1 }, (_, index) => minNickWidth + index)
+          .map((width) => <option key={width} value={width}>{width} characters</option>)}
       </select>
       <label className="settings-checkbox"><input type="checkbox" checked={preferences.coloredNicknames}
         onChange={(event) => update('coloredNicknames', event.target.checked)} /> Colored nicknames</label>

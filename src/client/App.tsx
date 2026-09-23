@@ -1,4 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type MouseEvent as ReactMouseEvent } from 'react';
+import {
+  useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent,
+} from 'react';
 import type {
   Bootstrap, ChannelListStatus, ChannelState, ChatBuffer, ChatMessage, Network, NetworkInput, NetworkStatus, ServerEvent,
 } from '../shared/contracts';
@@ -10,7 +13,9 @@ import { BanListDialog, IgnoreListDialog, WhoisDialog } from './Dialogs';
 import MentionComposer from './MentionComposer';
 import GlobalSettings from './GlobalSettings';
 import NetworkSettings from './NetworkSettings';
-import { applyAppearance, loadPreferences, savePreferences, type AppPreferences } from './preferences';
+import {
+  applyAppearance, clampSidebarWidth, loadPreferences, maxSidebarWidth, minSidebarWidth, savePreferences, type AppPreferences,
+} from './preferences';
 import SearchPanel from './SearchPanel';
 import Transcript from './Transcript';
 import ThemePicker from './ThemePicker';
@@ -72,7 +77,8 @@ function sameChannel(left: string, right: string): boolean {
 function isJoined(network: Network | undefined, channel: string): boolean {
   return !!network?.autojoin.some((name) => sameChannel(name, channel));
 }
-
+/** Matches the stylesheet breakpoint where the networks sidebar becomes a drawer. */
+const drawerLayout = '(max-width: 640px)';
 
 function savedIds(key: string): number[] {
   try {
@@ -101,6 +107,7 @@ export default function App() {
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [drawerSidebar, setDrawerSidebar] = useState(() => window.matchMedia(drawerLayout).matches);
   const [joinNetworkId, setJoinNetworkId] = useState<number | null>(null);
   const [collapsedNetworks, setCollapsedNetworks] = useState<number[]>(() => savedIds('lingo-collapsed-networks'));
   const [hiddenBuffers, setHiddenBuffers] = useState<number[]>(() => savedIds('lingo-hidden-buffers'));
@@ -161,6 +168,7 @@ export default function App() {
   const channelStateVersion = useRef(0);
   const olderRequest = useRef<{ bufferId: number; controller: AbortController } | null>(null);
   const audioContext = useRef<AudioContext | null>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
 
   const activeBuffer = buffers.find((buffer) => buffer.id === selectedId);
   const selectedChannelId = activeBuffer?.kind === 'channel' ? activeBuffer.id : null;
@@ -185,6 +193,51 @@ export default function App() {
     const rect = event.currentTarget.getBoundingClientRect();
     const pointer = event.clientX !== 0 || event.clientY !== 0;
     setMenu({ ...subject, x: pointer ? event.clientX : rect.left, y: pointer ? event.clientY : rect.bottom });
+  }
+
+  function toggleSidebar() {
+    if (drawerSidebar) {
+      setSidebarOpen((open) => !open);
+      setGlobalSettingsOpen(false);
+    } else setPreferences((current) => ({ ...current, sidebarCollapsed: !current.sidebarCollapsed }));
+  }
+
+  /** Drag writes the CSS variable directly and commits once on release, so the app does not re-render per pointer move. */
+  function startSidebarResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const sidebar = sidebarRef.current;
+    if (event.button !== 0 || !sidebar) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    const root = document.documentElement;
+    const startX = event.clientX;
+    const startWidth = sidebar.getBoundingClientRect().width;
+    let width = clampSidebarWidth(startWidth);
+    const move = (moveEvent: PointerEvent) => {
+      width = clampSidebarWidth(startWidth + moveEvent.clientX - startX);
+      root.style.setProperty('--sidebar-width', `${width}px`);
+    };
+    const end = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', end);
+      handle.removeEventListener('pointercancel', end);
+      root.classList.remove('sidebar-resizing');
+      setPreferences((current) => ({ ...current, sidebarWidth: width }));
+    };
+    handle.setPointerCapture(event.pointerId);
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+    root.classList.add('sidebar-resizing');
+  }
+
+  function resizeSidebarWithKeys(event: ReactKeyboardEvent<HTMLDivElement>) {
+    const current = sidebarRef.current?.getBoundingClientRect().width;
+    if (current === undefined) return;
+    const next = event.key === 'ArrowLeft' ? current - 16 : event.key === 'ArrowRight' ? current + 16
+      : event.key === 'Home' ? minSidebarWidth : event.key === 'End' ? maxSidebarWidth : null;
+    if (next === null) return;
+    event.preventDefault();
+    setPreferences((prefs) => ({ ...prefs, sidebarWidth: clampSidebarWidth(next) }));
   }
 
   const refreshBootstrap = useCallback(async (signal?: AbortSignal) => {
@@ -219,6 +272,15 @@ export default function App() {
     applyAppearance(preferences);
     savePreferences(preferences);
   }, [preferences]);
+  useEffect(() => {
+    const media = window.matchMedia(drawerLayout);
+    const update = () => {
+      setDrawerSidebar(media.matches);
+      if (!media.matches) setSidebarOpen(false);
+    };
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
   useEffect(() => {
     try {
       localStorage.setItem('lingo-collapsed-networks', JSON.stringify(collapsedNetworks));
@@ -1053,8 +1115,10 @@ export default function App() {
   return <div className="app-shell">
     <header className="topbar">
       <div className="topbar-left">
-        <button className="icon-button mobile-menu" type="button" aria-label="Toggle networks" aria-expanded={sidebarOpen}
-          onClick={() => { setSidebarOpen((open) => !open); setGlobalSettingsOpen(false); }}>☰</button>
+        <button className="icon-button sidebar-toggle" type="button" aria-controls="networks-sidebar"
+          aria-label={drawerSidebar ? 'Toggle networks' : preferences.sidebarCollapsed ? 'Show networks' : 'Hide networks'}
+          title={drawerSidebar ? undefined : preferences.sidebarCollapsed ? 'Show networks' : 'Hide networks'}
+          aria-expanded={drawerSidebar ? sidebarOpen : !preferences.sidebarCollapsed} onClick={toggleSidebar}>☰</button>
         <span className="brand">lingo<span className="brand-cursor">_</span></span>
         <span className={`transport transport-${connection}`} role="status" aria-label={`Live updates ${connection}`}>
           <span className="status-dot" />{connection === 'live' ? 'live' : connection === 'offline' ? 'reconnecting' : 'connecting'}
@@ -1073,9 +1137,14 @@ export default function App() {
     </header>
     <div className="workspace">
       {sidebarOpen && <button className="sidebar-scrim" type="button" aria-label="Close networks" onClick={() => setSidebarOpen(false)} />}
-      <aside className={`sidebar${sidebarOpen ? ' sidebar-open' : ''}`} aria-label="Networks and buffers">
-        <div className="sidebar-heading"><span>NETWORKS</span><button type="button" className="icon-button" aria-label="Add network" title="Add network"
-          onClick={() => { setSettingsTarget('new'); setSearchOpen(false); setGlobalSettingsOpen(false); setSidebarOpen(false); }}>+</button></div>
+      <aside id="networks-sidebar" ref={sidebarRef} aria-label="Networks and buffers"
+        className={`sidebar${sidebarOpen ? ' sidebar-open' : ''}${preferences.sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
+        <div className="sidebar-heading"><span>NETWORKS</span><div className="sidebar-heading-actions">
+          <button type="button" className="icon-button" aria-label="Add network" title="Add network"
+            onClick={() => { setSettingsTarget('new'); setSearchOpen(false); setGlobalSettingsOpen(false); setSidebarOpen(false); }}>+</button>
+          <button type="button" className="icon-button sidebar-collapse" aria-label="Hide networks" title="Hide networks"
+            onClick={toggleSidebar}>«</button>
+        </div></div>
         {networks.length === 0 && <div className="sidebar-empty">No networks yet.<button className="text-button" type="button"
           onClick={() => { setSettingsTarget('new'); setSearchOpen(false); setGlobalSettingsOpen(false); setSidebarOpen(false); }}>Set one up →</button></div>}
         {networks.map((network) => {
@@ -1162,6 +1231,11 @@ export default function App() {
           </section>;
         })}
       </aside>
+      {!preferences.sidebarCollapsed && <div className="sidebar-resizer" role="separator" aria-orientation="vertical"
+        aria-label="Resize networks" aria-controls="networks-sidebar" tabIndex={0}
+        aria-valuemin={minSidebarWidth} aria-valuemax={maxSidebarWidth} aria-valuenow={preferences.sidebarWidth ?? undefined}
+        title="Drag to resize · double-click to reset" onPointerDown={startSidebarResize} onKeyDown={resizeSidebarWithKeys}
+        onDoubleClick={() => setPreferences((current) => ({ ...current, sidebarWidth: null }))} />}
       <main className="main-pane">
         {notice && <div className="notice" role="alert"><span>{notice}</span><button className="icon-button" type="button" aria-label="Dismiss error" onClick={() => setNotice('')}>×</button></div>}
         {settingsTarget !== null ? <div className="panel-scroll"><NetworkSettings key={settingsTarget} network={settingsNetwork}
