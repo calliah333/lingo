@@ -1,5 +1,7 @@
 import { Client, type IrcEvent } from 'irc-framework';
 import type {
+  ChannelState,
+  ChannelUser,
   ChatBuffer,
   ChatMessage,
   MentionCandidate,
@@ -18,12 +20,23 @@ type Runtime = {
   retryCount: number;
   retryTimer: NodeJS.Timeout | null;
   joined: Set<string>;
-  liveUsers: Map<string, Set<string>>;
+  channels: Map<string, { topic: string | null; users: Map<string, { nick: string; modes: string[] }> }>;
+  listRemaining: number;
+  listCount: number;
 };
 
 function isChannel(name: string): boolean {
   return /^[#&+!][^\s,\x00-\x1f\x7f]+$/.test(name);
 }
+function channelsFrom(input: string): string[] {
+  const channels = input.split(/[\s,]+/).filter(Boolean);
+  if (/^\s*,|,\s*,|,\s*$/.test(input) ||
+    !channels.length || channels.length > 20 || channels.some(name => !isChannel(name) || name.length > 100) ||
+    new Set(channels.map(name => name.toLowerCase())).size !== channels.length)
+    throw new Error('Usage: /join #channel[,#channel]');
+  return channels;
+}
+
 
 function safeToken(value: string): boolean {
   return !!value && !/[:\s,\x00-\x1f\x7f]/.test(value);
@@ -43,6 +56,7 @@ export class IrcManager {
   private readonly statuses = new Map<number, NetworkStatus>();
   private readonly knownBuffers = new Set<number>();
   private started = false;
+  private browserPresent = false;
 
   constructor(
     private readonly store: Store,
@@ -77,93 +91,164 @@ export class IrcManager {
       retryCount: 0,
       retryTimer: null,
       joined: new Set(),
-      liveUsers: new Map(),
+      channels: new Map(),
+      listRemaining: -1,
+      listCount: 0,
     };
     this.connections.set(network.id, runtime);
     this.setStatus(runtime, 'connecting');
     this.serverBuffer(network.id);
 
     client.on('registered', (event: IrcEvent) => {
-      if (!runtime.active) return;
+      if (!runtime.active || runtime.registered) return;
       runtime.registered = true;
       runtime.retryCount = 0;
       this.setStatus(runtime, 'connected', event.nick || client.user.nick);
+      this.connectionMarker(runtime, 'connected');
+      this.applyAway(runtime);
       this.onRegistered(runtime);
     });
     client.on('close', () => {
       if (!runtime.active) return;
+      if (runtime.registered) this.connectionMarker(runtime, 'disconnected');
       runtime.registered = false;
+      this.clearChannels(runtime);
+      runtime.joined.clear();
+      runtime.listRemaining = -1;
       this.scheduleRetry(runtime, 'Connection lost');
     });
     client.on('privmsg', (event: IrcEvent) => this.incoming(runtime, 'privmsg', event));
     client.on('notice', (event: IrcEvent) => this.incoming(runtime, 'notice', event));
     client.on('action', (event: IrcEvent) => this.incoming(runtime, 'action', event));
+    client.on('motd', (event: { motd?: string; error?: string }) => {
+      if (!runtime.active || !event.motd) return;
+      const buffer = this.serverBuffer(network.id);
+      for (const line of event.motd.split(/\r?\n/)) {
+        const text = line.replace(/^- /, '');
+        if (text) this.message(buffer, 'system', null, text, Date.now(), { fromNetwork: true, isMotd: true });
+      }
+    });
     client.on('userlist', (event: IrcEvent) => {
       if (!runtime.active || !event.channel || !Array.isArray(event.users)) return;
-      const users = new Set<string>();
+      const key = event.channel.toLowerCase();
+      if (!runtime.joined.has(key)) return;
+      const state = this.liveChannel(runtime, key);
+      state.users.clear();
       for (const user of event.users) {
-        if (user?.nick) users.add(user.nick);
+        if (!user?.nick) continue;
+        state.users.set(user.nick.toLowerCase(), { nick: user.nick, modes: [...new Set(user.modes ?? [])] });
       }
-      runtime.liveUsers.set(event.channel.toLowerCase(), users);
+      this.publishChannel(runtime, event.channel);
     });
     client.on('join', (event: IrcEvent) => {
       if (!runtime.active || !event.channel || !event.nick) return;
       const key = event.channel.toLowerCase();
-      const users = runtime.liveUsers.get(key) ?? new Set<string>();
-      users.add(event.nick);
-      runtime.liveUsers.set(key, users);
-      if (!client.caseCompare(event.nick, client.user.nick)) return;
-      runtime.joined.add(key);
-      const buffer = this.ensureBuffer(network.id, event.channel, 'channel');
-      this.system(buffer, `Joined ${event.channel}`, eventTime(event));
+      const self = client.caseCompare(event.nick, client.user.nick);
+      if (self) {
+        runtime.joined.add(key);
+        const buffer = this.ensureBuffer(network.id, event.channel, 'channel');
+        this.system(buffer, `Joined ${event.channel}`, eventTime(event), true);
+        // Some networks omit topic or NAMES from the automatic JOIN burst.
+        client.raw('TOPIC', event.channel);
+        client.raw('NAMES', event.channel);
+      }
+      if (!runtime.joined.has(key)) return;
+      this.liveChannel(runtime, key).users.set(event.nick.toLowerCase(), { nick: event.nick, modes: [] });
+      this.publishChannel(runtime, event.channel);
     });
     client.on('part', (event: IrcEvent) => {
       if (!runtime.active || !event.channel || !event.nick) return;
       const key = event.channel.toLowerCase();
-      const users = runtime.liveUsers.get(key);
-      if (users) {
-        this.deleteNick(client, users, event.nick);
-        if (users.size === 0) runtime.liveUsers.delete(key);
+      if (client.caseCompare(event.nick, client.user.nick)) {
+        runtime.joined.delete(key);
+        this.clearChannel(runtime, key);
+      } else if (this.deleteNick(client, runtime.channels.get(key)?.users, event.nick)) {
+        this.publishChannel(runtime, event.channel);
       }
-      if (!client.caseCompare(event.nick, client.user.nick)) return;
-      runtime.joined.delete(key);
-      runtime.liveUsers.delete(key);
     });
     client.on('quit', (event: IrcEvent) => {
       if (!runtime.active || !event.nick) return;
-      for (const [channel, users] of runtime.liveUsers) {
-        this.deleteNick(client, users, event.nick);
-        if (users.size === 0) runtime.liveUsers.delete(channel);
+      for (const [channel, state] of runtime.channels) {
+        if (this.deleteNick(client, state.users, event.nick)) this.publishChannel(runtime, channel);
       }
     });
     client.on('kick', (event: IrcEvent) => {
       if (!runtime.active || !event.channel || !event.kicked) return;
       const key = event.channel.toLowerCase();
-      const users = runtime.liveUsers.get(key);
-      if (users) {
-        this.deleteNick(client, users, event.kicked);
-        if (users.size === 0) runtime.liveUsers.delete(key);
-      }
       if (client.caseCompare(event.kicked, client.user.nick)) {
         runtime.joined.delete(key);
-        runtime.liveUsers.delete(key);
+        this.clearChannel(runtime, key);
+      } else if (this.deleteNick(client, runtime.channels.get(key)?.users, event.kicked)) {
+        this.publishChannel(runtime, event.channel);
       }
     });
     client.on('nick', (event: IrcEvent) => {
       if (!runtime.active || !event.nick || !event.new_nick) return;
-      for (const users of runtime.liveUsers.values()) {
-        if (this.deleteNick(client, users, event.nick)) users.add(event.new_nick);
+      for (const [channel, state] of runtime.channels) {
+        const user = this.deleteNick(client, state.users, event.nick);
+        if (user) {
+          state.users.set(event.new_nick.toLowerCase(), { ...user, nick: event.new_nick });
+          this.publishChannel(runtime, channel);
+        }
       }
       if (client.caseCompare(event.nick, runtime.status.nick)) {
         this.setStatus(runtime, runtime.status.state, event.new_nick);
-        const buffer = this.serverBuffer(network.id);
-        this.system(buffer, `You are now known as ${event.new_nick}`, eventTime(event));
+        this.system(this.serverBuffer(network.id), `You are now known as ${event.new_nick}`, eventTime(event), true);
       }
     });
+    client.on('mode', (event: IrcEvent) => {
+      if (!runtime.active || !event.target || !event.modes) return;
+      const state = runtime.channels.get(event.target.toLowerCase());
+      if (!state) return;
+      let changed = false;
+      for (const change of event.modes) {
+        const mode = change.mode?.slice(1);
+        if (!mode || !client.network.options.PREFIX.some(prefix => prefix.mode === mode) || !change.param) continue;
+        let user: { nick: string; modes: string[] } | undefined;
+        for (const entry of state.users.values()) {
+          if (client.caseCompare(entry.nick, change.param)) { user = entry; break; }
+        }
+        if (!user) continue;
+        const before = user.modes.includes(mode);
+        if (change.mode[0] === '+' && !before) { user.modes.push(mode); changed = true; }
+        if (change.mode[0] === '-' && before) {
+          user.modes.splice(user.modes.indexOf(mode), 1);
+          changed = true;
+        }
+      }
+      if (changed) this.publishChannel(runtime, event.target);
+    });
     client.on('topic', (event: IrcEvent) => {
-      if (!runtime.active || !event.nick || !event.channel) return;
-      const buffer = this.channelBuffer(network.id, event.channel);
-      if (buffer) this.system(buffer, `${event.nick} changed the topic to: ${event.topic || '(none)'}`, eventTime(event));
+      if (!runtime.active || !event.channel || typeof event.topic !== 'string') return;
+      const state = runtime.channels.get(event.channel.toLowerCase());
+      if (state && state.topic !== event.topic) {
+        state.topic = event.topic;
+        this.publishChannel(runtime, event.channel);
+      }
+      if (event.nick && state) {
+        const buffer = this.channelBuffer(network.id, event.channel);
+        if (buffer) this.system(buffer, `${event.nick} changed the topic to: ${event.topic || '(none)'}`, eventTime(event), true);
+      }
+    });
+    client.on<IrcEvent[]>('channel list', (entries) => {
+      if (!runtime.active || runtime.listRemaining <= 0) return;
+      const buffer = this.serverBuffer(network.id);
+      for (const entry of entries) {
+        if (!runtime.listRemaining) break;
+        if (!entry.channel) continue;
+        const count = Number.isFinite(entry.num_users) ? entry.num_users : 0;
+        const topic = (entry.topic ?? '').replace(/[\r\n\0]/g, ' ').slice(0, 250);
+        this.system(buffer, `${entry.channel} — ${count} users${topic ? ` — ${topic}` : ''}`, Date.now(), true);
+        runtime.listRemaining--;
+        runtime.listCount++;
+      }
+    });
+    client.on('channel list end', () => {
+      if (!runtime.active || runtime.listRemaining < 0) return;
+      this.system(this.serverBuffer(network.id),
+        `LIST complete: ${runtime.listCount} channel${runtime.listCount === 1 ? '' : 's'} shown${runtime.listRemaining === 0 ? ' (limit reached)' : ''}`,
+        Date.now());
+      runtime.listRemaining = -1;
     });
     client.on('sasl failed', () => {
       if (runtime.active) this.setStatus(runtime, runtime.status.state, undefined, 'SASL authentication failed');
@@ -175,9 +260,11 @@ export class IrcManager {
   disconnect(id: number): void {
     const runtime = this.connections.get(id);
     if (!runtime) return;
+    if (runtime.registered) this.connectionMarker(runtime, 'disconnected');
     runtime.active = false;
     runtime.registered = false;
     clearTimeout(runtime.retryTimer ?? undefined);
+    this.clearChannels(runtime);
     runtime.retryTimer = null;
     this.connections.delete(id);
     // end() cancels irc-framework's ping/reconnect timers; disposing the transport also
@@ -198,19 +285,75 @@ export class IrcManager {
       network.id, { ...(this.statuses.get(network.id) ?? { state: 'disconnected', nick: network.nick }) },
     ]));
   }
+  setBrowserPresence(present: boolean): void {
+    if (this.browserPresent === present) return;
+    this.browserPresent = present;
+    for (const runtime of this.connections.values()) this.applyAway(runtime);
+  }
+
+  updateAwayMessage(): void {
+    if (!this.browserPresent) {
+      for (const runtime of this.connections.values()) this.applyAway(runtime);
+    }
+  }
+
+  private applyAway(runtime: Runtime): void {
+    if (!runtime.registered || !runtime.active) return;
+    const message = this.browserPresent ? '' : this.store.getAwayMessage();
+    runtime.client.raw(message ? `AWAY :${message}` : 'AWAY');
+  }
+
+  private connectionMarker(runtime: Runtime, event: 'connected' | 'disconnected'): void {
+    const time = Date.now();
+    for (const buffer of this.store.listBuffers()) {
+      if (buffer.networkId !== runtime.network.id) continue;
+      this.message(buffer, 'system', null,
+        event === 'connected' ? 'Connected' : 'Disconnected', time, { connectionEvent: event });
+    }
+  }
+
+  channelState(bufferId: number): ChannelState {
+    const buffer = this.store.getBuffer(bufferId);
+    if (!buffer || buffer.kind !== 'channel') throw new Error('Channel not found');
+    const runtime = this.connections.get(buffer.networkId);
+    const state = runtime?.channels.get(buffer.name.toLowerCase());
+    const prefixes = runtime?.client.network.options.PREFIX ?? [];
+    const users: ChannelUser[] = [...(state?.users.values() ?? [])].map(user => ({
+      nick: user.nick,
+      modes: [...user.modes],
+      prefix: prefixes.find(prefix => user.modes.includes(prefix.mode))?.symbol ?? '',
+    }));
+    const rank = (user: ChannelUser) => {
+      const index = prefixes.findIndex(prefix => prefix.symbol === user.prefix);
+      return index < 0 ? prefixes.length : index;
+    };
+    users.sort((a, b) => rank(a) - rank(b) || a.nick.localeCompare(b.nick, undefined, { sensitivity: 'base' }));
+    return { bufferId, topic: state?.topic ?? null, users };
+  }
+
+  setTopic(bufferId: number, topic: string): void {
+    if (typeof topic !== 'string' || Buffer.byteLength(topic, 'utf8') > 390 || /[\r\n\0]/.test(topic))
+      throw new Error('Invalid topic');
+    const buffer = this.store.getBuffer(bufferId);
+    if (!buffer || buffer.kind !== 'channel') throw new Error('Channel not found');
+    const runtime = this.connections.get(buffer.networkId);
+    if (!runtime?.registered || !runtime.joined.has(buffer.name.toLowerCase()) ||
+      !runtime.channels.has(buffer.name.toLowerCase())) throw new Error('Channel is not connected');
+    runtime.client.setTopic(buffer.name, topic);
+  }
 
   listLiveParticipants(bufferId: number): MentionCandidate[] {
     const buffer = this.store.getBuffer(bufferId);
     if (!buffer || buffer.kind !== 'channel') return [];
     const runtime = this.connections.get(buffer.networkId);
     if (!runtime) return [];
-    const users = runtime.liveUsers.get(buffer.name.toLowerCase());
+    const users = runtime.channels.get(buffer.name.toLowerCase())?.users;
     if (!users) return [];
     const network = this.store.getNetwork(buffer.networkId) ?? runtime.network;
     const relayNicks = new Set(network.relayNicks.map(nick => nick.toLowerCase()));
     const displayNames = network.displayNames;
     const participants: MentionCandidate[] = [];
-    for (const mention of users) {
+    for (const { nick: mention } of users.values()) {
       if (relayNicks.has(mention.toLowerCase())) continue;
       let name = mention;
       for (const source in displayNames) {
@@ -225,13 +368,36 @@ export class IrcManager {
     return participants;
   }
 
-  private deleteNick(client: Client, users: Set<string>, nick: string): boolean {
-    for (const current of users) {
-      if (!client.caseCompare(current, nick)) continue;
-      users.delete(current);
-      return true;
+  private liveChannel(runtime: Runtime, key: string): { topic: string | null; users: Map<string, { nick: string; modes: string[] }> } {
+    let state = runtime.channels.get(key);
+    if (!state) {
+      state = { topic: null, users: new Map() };
+      runtime.channels.set(key, state);
     }
-    return false;
+    return state;
+  }
+
+  private publishChannel(runtime: Runtime, channel: string): void {
+    const buffer = this.channelBuffer(runtime.network.id, channel);
+    if (buffer) this.publish({ type: 'channel_state', state: this.channelState(buffer.id) });
+  }
+
+  private clearChannel(runtime: Runtime, channel: string): void {
+    if (runtime.channels.delete(channel)) this.publishChannel(runtime, channel);
+  }
+
+  private clearChannels(runtime: Runtime): void {
+    for (const channel of runtime.channels.keys()) this.clearChannel(runtime, channel);
+  }
+
+  private deleteNick(client: Client, users: Map<string, { nick: string; modes: string[] }> | undefined,
+    nick: string): { nick: string; modes: string[] } | undefined {
+    if (!users) return;
+    for (const [key, user] of users) {
+      if (!client.caseCompare(user.nick, nick)) continue;
+      users.delete(key);
+      return user;
+    }
   }
 
   forgetBuffer(id: number): void {
@@ -239,22 +405,35 @@ export class IrcManager {
   }
 
   join(networkId: number, channel: string): void {
-    if (!isChannel(channel)) throw new Error('Enter a valid channel name');
+    this.joinMany(networkId, [channel]);
+  }
+
+  joinMany(networkId: number, channels: string[]): ChatBuffer[] {
+    if (!channels.length || channels.length > 20 || channels.some(name => !isChannel(name) || name.length > 100) ||
+      new Set(channels.map(name => name.toLowerCase())).size !== channels.length)
+      throw new Error('Enter valid, distinct channel names (up to 20)');
     const network = this.store.getNetwork(networkId);
     if (!network) throw new Error('Network not found');
     const runtime = this.connections.get(networkId);
-    this.ensureBuffer(networkId, channel, 'channel');
-    const key = channel.toLowerCase();
-    if (!network.autojoin.some(name => name.toLowerCase() === key)) {
+    const saved = new Set(network.autojoin.map(name => name.toLowerCase()));
+    const additions = channels.filter(name => !saved.has(name.toLowerCase()));
+    if (network.autojoin.length + additions.length > 100) throw new Error('Too many autojoined channels');
+    if (additions.length) {
       const updated = this.store.updateNetwork(networkId, {
-        ...network, autojoin: [...network.autojoin, channel],
+        ...network, autojoin: [...network.autojoin, ...additions],
       })!;
       if (runtime) runtime.network = updated;
     }
-    if (runtime?.registered && !runtime.joined.has(key)) {
-      runtime.joined.add(key);
-      runtime.client.join(channel);
+    const buffers = channels.map(channel => this.ensureBuffer(networkId, channel, 'channel'));
+    if (runtime?.registered) {
+      for (const channel of channels) {
+        const key = channel.toLowerCase();
+        if (runtime.joined.has(key)) continue;
+        runtime.joined.add(key);
+        runtime.client.join(channel);
+      }
     }
+    return buffers;
   }
 
   part(bufferId: number): void {
@@ -271,6 +450,7 @@ export class IrcManager {
     }
     if (runtime?.registered && runtime.joined.has(key)) runtime.client.part(buffer.name);
     runtime?.joined.delete(key);
+    if (runtime) this.clearChannel(runtime, key);
   }
 
   send(bufferId: number, text: string): void {
@@ -299,8 +479,15 @@ export class IrcManager {
     const args = space < 0 ? '' : text.slice(space + 1).trim();
     switch (command) {
       case 'join': {
-        if (!isChannel(args)) throw new Error('Usage: /join #channel');
-        this.join(runtime.network.id, args);
+        this.joinMany(runtime.network.id, channelsFrom(args));
+        return;
+      }
+      case 'list': {
+        if (args && (args.length > 100 || !safeToken(args))) throw new Error('Usage: /list [mask]');
+        if (runtime.listRemaining >= 0) throw new Error('Channel list already in progress');
+        runtime.listRemaining = 100;
+        runtime.listCount = 0;
+        runtime.client.raw('LIST', ...(args ? [args] : []));
         return;
       }
       case 'part': {
@@ -399,11 +586,19 @@ export class IrcManager {
   private incoming(runtime: Runtime, kind: 'privmsg' | 'notice' | 'action', event: IrcEvent): void {
     if (!runtime.active || !event.message || !event.target) return;
     if (event.nick && runtime.client.caseCompare(event.nick, runtime.status.nick)) return;
-    const name = isChannel(event.target) ? event.target : event.nick;
+    // irc-framework parses bare server prefixes such as `:mock` as nick values.
+    // A server NOTICE addressed to our nick has no user/host mask, so retain it
+    // in the server buffer even when `from_server` is false.
+    const serverNotice = kind === 'notice' &&
+      runtime.client.caseCompare(event.target, runtime.status.nick) &&
+      !event.ident && !event.hostname;
+    const fromNetwork = !!event.from_server || serverNotice;
+    const name = isChannel(event.target) ? event.target : fromNetwork ? undefined : event.nick;
     const buffer = name
       ? this.ensureBuffer(runtime.network.id, name, isChannel(event.target) ? 'channel' : 'query')
       : this.serverBuffer(runtime.network.id);
-    this.message(buffer, kind, event.nick || null, event.message, eventTime(event));
+    this.message(buffer, kind, event.nick || null, event.message, eventTime(event),
+      fromNetwork ? { fromNetwork: true } : {});
   }
 
   private ensureBuffer(networkId: number, name: string, kind: ChatBuffer['kind']): ChatBuffer {
@@ -433,17 +628,17 @@ export class IrcManager {
     nick: string | null,
     text: string,
     time: number,
+    metadata: Pick<ChatMessage, 'fromNetwork' | 'connectionEvent' | 'isMotd'> = {},
   ): void {
     const message = this.store.appendMessage({
-      networkId: buffer.networkId, bufferId: buffer.id, kind, nick, text, time,
+      networkId: buffer.networkId, bufferId: buffer.id, kind, nick, text, time, ...metadata,
     });
     this.publish({ type: 'message', message });
   }
 
-  private system(buffer: ChatBuffer, text: string, time: number): void {
-    this.message(buffer, 'system', null, text, time);
+  private system(buffer: ChatBuffer, text: string, time: number, fromNetwork = false): void {
+    this.message(buffer, 'system', null, text, time, fromNetwork ? { fromNetwork: true } : {});
   }
-
 
   private setStatus(runtime: Runtime, state: NetworkStatus['state'], nick = runtime.status.nick, error?: string): void {
     runtime.status = { state, nick, ...(error ? { error } : {}) };
@@ -453,8 +648,9 @@ export class IrcManager {
 
   private dial(runtime: Runtime, config = this.store.getNetworkConfig(runtime.network.id)): void {
     if (!runtime.active || !config) return;
+    this.clearChannels(runtime);
     runtime.joined.clear();
-    runtime.liveUsers.clear();
+    runtime.listRemaining = -1;
     this.setStatus(runtime, runtime.retryCount ? 'reconnecting' : 'connecting');
     try {
       runtime.client.connect({

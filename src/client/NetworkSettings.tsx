@@ -82,12 +82,24 @@ export default function NetworkSettings({
   onClose,
 }: NetworkSettingsProps) {
   const [fields, setFields] = useState<Fields>(emptyFields);
+  const [optionalOpen, setOptionalOpen] = useState(() => Boolean(network && (
+    network.username || network.realname || network.saslAccount || network.autojoin.length || network.commands.length
+  )));
+  const [advancedOpen, setAdvancedOpen] = useState(() => Boolean(network && (
+    network.relayNicks.length || network.mentionAliases.length || Object.keys(network.displayNames).length
+  )));
   const [validationError, setValidationError] = useState('');
   const [saveError, setSaveError] = useState('');
   const [deleteError, setDeleteError] = useState('');
   const [pending, setPending] = useState<'save' | 'delete' | null>(null);
 
   useEffect(() => {
+    setOptionalOpen(Boolean(network && (
+      network.username || network.realname || network.saslAccount || network.autojoin.length || network.commands.length
+    )));
+    setAdvancedOpen(Boolean(network && (
+      network.relayNicks.length || network.mentionAliases.length || Object.keys(network.displayNames).length
+    )));
     if (!network) {
       setFields(emptyFields());
       return;
@@ -133,6 +145,7 @@ export default function NetworkSettings({
 
     const displayNames = parseDisplayNames(fields.displayNames);
     if (typeof displayNames === 'string') {
+      setAdvancedOpen(true);
       setValidationError(displayNames);
       return;
     }
@@ -191,9 +204,15 @@ export default function NetworkSettings({
         </button>
       </header>
       <form className="settings-form" onSubmit={submit} noValidate>
-        <div className="settings-field">
-          <label htmlFor="network-name">Network name</label>
-          <input id="network-name" name="name" autoComplete="off" required value={fields.name} onChange={(event) => update('name', event.target.value)} />
+        <div className="settings-row">
+          <div className="settings-field">
+            <label htmlFor="network-name">Network name</label>
+            <input id="network-name" name="name" autoComplete="off" required value={fields.name} onChange={(event) => update('name', event.target.value)} />
+          </div>
+          <div className="settings-field">
+            <label htmlFor="network-nick">Nickname</label>
+            <input id="network-nick" name="nick" autoComplete="username" required value={fields.nick} onChange={(event) => update('nick', event.target.value)} />
+          </div>
         </div>
         <div className="settings-row">
           <div className="settings-field">
@@ -209,56 +228,58 @@ export default function NetworkSettings({
           <input id="network-tls" name="tls" type="checkbox" checked={fields.tls} onChange={(event) => update('tls', event.target.checked)} />
           Use TLS
         </label>
-        <div className="settings-field">
-          <label htmlFor="network-nick">Nickname</label>
-          <input id="network-nick" name="nick" autoComplete="username" required value={fields.nick} onChange={(event) => update('nick', event.target.value)} />
-        </div>
-        <div className="settings-row">
+        <details className="settings-optional" open={optionalOpen} onToggle={(event) => setOptionalOpen(event.currentTarget.open)}>
+          <summary>Connection options <span className="muted">(optional)</span></summary>
+          <div className="settings-row">
+            <div className="settings-field">
+              <label htmlFor="network-username">Username <span className="muted">(optional)</span></label>
+              <input id="network-username" name="username" autoComplete="off" value={fields.username} onChange={(event) => update('username', event.target.value)} />
+            </div>
+            <div className="settings-field">
+              <label htmlFor="network-realname">Real name <span className="muted">(optional)</span></label>
+              <input id="network-realname" name="realname" autoComplete="name" value={fields.realname} onChange={(event) => update('realname', event.target.value)} />
+            </div>
+          </div>
+          <fieldset className="settings-group">
+            <legend>SASL authentication <span className="muted">(optional)</span></legend>
+            <div className="settings-field">
+              <label htmlFor="network-sasl-account">SASL account</label>
+              <input id="network-sasl-account" name="saslAccount" autoComplete="off" value={fields.saslAccount} onChange={(event) => update('saslAccount', event.target.value)} />
+            </div>
+            <div className="settings-field">
+              <label htmlFor="network-sasl-password">SASL password</label>
+              <input id="network-sasl-password" name="saslPassword" type="password" autoComplete="new-password" value={fields.saslPassword} placeholder={network ? 'Leave blank to keep saved password' : ''} onChange={(event) => update('saslPassword', event.target.value)} />
+            </div>
+          </fieldset>
           <div className="settings-field">
-            <label htmlFor="network-username">Username <span className="muted">(optional)</span></label>
-            <input id="network-username" name="username" autoComplete="off" value={fields.username} onChange={(event) => update('username', event.target.value)} />
+            <label htmlFor="network-autojoin">Autojoin channels</label>
+            <textarea id="network-autojoin" name="autojoin" rows={3} value={fields.autojoin} onChange={(event) => update('autojoin', event.target.value)} aria-describedby="autojoin-help" />
+            <span className="settings-help" id="autojoin-help">One channel per line, for example #general.</span>
           </div>
           <div className="settings-field">
-            <label htmlFor="network-realname">Real name <span className="muted">(optional)</span></label>
-            <input id="network-realname" name="realname" autoComplete="name" value={fields.realname} onChange={(event) => update('realname', event.target.value)} />
+            <label htmlFor="network-commands">Registration commands</label>
+            <textarea id="network-commands" name="commands" rows={3} value={fields.commands} onChange={(event) => update('commands', event.target.value)} aria-describedby="commands-help" />
+            <span className="settings-help" id="commands-help">Run after connecting, one IRC command per line.</span>
           </div>
-        </div>
-        <fieldset className="settings-group">
-          <legend>SASL authentication <span className="muted">(optional)</span></legend>
+        </details>
+        <details className="settings-advanced" open={advancedOpen} onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}>
+          <summary>Advanced</summary>
           <div className="settings-field">
-            <label htmlFor="network-sasl-account">SASL account</label>
-            <input id="network-sasl-account" name="saslAccount" autoComplete="off" value={fields.saslAccount} onChange={(event) => update('saslAccount', event.target.value)} />
+            <label htmlFor="network-relay-nicks">Relay bridge nicknames</label>
+            <textarea id="network-relay-nicks" name="relayNicks" rows={3} value={fields.relayNicks} onChange={(event) => update('relayNicks', event.target.value)} aria-describedby="relay-nicks-help" />
+            <span className="settings-help" id="relay-nicks-help">One relay bot nickname per line. Relay messages appear as [username] message or &lt;username&gt; message.</span>
           </div>
           <div className="settings-field">
-            <label htmlFor="network-sasl-password">SASL password</label>
-            <input id="network-sasl-password" name="saslPassword" type="password" autoComplete="new-password" value={fields.saslPassword} placeholder={network ? 'Leave blank to keep saved password' : ''} onChange={(event) => update('saslPassword', event.target.value)} />
+            <label htmlFor="network-mention-aliases">Mention aliases</label>
+            <textarea id="network-mention-aliases" name="mentionAliases" rows={3} value={fields.mentionAliases} onChange={(event) => update('mentionAliases', event.target.value)} aria-describedby="mention-aliases-help" />
+            <span className="settings-help" id="mention-aliases-help">One name per line that should highlight you; include your bridge handle.</span>
           </div>
-        </fieldset>
-        <div className="settings-field">
-          <label htmlFor="network-autojoin">Autojoin channels</label>
-          <textarea id="network-autojoin" name="autojoin" rows={3} value={fields.autojoin} onChange={(event) => update('autojoin', event.target.value)} aria-describedby="autojoin-help" />
-          <span className="settings-help" id="autojoin-help">One channel per line, for example #general.</span>
-        </div>
-        <div className="settings-field">
-          <label htmlFor="network-commands">Registration commands</label>
-          <textarea id="network-commands" name="commands" rows={3} value={fields.commands} onChange={(event) => update('commands', event.target.value)} aria-describedby="commands-help" />
-          <span className="settings-help" id="commands-help">Run after connecting, one IRC command per line.</span>
-        </div>
-        <div className="settings-field">
-          <label htmlFor="network-relay-nicks">Relay bridge nicknames</label>
-          <textarea id="network-relay-nicks" name="relayNicks" rows={3} value={fields.relayNicks} onChange={(event) => update('relayNicks', event.target.value)} aria-describedby="relay-nicks-help" />
-          <span className="settings-help" id="relay-nicks-help">One relay bot nickname per line. Relay messages appear as [username] message or &lt;username&gt; message.</span>
-        </div>
-        <div className="settings-field">
-          <label htmlFor="network-mention-aliases">Mention aliases</label>
-          <textarea id="network-mention-aliases" name="mentionAliases" rows={3} value={fields.mentionAliases} onChange={(event) => update('mentionAliases', event.target.value)} aria-describedby="mention-aliases-help" />
-          <span className="settings-help" id="mention-aliases-help">One name per line that should highlight you; include your bridge handle.</span>
-        </div>
-        <div className="settings-field">
-          <label htmlFor="network-display-names">Display name overrides</label>
-          <textarea id="network-display-names" name="displayNames" rows={3} value={fields.displayNames} onChange={(event) => update('displayNames', event.target.value)} aria-describedby="display-names-help" />
-          <span className="settings-help" id="display-names-help">One override per line: ircNick = Friendly name.</span>
-        </div>
+          <div className="settings-field">
+            <label htmlFor="network-display-names">Display name overrides</label>
+            <textarea id="network-display-names" name="displayNames" rows={3} value={fields.displayNames} onChange={(event) => update('displayNames', event.target.value)} aria-describedby="display-names-help" />
+            <span className="settings-help" id="display-names-help">One override per line: ircNick = Friendly name.</span>
+          </div>
+        </details>
         {validationError && <p className="settings-error" role="alert">{validationError}</p>}
         {saveError && <p className="settings-error" role="alert">Could not save network: {saveError}</p>}
         {deleteError && <p className="settings-error" role="alert">Could not delete network: {deleteError}</p>}

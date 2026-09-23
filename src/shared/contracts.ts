@@ -43,6 +43,21 @@ export interface ChatMessage {
   nick: string | null;
   text: string;
   time: number;
+  fromNetwork?: boolean;
+  connectionEvent?: 'connected' | 'disconnected';
+  isMotd?: true;
+}
+
+export interface ChannelUser {
+  nick: string;
+  prefix: string;
+  modes: string[];
+}
+
+export interface ChannelState {
+  bufferId: number;
+  topic: string | null;
+  users: ChannelUser[];
 }
 
 export interface NetworkStatus {
@@ -56,7 +71,8 @@ export type ServerEvent =
   | { type: 'buffer'; buffer: ChatBuffer }
   | { type: 'buffer_removed'; bufferId: number }
   | { type: 'network'; networkId: number; status: NetworkStatus }
-  | { type: 'network_removed'; networkId: number };
+  | { type: 'network_removed'; networkId: number }
+  | { type: 'channel_state'; state: ChannelState };
 
 export interface Bootstrap {
   networks: Network[];

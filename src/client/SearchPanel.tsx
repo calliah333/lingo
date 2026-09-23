@@ -7,24 +7,38 @@ type SearchResponse = {
   messages: ChatMessage[];
   hasMore: boolean;
 };
+const TIME_RANGES = {
+  day: 24 * 60 * 60 * 1000,
+  week: 7 * 24 * 60 * 60 * 1000,
+  month: 30 * 24 * 60 * 60 * 1000,
+} as const;
+
 
 type SearchPanelProps = {
   networks: Network[];
+  initialBufferId?: number;
   buffers: ChatBuffer[];
   onClose: () => void;
   onJump: (message: ChatMessage) => void;
 };
 
-export default function SearchPanel({ networks, buffers, onClose, onJump }: SearchPanelProps) {
+export default function SearchPanel({ networks, buffers, initialBufferId, onClose, onJump }: SearchPanelProps) {
   const [input, setInput] = useState('');
   const [query, setQuery] = useState('');
-  const [networkId, setNetworkId] = useState('');
-  const [bufferId, setBufferId] = useState('');
+  const [networkId, setNetworkId] = useState(() => {
+    const buffer = buffers.find((item) => item.id === initialBufferId);
+    return buffer ? String(buffer.networkId) : '';
+  });
+  const [bufferId, setBufferId] = useState(() =>
+    buffers.some((buffer) => buffer.id === initialBufferId) ? String(initialBufferId) : '',
+  );
+  const [timeScope, setTimeScope] = useState<'any' | keyof typeof TIME_RANGES>('any');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const requestId = useRef(0);
+  const boundsRef = useRef<{ since: number; until: number } | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
   const loadingMore = useRef(false);
   const resultsRef = useRef<HTMLDivElement>(null);
@@ -39,6 +53,7 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
     requestId.current += 1;
     activeRequest.current?.abort();
     activeRequest.current = null;
+    boundsRef.current = null;
     loadingMore.current = false;
     setMessages([]);
     setHasMore(false);
@@ -57,13 +72,7 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
   }, [input]);
 
   useEffect(() => {
-    if (!query) {
-      setMessages([]);
-      setHasMore(false);
-      setLoading(false);
-      setError('');
-      return;
-    }
+    if (!query || query !== input.trim()) return;
 
     const controller = new AbortController();
     activeRequest.current?.abort();
@@ -72,7 +81,14 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
     const params = new URLSearchParams({ q: query, limit: '50' });
     if (networkId) params.set('networkId', networkId);
     if (bufferId) params.set('bufferId', bufferId);
-
+    let bounds: { since: number; until: number } | null = null;
+    if (timeScope !== 'any') {
+      const until = Date.now();
+      bounds = { since: until - TIME_RANGES[timeScope], until };
+      params.set('since', String(bounds.since));
+      params.set('until', String(bounds.until));
+    }
+    boundsRef.current = bounds;
     setMessages([]);
     setHasMore(false);
     setError('');
@@ -96,7 +112,7 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
       });
 
     return () => controller.abort();
-  }, [query, networkId, bufferId]);
+  }, [query, input, networkId, bufferId, timeScope]);
   const loadMore = async () => {
     const lastMessage = messages[messages.length - 1];
     if (!query || !hasMore || !lastMessage || loading || loadingMore.current) return;
@@ -109,6 +125,11 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
     const params = new URLSearchParams({ q: query, before: String(lastMessage.id), limit: '50' });
     if (networkId) params.set('networkId', networkId);
     if (bufferId) params.set('bufferId', bufferId);
+    const bounds = boundsRef.current;
+    if (bounds) {
+      params.set('since', String(bounds.since));
+      params.set('until', String(bounds.until));
+    }
     setLoading(true);
     setError('');
 
@@ -191,6 +212,22 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
                 {networkNames.get(buffer.networkId) ?? 'Network'} · {buffer.name}
               </option>
             ))}
+          </select>
+        </label>
+        <label className="search-panel__filter-label">
+          <span>Time</span>
+          <select
+            className="search-panel__filter"
+            value={timeScope}
+            onChange={(event) => {
+              resetResults();
+              setTimeScope(event.target.value as typeof timeScope);
+            }}
+          >
+            <option value="any">Any time</option>
+            <option value="day">Past day</option>
+            <option value="week">Past week</option>
+            <option value="month">Past month</option>
           </select>
         </label>
       </div>

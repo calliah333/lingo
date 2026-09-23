@@ -16,17 +16,22 @@ declare module 'irc-framework' {
     new_nick?: string;
     target?: string;
     channel?: string;
-    users?: Array<{ nick: string }>;
+    users?: Array<{ nick: string; modes?: string[] }>;
     kicked?: string;
     topic?: string;
     message?: string;
     time?: number;
+    ident?: string;
+    hostname?: string;
+    modes?: Array<{ mode: string; param?: string }>;
+    num_users?: number;
     from_server?: boolean;
   }
 
   export class Client {
     readonly connected: boolean;
     readonly user: { nick: string };
+    readonly network: { options: { PREFIX: Array<{ symbol: string; mode: string }> } };
     readonly connection: {
       end(data?: string): void;
       clearTimers(): void;
@@ -43,6 +48,7 @@ declare module 'irc-framework' {
     notice(target: string, message: string): void;
     action(target: string, message: string): void;
     setTopic(channel: string, topic: string): void;
+    list(mask?: string): void;
     raw(command: string, ...args: string[]): void;
   }
 }

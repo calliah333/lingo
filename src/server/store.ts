@@ -44,6 +44,9 @@ type MessageRow = {
   nick: string | null;
   text: string;
   time: number;
+  from_network: number;
+  connection_event: ChatMessage['connectionEvent'] | null;
+  is_motd: number;
 };
 
 function networkFromRow(row: NetworkRow): Network {
@@ -78,6 +81,9 @@ function messageFromRow(row: MessageRow): ChatMessage {
     nick: row.nick,
     text: row.text,
     time: row.time,
+    ...(row.from_network ? { fromNetwork: true } : {}),
+    ...(row.connection_event ? { connectionEvent: row.connection_event } : {}),
+    ...(row.is_motd ? { isMotd: true as const } : {}),
   };
 }
 
@@ -107,8 +113,8 @@ export class Store {
       throw new Error('Could not read database schema version');
     }
     const version = versionRow.user_version;
-    if (version > 2) throw new Error(`Unsupported database schema version ${version}`);
-    if (version === 2) return;
+    if (version > 3) throw new Error(`Unsupported database schema version ${version}`);
+    if (version === 3) return;
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -171,14 +177,28 @@ export class Store {
           INSERT INTO messages_fts(rowid, text, nick) VALUES (new.id, new.text, new.nick);
         END;
         `);
-      } else {
+      } else if (version === 1) {
         this.db.exec(`
           ALTER TABLE networks ADD COLUMN relay_nicks TEXT NOT NULL DEFAULT '[]';
           ALTER TABLE networks ADD COLUMN mention_aliases TEXT NOT NULL DEFAULT '[]';
           ALTER TABLE networks ADD COLUMN display_names TEXT NOT NULL DEFAULT '{}';
         `);
       }
-      this.db.exec('PRAGMA user_version = 2');
+      this.db.exec(`
+        ALTER TABLE messages ADD COLUMN from_network INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE messages ADD COLUMN connection_event TEXT
+          CHECK (connection_event IN ('connected', 'disconnected'));
+        ALTER TABLE messages ADD COLUMN is_motd INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE sessions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+        UPDATE sessions SET created_at = MAX(0, expires_at - 2592000000);
+        CREATE TABLE account_settings (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          password_hash TEXT,
+          away_message TEXT NOT NULL DEFAULT 'Away'
+        );
+        INSERT INTO account_settings (id) VALUES (1);
+      `);
+      this.db.exec('PRAGMA user_version = 3');
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -268,9 +288,11 @@ export class Store {
 
   appendMessage(input: Omit<ChatMessage, 'id'>): ChatMessage {
     const result = this.db.query(`
-      INSERT INTO messages (network_id, buffer_id, kind, nick, text, time)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(input.networkId, input.bufferId, input.kind, input.nick, input.text, input.time);
+      INSERT INTO messages (network_id, buffer_id, kind, nick, text, time,
+                            from_network, connection_event, is_motd)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(input.networkId, input.bufferId, input.kind, input.nick, input.text, input.time,
+      Number(input.fromNetwork === true), input.connectionEvent ?? null, Number(input.isMotd === true));
     return { id: Number(result.lastInsertRowid), ...input };
   }
 
@@ -318,7 +340,7 @@ export class Store {
 
   searchMessages(
     query: string,
-    filters: { networkId?: number; bufferId?: number; before?: number; limit?: number },
+    filters: { networkId?: number; bufferId?: number; before?: number; limit?: number; since?: number; until?: number },
   ): { messages: ChatMessage[]; hasMore: boolean } {
     // SQLite's FTS5 parser treats an embedded NUL as the end of the query string.
     const text = query.replaceAll('\0', ' ').trim();
@@ -330,17 +352,28 @@ export class Store {
       SELECT m.* FROM messages_fts JOIN messages AS m ON m.id = messages_fts.rowid
       WHERE messages_fts MATCH ? AND m.network_id = COALESCE(?, m.network_id)
         AND m.buffer_id = COALESCE(?, m.buffer_id) AND m.id < ?
+        AND (? IS NULL OR m.time >= ?) AND (? IS NULL OR m.time <= ?)
       ORDER BY m.id DESC LIMIT ?
     `).all(literal, filters.networkId ?? null, filters.bufferId ?? null,
-      filters.before ?? Number.MAX_SAFE_INTEGER, size + 1) as MessageRow[];
+      filters.before ?? Number.MAX_SAFE_INTEGER, filters.since ?? null, filters.since ?? null,
+      filters.until ?? null, filters.until ?? null, size + 1) as MessageRow[];
     return { messages: rows.slice(0, size).map(messageFromRow), hasMore: rows.length > size };
   }
 
-  createSession(tokenHash: string, expiresAt: number): void {
+  createSession(tokenHash: string, expiresAt: number, createdAt = Date.now()): void {
     this.db.query(`
-      INSERT INTO sessions (token_hash, expires_at) VALUES (?, ?)
-      ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at
-    `).run(tokenHash, expiresAt);
+      INSERT INTO sessions (token_hash, expires_at, created_at) VALUES (?, ?, ?)
+      ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at,
+        created_at = excluded.created_at
+    `).run(tokenHash, expiresAt, createdAt);
+  }
+
+  listSessions(now: number): Array<{ id: string; createdAt: number; expiresAt: number }> {
+    return (this.db.query(`
+      SELECT token_hash, created_at, expires_at FROM sessions
+      WHERE expires_at > ? ORDER BY created_at DESC, token_hash
+    `).all(now) as Array<{ token_hash: string; created_at: number; expires_at: number }>)
+      .map(row => ({ id: row.token_hash, createdAt: row.created_at, expiresAt: row.expires_at }));
   }
 
   hasSession(tokenHash: string, now: number): boolean {
@@ -350,6 +383,31 @@ export class Store {
 
   deleteSession(tokenHash: string): void {
     this.db.query('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+  }
+
+  revokeOtherSessions(currentHash: string, passwordHash: string): void {
+    this.db.transaction(() => {
+      this.db.query('UPDATE account_settings SET password_hash = ? WHERE id = 1').run(passwordHash);
+      this.db.query('DELETE FROM sessions WHERE token_hash != ?').run(currentHash);
+    })();
+  }
+
+  getPasswordHash(): string | null {
+    const row = this.db.query('SELECT password_hash FROM account_settings WHERE id = 1')
+      .get() as { password_hash: string | null } | null;
+    if (!row) throw new Error('Account settings missing');
+    return row.password_hash;
+  }
+
+  getAwayMessage(): string {
+    const row = this.db.query('SELECT away_message FROM account_settings WHERE id = 1')
+      .get() as { away_message: string } | null;
+    if (!row) throw new Error('Account settings missing');
+    return row.away_message;
+  }
+
+  setAwayMessage(message: string): void {
+    this.db.query('UPDATE account_settings SET away_message = ? WHERE id = 1').run(message);
   }
 
   pruneSessions(now: number): void {
