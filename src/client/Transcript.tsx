@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { ChatBuffer, ChatMessage, Network } from '../shared/contracts';
 import { displayIdentity, mentionRanges } from '../shared/identity';
+import { nicknameColor } from './nickColor';
 import type { AppPreferences } from './preferences';
 import type { Theme } from './ThemePicker';
 
@@ -30,16 +31,6 @@ type TranscriptRow =
   | { type: 'message'; key: string; message: ChatMessage };
 
 type Anchor = { id: number; top: number };
-
-function nicknameColor(nick: string, theme: Theme): string {
-  let hash = 2166136261;
-  for (let i = 0; i < nick.length; i += 1) {
-    hash ^= nick.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  const hue = (hash >>> 0) % 360;
-  return `hsl(${hue} 67% ${theme === 'light' ? '27%' : '69%'})`;
-}
 
 function localDay(time: number): string {
   const date = new Date(time);

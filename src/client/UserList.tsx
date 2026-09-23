@@ -1,5 +1,7 @@
 import { useMemo, useState, type MouseEvent } from 'react';
 import type { ChannelUser } from '../shared/contracts';
+import { nicknameColor } from './nickColor';
+import type { Theme } from './ThemePicker';
 
 type UserListProps = {
   channel: string;
@@ -7,16 +9,44 @@ type UserListProps = {
   users: ChannelUser[] | null;
   message: string;
   open: boolean;
+  /** Color nicks like the transcript; `null` leaves them uncolored. */
+  nickTheme: Theme | null;
   onClose: () => void;
   onUserMenu: (nick: string, x: number, y: number) => void;
 };
 
-export default function UserList({ channel, users, message, open, onClose, onUserMenu }: UserListProps) {
+const roleNames: Record<string, string> = {
+  '~': 'Owners',
+  '&': 'Admins',
+  '@': 'Operators',
+  '%': 'Half-operators',
+  '+': 'Voiced',
+  '': 'Users',
+};
+
+type RoleGroup = { prefix: string; label: string; users: ChannelUser[] };
+
+/** Users arrive ranked by the server's PREFIX order, so groups keep first-seen order. */
+function groupByRole(users: ChannelUser[]): RoleGroup[] {
+  const groups = new Map<string, RoleGroup>();
+  for (const user of users) {
+    let group = groups.get(user.prefix);
+    if (!group) {
+      group = { prefix: user.prefix, label: roleNames[user.prefix] ?? `Mode ${user.prefix}`, users: [] };
+      groups.set(user.prefix, group);
+    }
+    group.users.push(user);
+  }
+  return [...groups.values()];
+}
+
+export default function UserList({ channel, users, message, open, nickTheme, onClose, onUserMenu }: UserListProps) {
   const [query, setQuery] = useState('');
   const filtered = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     return !users || !needle ? users : users.filter((user) => user.nick.toLocaleLowerCase().includes(needle));
   }, [users, query]);
+  const groups = useMemo(() => filtered && groupByRole(filtered), [filtered]);
 
   function openMenu(event: MouseEvent<HTMLButtonElement>, nick: string) {
     event.preventDefault();
@@ -36,18 +66,25 @@ export default function UserList({ channel, users, message, open, onClose, onUse
       <input id="user-search" type="search" value={query} placeholder="Search users…" autoComplete="off"
         disabled={!users} onChange={(event) => setQuery(event.target.value)} />
     </div>
-    {!filtered ? <p className="user-panel__status" role="status">{message}</p>
-      : !filtered.length ? <p className="user-panel__status">{query ? 'No matching users' : 'No users'}</p>
-        : <ul className="user-panel__list">
-          {filtered.map((user) => <li key={user.nick}>
-            <button type="button" className="user-entry" title={`${user.nick} — click for actions`}
-              onContextMenu={(event) => openMenu(event, user.nick)}
-              onClick={(event) => openMenu(event, user.nick)}>
-              <span className="channel-user-prefix" data-prefix={user.prefix}>{user.prefix}</span>
-              <span className="user-entry__nick">{user.nick}</span>
-            </button>
-          </li>)}
-        </ul>}
+    {!groups ? <p className="user-panel__status" role="status">{message}</p>
+      : !groups.length ? <p className="user-panel__status">{query ? 'No matching users' : 'No users'}</p>
+        : <div className="user-panel__list">
+          {groups.map((group) => <section className="user-group" key={group.prefix}
+            aria-label={`${group.label}: ${group.users.length}`}>
+            <h3 className="user-group__heading">{group.label} · {group.users.length}</h3>
+            <ul>
+              {group.users.map((user) => <li key={user.nick}>
+                <button type="button" className="user-entry" title={`${user.nick} — click for actions`}
+                  onContextMenu={(event) => openMenu(event, user.nick)}
+                  onClick={(event) => openMenu(event, user.nick)}>
+                  <span className="channel-user-prefix" data-prefix={user.prefix}>{user.prefix}</span>
+                  <span className="user-entry__nick"
+                    style={nickTheme ? { color: nicknameColor(user.nick, nickTheme) } : undefined}>{user.nick}</span>
+                </button>
+              </li>)}
+            </ul>
+          </section>)}
+        </div>}
     {filtered && query && users && filtered.length !== users.length
       && <p className="user-panel__footer">{filtered.length} of {users.length} shown</p>}
   </aside>;

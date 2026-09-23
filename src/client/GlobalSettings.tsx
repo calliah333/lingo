@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import ThemePicker from './ThemePicker';
-import type { AppPreferences } from './preferences';
+import { fontFamilies, maxFontSize, minFontSize, type AppPreferences, type FontFamily } from './preferences';
 
 type AccountSession = { id: string; createdAt: number; expiresAt: number; current: boolean };
 type GlobalSettingsProps = {
@@ -164,6 +164,17 @@ export default function GlobalSettings({ preferences, onChange, onEnableNotifica
     <section className="global-settings__section" aria-labelledby="appearance-heading">
       <h3 id="appearance-heading">Appearance</h3>
       <ThemePicker theme={preferences.theme} onChange={(theme) => update('theme', theme)} />
+      <label className="settings-field" htmlFor="font-family">Font</label>
+      <select id="font-family" value={preferences.fontFamily}
+        onChange={(event) => update('fontFamily', event.target.value as FontFamily)}>
+        {Object.entries(fontFamilies).map(([value, { label }]) => <option key={value} value={value}>{label}</option>)}
+      </select>
+      <label className="settings-field" htmlFor="font-size">Font size</label>
+      <select id="font-size" value={preferences.fontSize}
+        onChange={(event) => update('fontSize', Number(event.target.value))}>
+        {Array.from({ length: maxFontSize - minFontSize + 1 }, (_, index) => minFontSize + index)
+          .map((size) => <option key={size} value={size}>{size}px</option>)}
+      </select>
       <label className="settings-checkbox"><input type="checkbox" checked={preferences.coloredNicknames}
         onChange={(event) => update('coloredNicknames', event.target.checked)} /> Colored nicknames</label>
       <label className="settings-checkbox"><input type="checkbox" checked={preferences.showSeconds}

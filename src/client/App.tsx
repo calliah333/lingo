@@ -10,7 +10,7 @@ import { BanListDialog, IgnoreListDialog, WhoisDialog } from './Dialogs';
 import MentionComposer from './MentionComposer';
 import GlobalSettings from './GlobalSettings';
 import NetworkSettings from './NetworkSettings';
-import { loadPreferences, savePreferences, type AppPreferences } from './preferences';
+import { applyAppearance, loadPreferences, savePreferences, type AppPreferences } from './preferences';
 import SearchPanel from './SearchPanel';
 import Transcript from './Transcript';
 import ThemePicker from './ThemePicker';
@@ -216,7 +216,7 @@ export default function App() {
     return () => controller.abort();
   }, [refreshBootstrap]);
   useEffect(() => {
-    document.documentElement.dataset.theme = preferences.theme;
+    applyAppearance(preferences);
     savePreferences(preferences);
   }, [preferences]);
   useEffect(() => {
@@ -1185,7 +1185,6 @@ export default function App() {
         : selected ? <>
           <header className="conversation-header">
             <div className="conversation-title">
-              <span className="conversation-overline">{activeNetwork?.name ?? 'Network'} <span className="divider">/</span> {selected.kind}</span>
               {renameTarget && renameTarget.networkId === activeNetwork?.id && <form className="nick-rename" onSubmit={(event) => {
                 event.preventDefault();
                 void renameNick(renameTarget.nick, renameValue);
@@ -1261,6 +1260,7 @@ export default function App() {
         {usersPanelOpen && <button className="user-panel-scrim" type="button" aria-label="Close users"
           onClick={() => setUsersPanelOpen(false)} />}
         <UserList key={selected.id} channel={selected.name} open={usersPanelOpen} onClose={() => setUsersPanelOpen(false)}
+          nickTheme={preferences.coloredNicknames ? preferences.theme : null}
           users={selectedDetails?.state?.users ?? null}
           message={!selectedJoined ? 'Users are unavailable while parted.'
             : !channelConnected ? `Users are unavailable while ${selectedState}.`
