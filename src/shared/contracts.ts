@@ -66,16 +66,63 @@ export interface NetworkStatus {
   error?: string;
 }
 
+export interface ChannelListEntry {
+  name: string;
+  users: number;
+  topic: string;
+}
+
+/** `idle`: no LIST requested on this connection; `loading`: results are still arriving. */
+export interface ChannelListStatus {
+  networkId: number;
+  state: 'idle' | 'loading' | 'complete';
+  total: number;
+  updatedAt: number | null;
+}
+
+/** Channels matching the query, sorted by user count (descending), then name. */
+export type ChannelListPage = ChannelListStatus & {
+  matched: number;
+  channels: ChannelListEntry[];
+};
+
+export interface WhoisInfo {
+  nick: string;
+  found: boolean;
+  ident?: string;
+  hostname?: string;
+  realName?: string;
+  account?: string;
+  server?: string;
+  serverInfo?: string;
+  channels?: string;
+  away?: string;
+  operator?: string;
+  secure?: boolean;
+  idleSeconds?: number;
+  signonTime?: number;
+}
+
+export interface BanEntry {
+  mask: string;
+  setBy: string;
+  setAt: number | null;
+}
+
 export type ServerEvent =
   | { type: 'message'; message: ChatMessage }
   | { type: 'buffer'; buffer: ChatBuffer }
   | { type: 'buffer_removed'; bufferId: number }
+  | { type: 'history_cleared'; bufferId: number }
   | { type: 'network'; networkId: number; status: NetworkStatus }
   | { type: 'network_removed'; networkId: number }
-  | { type: 'channel_state'; state: ChannelState };
+  | { type: 'channel_state'; state: ChannelState }
+  | { type: 'channel_list'; status: ChannelListStatus }
+  | { type: 'ignores'; networkId: number; ignores: string[] };
 
 export interface Bootstrap {
   networks: Network[];
   buffers: ChatBuffer[];
   statuses: Record<number, NetworkStatus>;
+  ignores: Record<number, string[]>;
 }

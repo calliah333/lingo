@@ -19,6 +19,8 @@ type TranscriptProps = {
   onLoadOlder: () => Promise<void>;
   onRetry: () => void;
   onRename: (mentionTarget: string, displayName: string) => void;
+  /** Opens user actions for the IRC nick behind a message (the relayed nick for bridged users). */
+  onNickMenu: (nick: string, x: number, y: number) => void;
   preferences: AppPreferences;
   theme: Theme;
 };
@@ -62,6 +64,7 @@ export default function Transcript({
   onLoadOlder,
   onRetry,
   onRename,
+  onNickMenu,
   preferences,
   theme,
 }: TranscriptProps) {
@@ -357,9 +360,15 @@ export default function Transcript({
               ref={virtualizer.measureElement} style={rowStyle}>
               <time className="message-time" dateTime={dateTimeLabel(message.time)}>{timeFormatter.format(new Date(message.time))}</time>
               {nick && message.kind !== 'system' ? (
-                <button className="message-nick" type="button" title={`Rename ${identity.mentionTarget ?? nick}`}
+                <button className="message-nick" type="button" title={`Rename ${identity.mentionTarget ?? nick} (right-click for actions)`}
                   style={{ color: nickColor, border: 0, padding: 0, background: 'transparent', font: 'inherit', cursor: 'pointer' }}
-                  onClick={() => onRename(identity.mentionTarget ?? nick, nick)}>{nick}</button>
+                  onClick={() => onRename(identity.mentionTarget ?? nick, nick)}
+                  onContextMenu={message.fromNetwork ? undefined : (event) => {
+                    event.preventDefault();
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    const pointer = event.clientX !== 0 || event.clientY !== 0;
+                    onNickMenu(identity.mentionTarget ?? nick, pointer ? event.clientX : rect.left, pointer ? event.clientY : rect.bottom);
+                  }}>{nick}</button>
               ) : <span className="message-nick">{message.kind === 'system' ? '*' : ''}</span>}
               <span className="message-text">
                 {message.fromNetwork ? <span className="message-network-info" role="img" aria-label="From IRC network" title="From IRC network">ⓘ</span> : null}

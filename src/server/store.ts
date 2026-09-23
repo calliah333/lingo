@@ -113,97 +113,110 @@ export class Store {
       throw new Error('Could not read database schema version');
     }
     const version = versionRow.user_version;
-    if (version > 3) throw new Error(`Unsupported database schema version ${version}`);
-    if (version === 3) return;
+    if (version > 4) throw new Error(`Unsupported database schema version ${version}`);
+    if (version === 4) return;
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      if (version === 0) {
-        this.db.exec(`
-        CREATE TABLE networks (
-          id INTEGER PRIMARY KEY,
-          name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-          host TEXT NOT NULL,
-          port INTEGER NOT NULL,
-          tls INTEGER NOT NULL,
-          nick TEXT NOT NULL,
-          username TEXT NOT NULL,
-          realname TEXT NOT NULL,
-          sasl_account TEXT NOT NULL,
-          sasl_password TEXT NOT NULL,
-          autojoin TEXT NOT NULL,
-          commands TEXT NOT NULL,
-          relay_nicks TEXT NOT NULL DEFAULT '[]',
-          mention_aliases TEXT NOT NULL DEFAULT '[]',
-          display_names TEXT NOT NULL DEFAULT '{}'
-        );
-        CREATE TABLE buffers (
-          id INTEGER PRIMARY KEY,
-          network_id INTEGER NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
-          name TEXT NOT NULL,
-          name_key TEXT NOT NULL,
-          kind TEXT NOT NULL CHECK (kind IN ('server', 'channel', 'query')),
-          UNIQUE(network_id, kind, name_key),
-          UNIQUE(id, network_id)
-        );
-        CREATE TABLE messages (
-          id INTEGER PRIMARY KEY,
-          network_id INTEGER NOT NULL,
-          buffer_id INTEGER NOT NULL,
-          kind TEXT NOT NULL CHECK (kind IN ('privmsg', 'notice', 'action', 'system')),
-          nick TEXT,
-          text TEXT NOT NULL,
-          time INTEGER NOT NULL,
-          FOREIGN KEY (buffer_id, network_id) REFERENCES buffers(id, network_id) ON DELETE CASCADE
-        );
-        CREATE INDEX messages_buffer_history ON messages(buffer_id, id DESC);
-        CREATE INDEX messages_network_history ON messages(network_id, id DESC);
-        CREATE TABLE sessions (
-          token_hash TEXT PRIMARY KEY,
-          expires_at INTEGER NOT NULL
-        );
-        CREATE INDEX sessions_expiration ON sessions(expires_at);
-        CREATE VIRTUAL TABLE messages_fts USING fts5(text, nick, content='messages', content_rowid='id');
-        CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
-          INSERT INTO messages_fts(rowid, text, nick) VALUES (new.id, new.text, new.nick);
-        END;
-        CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
-          INSERT INTO messages_fts(messages_fts, rowid, text, nick)
-            VALUES ('delete', old.id, old.text, old.nick);
-        END;
-        CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
-          INSERT INTO messages_fts(messages_fts, rowid, text, nick)
-            VALUES ('delete', old.id, old.text, old.nick);
-          INSERT INTO messages_fts(rowid, text, nick) VALUES (new.id, new.text, new.nick);
-        END;
-        `);
-      } else if (version === 1) {
-        this.db.exec(`
-          ALTER TABLE networks ADD COLUMN relay_nicks TEXT NOT NULL DEFAULT '[]';
-          ALTER TABLE networks ADD COLUMN mention_aliases TEXT NOT NULL DEFAULT '[]';
-          ALTER TABLE networks ADD COLUMN display_names TEXT NOT NULL DEFAULT '{}';
-        `);
-      }
+      if (version < 3) this.migrateToV3(version);
       this.db.exec(`
-        ALTER TABLE messages ADD COLUMN from_network INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE messages ADD COLUMN connection_event TEXT
-          CHECK (connection_event IN ('connected', 'disconnected'));
-        ALTER TABLE messages ADD COLUMN is_motd INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE sessions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
-        UPDATE sessions SET created_at = MAX(0, expires_at - 2592000000);
-        CREATE TABLE account_settings (
-          id INTEGER PRIMARY KEY CHECK (id = 1),
-          password_hash TEXT,
-          away_message TEXT NOT NULL DEFAULT 'Away'
+        ALTER TABLE networks ADD COLUMN disconnected INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE ignores (
+          network_id INTEGER NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
+          nick TEXT NOT NULL,
+          nick_key TEXT NOT NULL,
+          PRIMARY KEY (network_id, nick_key)
         );
-        INSERT INTO account_settings (id) VALUES (1);
       `);
-      this.db.exec('PRAGMA user_version = 3');
+      this.db.exec('PRAGMA user_version = 4');
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  private migrateToV3(version: number): void {
+    if (version === 0) {
+      this.db.exec(`
+      CREATE TABLE networks (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        tls INTEGER NOT NULL,
+        nick TEXT NOT NULL,
+        username TEXT NOT NULL,
+        realname TEXT NOT NULL,
+        sasl_account TEXT NOT NULL,
+        sasl_password TEXT NOT NULL,
+        autojoin TEXT NOT NULL,
+        commands TEXT NOT NULL,
+        relay_nicks TEXT NOT NULL DEFAULT '[]',
+        mention_aliases TEXT NOT NULL DEFAULT '[]',
+        display_names TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE TABLE buffers (
+        id INTEGER PRIMARY KEY,
+        network_id INTEGER NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        name_key TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('server', 'channel', 'query')),
+        UNIQUE(network_id, kind, name_key),
+        UNIQUE(id, network_id)
+      );
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        network_id INTEGER NOT NULL,
+        buffer_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('privmsg', 'notice', 'action', 'system')),
+        nick TEXT,
+        text TEXT NOT NULL,
+        time INTEGER NOT NULL,
+        FOREIGN KEY (buffer_id, network_id) REFERENCES buffers(id, network_id) ON DELETE CASCADE
+      );
+      CREATE INDEX messages_buffer_history ON messages(buffer_id, id DESC);
+      CREATE INDEX messages_network_history ON messages(network_id, id DESC);
+      CREATE TABLE sessions (
+        token_hash TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL
+      );
+      CREATE INDEX sessions_expiration ON sessions(expires_at);
+      CREATE VIRTUAL TABLE messages_fts USING fts5(text, nick, content='messages', content_rowid='id');
+      CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, text, nick) VALUES (new.id, new.text, new.nick);
+      END;
+      CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, text, nick)
+          VALUES ('delete', old.id, old.text, old.nick);
+      END;
+      CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, text, nick)
+          VALUES ('delete', old.id, old.text, old.nick);
+        INSERT INTO messages_fts(rowid, text, nick) VALUES (new.id, new.text, new.nick);
+      END;
+      `);
+    } else if (version === 1) {
+      this.db.exec(`
+        ALTER TABLE networks ADD COLUMN relay_nicks TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE networks ADD COLUMN mention_aliases TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE networks ADD COLUMN display_names TEXT NOT NULL DEFAULT '{}';
+      `);
+    }
+    this.db.exec(`
+      ALTER TABLE messages ADD COLUMN from_network INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE messages ADD COLUMN connection_event TEXT
+        CHECK (connection_event IN ('connected', 'disconnected'));
+      ALTER TABLE messages ADD COLUMN is_motd INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sessions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+      UPDATE sessions SET created_at = MAX(0, expires_at - 2592000000);
+      CREATE TABLE account_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        password_hash TEXT,
+        away_message TEXT NOT NULL DEFAULT 'Away'
+      );
+      INSERT INTO account_settings (id) VALUES (1);
+    `);
   }
 
   close(): void {
@@ -259,6 +272,40 @@ export class Store {
     return row ? { ...networkFromRow(row), saslPassword: row.sasl_password } : null;
   }
 
+  isNetworkDisconnected(id: number): boolean {
+    const row = this.db.query('SELECT disconnected FROM networks WHERE id = ?').get(id) as { disconnected: number } | null;
+    return row?.disconnected === 1;
+  }
+
+  setNetworkDisconnected(id: number, disconnected: boolean): void {
+    this.db.query('UPDATE networks SET disconnected = ? WHERE id = ?').run(Number(disconnected), id);
+  }
+
+  listIgnores(networkId: number): string[] {
+    return (this.db.query('SELECT nick FROM ignores WHERE network_id = ? ORDER BY nick_key')
+      .all(networkId) as Array<{ nick: string }>).map(row => row.nick);
+  }
+
+  allIgnores(): Record<number, string[]> {
+    const ignores: Record<number, string[]> = {};
+    for (const row of this.db.query('SELECT network_id, nick FROM ignores ORDER BY nick_key')
+      .all() as Array<{ network_id: number; nick: string }>) {
+      (ignores[row.network_id] ??= []).push(row.nick);
+    }
+    return ignores;
+  }
+
+  addIgnore(networkId: number, nick: string): void {
+    this.db.query(`
+      INSERT INTO ignores (network_id, nick, nick_key) VALUES (?, ?, ?)
+      ON CONFLICT(network_id, nick_key) DO NOTHING
+    `).run(networkId, nick, nick.toLowerCase());
+  }
+
+  removeIgnore(networkId: number, nick: string): void {
+    this.db.query('DELETE FROM ignores WHERE network_id = ? AND nick_key = ?').run(networkId, nick.toLowerCase());
+  }
+
   getOrCreateBuffer(networkId: number, name: string, kind: ChatBuffer['kind']): ChatBuffer {
     const nameKey = name.toLowerCase();
     this.db.query(`
@@ -284,6 +331,10 @@ export class Store {
 
   removeBuffer(id: number): void {
     this.db.query('DELETE FROM buffers WHERE id = ?').run(id);
+  }
+
+  clearMessages(bufferId: number): void {
+    this.db.query('DELETE FROM messages WHERE buffer_id = ?').run(bufferId);
   }
 
   appendMessage(input: Omit<ChatMessage, 'id'>): ChatMessage {

@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import type {
-  Bootstrap, ChannelState, ChatBuffer, ChatMessage, Network, NetworkInput, NetworkStatus, ServerEvent,
+  Bootstrap, ChannelListStatus, ChannelState, ChatBuffer, ChatMessage, Network, NetworkInput, NetworkStatus, ServerEvent,
 } from '../shared/contracts';
 import { displayIdentity, mentionsAny } from '../shared/identity';
+import { api, ApiError, errorText, json } from './api';
+import ChannelListPanel from './ChannelListPanel';
+import ContextMenu, { type MenuItem } from './ContextMenu';
+import { BanListDialog, IgnoreListDialog, WhoisDialog } from './Dialogs';
 import MentionComposer from './MentionComposer';
 import GlobalSettings from './GlobalSettings';
 import NetworkSettings from './NetworkSettings';
@@ -10,6 +14,7 @@ import { loadPreferences, savePreferences, type AppPreferences } from './prefere
 import SearchPanel from './SearchPanel';
 import Transcript from './Transcript';
 import ThemePicker from './ThemePicker';
+import UserList from './UserList';
 
 type MessagePage = { messages: ChatMessage[]; hasMore: boolean };
 type ChannelDetails = { bufferId: number; state: ChannelState | null; loading: boolean; error: string };
@@ -21,31 +26,15 @@ type View = {
   error: string;
 };
 type Jump = { bufferId: number; messageId: number; serial: number };
-
-class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message);
-  }
-}
-
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, { credentials: 'same-origin', ...options });
-  if (!response.ok) {
-    const body: unknown = await response.json().catch(() => null);
-    const error = body && typeof body === 'object' && 'error' in body ? body.error : null;
-    throw new ApiError(typeof error === 'string' ? error : `Request failed (${response.status})`, response.status);
-  }
-  return response.json() as Promise<T>;
-}
-
-function json(method: string, value: unknown): RequestInit {
-  return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) };
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : 'Something went wrong. Please try again.';
-}
-
+type MenuSubject =
+  | { kind: 'network'; networkId: number }
+  | { kind: 'buffer'; bufferId: number }
+  | { kind: 'user'; networkId: number; nick: string };
+type MenuTarget = MenuSubject & { x: number; y: number };
+type DialogTarget =
+  | { kind: 'whois'; networkId: number; nick: string }
+  | { kind: 'bans'; bufferId: number }
+  | { kind: 'ignores'; networkId: number };
 function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
   if (!incoming.length) return current;
   if (!current.length) return incoming;
@@ -115,12 +104,19 @@ export default function App() {
   const [joinNetworkId, setJoinNetworkId] = useState<number | null>(null);
   const [collapsedNetworks, setCollapsedNetworks] = useState<number[]>(() => savedIds('lingo-collapsed-networks'));
   const [hiddenBuffers, setHiddenBuffers] = useState<number[]>(() => savedIds('lingo-hidden-buffers'));
-  const [bufferMenu, setBufferMenu] = useState<{ id: number; x: number; y: number } | null>(null);
+  const [menu, setMenu] = useState<MenuTarget | null>(null);
+  const [dialog, setDialog] = useState<DialogTarget | null>(null);
+  const [mutedBuffers, setMutedBuffers] = useState<number[]>(() => savedIds('lingo-muted-buffers'));
+  const [mutedNetworks, setMutedNetworks] = useState<number[]>(() => savedIds('lingo-muted-networks'));
+  const [ignores, setIgnores] = useState<Record<number, string[]>>({});
+  const [channelListTabs, setChannelListTabs] = useState<number[]>(() => savedIds('lingo-channel-lists'));
+  const [channelListView, setChannelListView] = useState<number | null>(null);
+  const [channelLists, setChannelLists] = useState<Record<number, ChannelListStatus>>({});
   const [joinName, setJoinName] = useState('');
   const [joining, setJoining] = useState(false);
   const [joinError, setJoinError] = useState('');
   const [channelDetails, setChannelDetails] = useState<ChannelDetails | null>(null);
-  const [usersOpen, setUsersOpen] = useState(false);
+  const [usersPanelOpen, setUsersPanelOpen] = useState(false);
   const [topicEditing, setTopicEditing] = useState(false);
   const [topicDraft, setTopicDraft] = useState('');
   const [topicSaving, setTopicSaving] = useState(false);
@@ -149,6 +145,11 @@ export default function App() {
   hiddenBuffersRef.current = hiddenBuffers;
   const preferencesRef = useRef(preferences);
   preferencesRef.current = preferences;
+  const mutedRef = useRef({ buffers: mutedBuffers, networks: mutedNetworks });
+  mutedRef.current = { buffers: mutedBuffers, networks: mutedNetworks };
+  const pendingTopicEdit = useRef<number | null>(null);
+  const overlayOpen = useRef(false);
+  overlayOpen.current = menu !== null || dialog !== null;
   const generation = useRef(0);
   const bootstrapRequest = useRef(0);
   const receivedMessageIds = useRef(new Set<number>());
@@ -167,14 +168,24 @@ export default function App() {
     && isJoined(networks.find((network) => network.id === activeBuffer.networkId), activeBuffer.name);
   const channelConnected = activeBuffer?.kind === 'channel'
     && statuses[activeBuffer.networkId]?.state === 'connected';
-  const fail = useCallback((error: unknown) => {
-    if (error instanceof ApiError && error.status === 401) {
-      setAuth('login');
-      setLoginError('Your session expired. Sign in again.');
-    } else {
-      setNotice(errorText(error));
-    }
+  const sessionExpired = useCallback(() => {
+    setAuth('login');
+    setLoginError('Your session expired. Sign in again.');
+    setDialog(null);
+    setMenu(null);
   }, []);
+  const fail = useCallback((error: unknown) => {
+    if (error instanceof ApiError && error.status === 401) sessionExpired();
+    else setNotice(errorText(error));
+  }, [sessionExpired]);
+
+  function openMenu(event: ReactMouseEvent<HTMLElement>, subject: MenuSubject) {
+    event.preventDefault();
+    // Keyboard-invoked context menus report no pointer position; anchor to the element.
+    const rect = event.currentTarget.getBoundingClientRect();
+    const pointer = event.clientX !== 0 || event.clientY !== 0;
+    setMenu({ ...subject, x: pointer ? event.clientX : rect.left, y: pointer ? event.clientY : rect.bottom });
+  }
 
   const refreshBootstrap = useCallback(async (signal?: AbortSignal) => {
     const request = ++bootstrapRequest.current;
@@ -186,6 +197,7 @@ export default function App() {
     }));
     setBuffers(data.buffers);
     setStatuses(data.statuses);
+    setIgnores(data.ignores);
     setSelectedId((current) => {
       if (current !== null && data.buffers.some((buffer) => buffer.id === current && !hiddenBuffersRef.current.includes(buffer.id))) return current;
       return (data.buffers.find((buffer) => buffer.kind === 'server')
@@ -211,21 +223,11 @@ export default function App() {
     try {
       localStorage.setItem('lingo-collapsed-networks', JSON.stringify(collapsedNetworks));
       localStorage.setItem('lingo-hidden-buffers', JSON.stringify(hiddenBuffers));
+      localStorage.setItem('lingo-muted-buffers', JSON.stringify(mutedBuffers));
+      localStorage.setItem('lingo-muted-networks', JSON.stringify(mutedNetworks));
+      localStorage.setItem('lingo-channel-lists', JSON.stringify(channelListTabs));
     } catch { /* Storage may be disabled. */ }
-  }, [collapsedNetworks, hiddenBuffers]);
-  useEffect(() => {
-    if (!bufferMenu) return;
-    const dismiss = (event: PointerEvent) => {
-      if (!(event.target instanceof Element && event.target.closest('.buffer-context-menu'))) setBufferMenu(null);
-    };
-    const scroll = () => setBufferMenu(null);
-    window.addEventListener('pointerdown', dismiss);
-    window.addEventListener('scroll', scroll, true);
-    return () => {
-      window.removeEventListener('pointerdown', dismiss);
-      window.removeEventListener('scroll', scroll, true);
-    };
-  }, [bufferMenu]);
+  }, [collapsedNetworks, hiddenBuffers, mutedBuffers, mutedNetworks, channelListTabs]);
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -287,7 +289,7 @@ export default function App() {
         event.preventDefault();
         setSearchOpen(true);
         window.setTimeout(() => document.querySelector<HTMLInputElement>('.search-panel__query')?.focus(), 0);
-        setBufferMenu(null);
+        setMenu(null);
         setSettingsTarget(null);
         setGlobalSettingsOpen(false);
         setSidebarOpen(false);
@@ -295,6 +297,12 @@ export default function App() {
       }
       if (event.key === 'Escape') {
         if (event.defaultPrevented) return;
+        // An open menu or dialog absorbs Escape without dismissing the view beneath it.
+        if (overlayOpen.current) {
+          setMenu(null);
+          setDialog(null);
+          return;
+        }
         setSearchOpen(false);
         setSettingsTarget(null);
         setGlobalSettingsOpen(false);
@@ -304,7 +312,7 @@ export default function App() {
         setTopicEditing(false);
         setTopicError('');
         setRenameTarget(null);
-        setBufferMenu(null);
+        setUsersPanelOpen(false);
         return;
       }
       const target = event.target;
@@ -396,13 +404,15 @@ export default function App() {
             && !ownNames.some((name) => name.toLowerCase() === sender.toLowerCase());
           const highlight = inbound && identity !== null && (mentionsAny(identity.text, ownNames)
             || preferencesRef.current.highlights.some((phrase) => identity.text.toLowerCase().includes(phrase.toLowerCase())));
-          if (selectedRef.current !== event.message.bufferId || jumpRef.current) {
+          const muted = mutedRef.current.buffers.includes(event.message.bufferId)
+            || (!!buffer && mutedRef.current.networks.includes(buffer.networkId));
+          if (!muted && (selectedRef.current !== event.message.bufferId || jumpRef.current)) {
             setUnread((current) => ({ ...current, [event.message.bufferId]: (current[event.message.bufferId] ?? 0) + 1 }));
             if (highlight || inbound && buffer?.kind === 'query') {
               setMentionUnread((current) => ({ ...current, [event.message.bufferId]: (current[event.message.bufferId] ?? 0) + 1 }));
             }
           }
-          if (identity && inbound && (highlight || buffer?.kind === 'query')) {
+          if (!muted && identity && inbound && (highlight || buffer?.kind === 'query')) {
             const settings = preferencesRef.current;
             if (settings.browserNotifications && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
               try {
@@ -476,6 +486,8 @@ export default function App() {
           setSelectedId((selected) => selected !== null && !remaining.some((buffer) => buffer.id === selected)
             ? (remaining[0]?.id ?? null) : selected);
           setStatuses((current) => { const next = { ...current }; delete next[event.networkId]; return next; });
+          setChannelListTabs((current) => current.filter((id) => id !== event.networkId));
+          setChannelListView((current) => current === event.networkId ? null : current);
           break;
         }
         case 'channel_state':
@@ -483,6 +495,18 @@ export default function App() {
             channelStateVersion.current++;
             setChannelDetails({ bufferId: event.state.bufferId, state: event.state, loading: false, error: '' });
           }
+          break;
+        case 'history_cleared':
+          setView((current) => current.bufferId === event.bufferId ? { ...current, messages: [], hasMore: false } : current);
+          setJump((current) => current?.bufferId === event.bufferId ? null : current);
+          setUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
+          setMentionUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
+          break;
+        case 'channel_list':
+          setChannelLists((current) => ({ ...current, [event.status.networkId]: event.status }));
+          break;
+        case 'ignores':
+          setIgnores((current) => ({ ...current, [event.networkId]: event.ignores }));
           break;
       }
     }
@@ -560,7 +584,7 @@ export default function App() {
     const version = ++channelStateVersion.current;
     setTopicEditing(false);
     setTopicError('');
-    setUsersOpen(false);
+    setUsersPanelOpen(false);
     if (auth !== 'ready' || selectedChannelId === null || !channelJoined || !channelConnected) {
       setChannelDetails(null);
       return () => controller.abort();
@@ -578,11 +602,20 @@ export default function App() {
       });
     return () => controller.abort();
   }, [auth, selectedChannelId, channelJoined, channelConnected]);
+  useEffect(() => {
+    const target = pendingTopicEdit.current;
+    if (target === null || channelDetails?.bufferId !== target || !channelDetails.state) return;
+    pendingTopicEdit.current = null;
+    setTopicDraft(channelDetails.state.topic ?? '');
+    setTopicError('');
+    setTopicEditing(true);
+  }, [channelDetails]);
 
   function selectBuffer(id: number) {
     hiddenBuffersRef.current = hiddenBuffersRef.current.filter((bufferId) => bufferId !== id);
     setHiddenBuffers(hiddenBuffersRef.current);
-    setBufferMenu(null);
+    setMenu(null);
+    setChannelListView(null);
     setJump(null);
     setSelectedId(id);
     setRenameTarget(null);
@@ -628,6 +661,8 @@ export default function App() {
     setNotice('');
     try {
       await api<{ ok: true }>('/api/send', json('POST', { bufferId: selectedId, text }));
+      const networkId = buffers.find((buffer) => buffer.id === selectedId)?.networkId;
+      if (networkId !== undefined && /^\/list(?:\s|$)/i.test(text.trim())) openChannelList(networkId, false);
     } catch (error) {
       fail(error);
       throw error;
@@ -718,12 +753,12 @@ export default function App() {
     }
   }
 
-  async function rejoin(buffer: ChatBuffer) {
+  async function joinChannel(networkId: number, name: string) {
     if (joining) return;
     setJoining(true);
     setNotice('');
     try {
-      const joined = await api<ChatBuffer>('/api/buffers', json('POST', { networkId: buffer.networkId, name: buffer.name }));
+      const joined = await api<ChatBuffer>('/api/buffers', json('POST', { networkId, name }));
       setBuffers((current) => current.some((item) => item.id === joined.id)
         ? current.map((item) => item.id === joined.id ? joined : item)
         : [...current, joined]);
@@ -749,7 +784,7 @@ export default function App() {
   }
   async function closeBuffer(buffer: ChatBuffer) {
     if (buffer.kind === 'server') return;
-    setBufferMenu(null);
+    setMenu(null);
     setNotice('');
     try {
       if (buffer.kind === 'channel' && isJoined(networks.find((item) => item.id === buffer.networkId), buffer.name)) {
@@ -782,6 +817,159 @@ export default function App() {
     }
   }
 
+  function beginTopicEdit(buffer: ChatBuffer) {
+    pendingTopicEdit.current = buffer.id;
+    if (selectedId !== buffer.id || channelListView !== null) selectBuffer(buffer.id);
+    // Already showing this channel: the details effect will not fire again, so apply now.
+    else if (channelDetails?.bufferId === buffer.id && channelDetails.state) {
+      pendingTopicEdit.current = null;
+      setTopicDraft(channelDetails.state.topic ?? '');
+      setTopicError('');
+      setTopicEditing(true);
+    }
+  }
+
+  function openChannelList(networkId: number, refresh: boolean) {
+    setChannelListTabs((current) => current.includes(networkId) ? current : [...current, networkId]);
+    setCollapsedNetworks((current) => current.filter((id) => id !== networkId));
+    setChannelListView(networkId);
+    setSearchOpen(false);
+    setSettingsTarget(null);
+    setGlobalSettingsOpen(false);
+    setSidebarOpen(false);
+    if (refresh) void refreshChannelList(networkId);
+  }
+
+  async function refreshChannelList(networkId: number) {
+    try {
+      await api<{ ok: true }>(`/api/networks/${networkId}/channels/refresh`, json('POST', {}));
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  function closeChannelList(networkId: number) {
+    setChannelListTabs((current) => current.filter((id) => id !== networkId));
+    if (channelListView === networkId) setChannelListView(null);
+  }
+
+  async function setNetworkConnected(networkId: number, connected: boolean) {
+    setNotice('');
+    try {
+      await api<{ ok: true }>(`/api/networks/${networkId}/${connected ? 'connect' : 'disconnect'}`, { method: 'POST' });
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  async function removeNetwork(network: Network) {
+    if (!window.confirm(`Remove ${network.name} and all of its history?`)) return;
+    try {
+      await deleteNetwork(network.id);
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  async function clearHistory(buffer: ChatBuffer) {
+    if (!window.confirm(`Permanently delete all stored messages in ${buffer.name}?`)) return;
+    setNotice('');
+    try {
+      await api<{ ok: true }>(`/api/buffers/${buffer.id}/messages`, { method: 'DELETE' });
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  async function openQuery(networkId: number, nick: string) {
+    setNotice('');
+    try {
+      const buffer = await api<ChatBuffer>('/api/buffers/query', json('POST', { networkId, nick }));
+      setBuffers((current) => current.some((item) => item.id === buffer.id) ? current : [...current, buffer]);
+      setCollapsedNetworks((current) => current.filter((id) => id !== networkId));
+      selectBuffer(buffer.id);
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  async function setIgnored(networkId: number, nick: string, ignored: boolean) {
+    setNotice('');
+    try {
+      const result = await api<{ ignores: string[] }>(`/api/networks/${networkId}/ignores`,
+        json(ignored ? 'POST' : 'DELETE', { nick }));
+      setIgnores((current) => ({ ...current, [networkId]: result.ignores }));
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  function toggleId(setter: typeof setMutedBuffers, id: number) {
+    setter((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  }
+
+  function menuItems(target: MenuTarget): { label: string; items: MenuItem[] } | null {
+    if (target.kind === 'network') {
+      const network = networks.find((item) => item.id === target.networkId);
+      if (!network) return null;
+      const server = buffers.find((buffer) => buffer.networkId === network.id && buffer.kind === 'server');
+      const offline = (statuses[network.id]?.state ?? 'disconnected') === 'disconnected';
+      return { label: `${network.name} actions`, items: [
+        { label: network.name, heading: true, onSelect: server ? () => selectBuffer(server.id) : undefined },
+        { label: 'Edit this network', onSelect: () => {
+          setSettingsTarget(network.id); setSearchOpen(false); setGlobalSettingsOpen(false); setSidebarOpen(false);
+        } },
+        { label: 'Join a channel', onSelect: () => {
+          setCollapsedNetworks((current) => current.filter((id) => id !== network.id));
+          setJoinNetworkId(network.id);
+          setJoinError('');
+        } },
+        { label: 'List all channels', disabled: offline, onSelect: () => openChannelList(network.id, true) },
+        { label: 'List ignored users', onSelect: () => setDialog({ kind: 'ignores', networkId: network.id }) },
+        offline
+          ? { label: 'Connect', onSelect: () => void setNetworkConnected(network.id, true) }
+          : { label: 'Disconnect', onSelect: () => void setNetworkConnected(network.id, false) },
+        { label: mutedNetworks.includes(network.id) ? 'Unmute network' : 'Mute network',
+          onSelect: () => toggleId(setMutedNetworks, network.id) },
+        { label: 'Remove', danger: true, onSelect: () => void removeNetwork(network) },
+      ] };
+    }
+    if (target.kind === 'user') {
+      const ignored = (ignores[target.networkId] ?? []).some((nick) => nick.toLowerCase() === target.nick.toLowerCase());
+      return { label: `${target.nick} actions`, items: [
+        { label: target.nick, heading: true },
+        { label: 'User info', onSelect: () => setDialog({ kind: 'whois', networkId: target.networkId, nick: target.nick }) },
+        { label: 'Direct message', onSelect: () => void openQuery(target.networkId, target.nick) },
+        { label: ignored ? 'Unignore user' : 'Ignore user', danger: !ignored,
+          onSelect: () => void setIgnored(target.networkId, target.nick, !ignored) },
+      ] };
+    }
+    const buffer = buffers.find((item) => item.id === target.bufferId);
+    if (!buffer || buffer.kind === 'server') return null;
+    const network = networks.find((item) => item.id === buffer.networkId);
+    const muteLabel = `${mutedBuffers.includes(buffer.id) ? 'Unmute' : 'Mute'} ${buffer.kind === 'channel' ? 'channel' : 'conversation'}`;
+    if (buffer.kind === 'query') {
+      return { label: `${buffer.name} actions`, items: [
+        { label: buffer.name, heading: true, onSelect: () => selectBuffer(buffer.id) },
+        { label: 'User info', onSelect: () => setDialog({ kind: 'whois', networkId: buffer.networkId, nick: buffer.name }) },
+        { label: 'Clear history', onSelect: () => void clearHistory(buffer) },
+        { label: muteLabel, onSelect: () => toggleId(setMutedBuffers, buffer.id) },
+        { label: 'Close conversation', onSelect: () => void closeBuffer(buffer) },
+      ] };
+    }
+    const joined = isJoined(network, buffer.name);
+    const live = joined && statuses[buffer.networkId]?.state === 'connected';
+    return { label: `${buffer.name} actions`, items: [
+      { label: buffer.name, heading: true, onSelect: () => selectBuffer(buffer.id) },
+      { label: 'Edit topic', disabled: !live, onSelect: () => beginTopicEdit(buffer) },
+      { label: 'List banned users', disabled: !live, onSelect: () => setDialog({ kind: 'bans', bufferId: buffer.id }) },
+      { label: 'Clear history', onSelect: () => void clearHistory(buffer) },
+      { label: muteLabel, onSelect: () => toggleId(setMutedBuffers, buffer.id) },
+      joined
+        ? { label: 'Leave', danger: true, onSelect: () => void part(buffer) }
+        : { label: 'Rejoin', onSelect: () => void joinChannel(buffer.networkId, buffer.name) },
+    ] };
+  }
 
   async function saveNetwork(input: NetworkInput, id?: number) {
     const network = await api<Network>(id === undefined ? '/api/networks' : `/api/networks/${id}`,
@@ -804,7 +992,8 @@ export default function App() {
     hiddenBuffersRef.current = hiddenBuffersRef.current.filter((id) => id !== message.bufferId);
     setHiddenBuffers(hiddenBuffersRef.current);
     setCollapsedNetworks((current) => current.filter((id) => id !== message.networkId));
-    setBufferMenu(null);
+    setMenu(null);
+    setChannelListView(null);
     setJump({ bufferId: message.bufferId, messageId: message.id, serial: ++jumpSerial.current });
     setSelectedId(message.bufferId);
     setSearchOpen(false);
@@ -850,8 +1039,16 @@ export default function App() {
   const activeNetwork = networks.find((network) => network.id === selected?.networkId);
   const selectedJoined = selected?.kind !== 'channel' || isJoined(activeNetwork, selected.name);
   const settingsNetwork = typeof settingsTarget === 'number' ? networks.find((network) => network.id === settingsTarget) ?? null : null;
+  const channelListNetwork = channelListView === null ? undefined : networks.find((network) => network.id === channelListView);
   const showingView = view.bufferId === selectedId;
   const messages = showingView ? view.messages : [];
+  const showingConversation = settingsTarget === null && !searchOpen && !globalSettingsOpen && !channelListNetwork && !!selected;
+  const selectedState = selected ? statuses[selected.networkId]?.state ?? 'disconnected' : 'disconnected';
+  const selectedDetails = selected && channelDetails?.bufferId === selected.id ? channelDetails : null;
+  const topic = selectedDetails?.state?.topic || '';
+  const menuSpec = menu && menuItems(menu);
+  const dialogNetwork = dialog && dialog.kind !== 'bans' ? networks.find((network) => network.id === dialog.networkId) : undefined;
+  const dialogBuffer = dialog?.kind === 'bans' ? buffers.find((buffer) => buffer.id === dialog.bufferId) : undefined;
 
   return <div className="app-shell">
     <header className="topbar">
@@ -889,8 +1086,9 @@ export default function App() {
             && buffer.kind !== 'server' && !hiddenBuffers.includes(buffer.id))
             .sort((a, b) => a.name.localeCompare(b.name));
           const collapsed = collapsedNetworks.includes(network.id);
-          return <section className="network-group" key={network.id} aria-label={`${network.name} network`}>
-            <div className="network-heading">
+          const networkMuted = mutedNetworks.includes(network.id);
+          return <section className={`network-group${networkMuted ? ' network-muted' : ''}`} key={network.id} aria-label={`${network.name} network`}>
+            <div className="network-heading" onContextMenu={(event) => openMenu(event, { kind: 'network', networkId: network.id })}>
               <span className={`status-dot status-${state}`} title={status?.error || state} aria-label={state} />
               <button className="network-collapse" type="button" aria-expanded={!collapsed}
                 aria-controls={`network-buffers-${network.id}`}
@@ -928,15 +1126,24 @@ export default function App() {
               {joinError && <span className="error-text" id={`join-error-${network.id}`} role="alert">{joinError}</span>}
             </form>}
             {!collapsed && <nav className="buffer-list" id={`network-buffers-${network.id}`} aria-label={`${network.name} buffers`}>
+              {channelListTabs.includes(network.id) && <div className="buffer-entry">
+                <button type="button" className={`buffer-item${channelListView === network.id ? ' buffer-active' : ''}`}
+                  aria-current={channelListView === network.id ? 'page' : undefined}
+                  onClick={() => openChannelList(network.id, false)}>
+                  <span className="buffer-prefix" aria-hidden="true">≡</span>
+                  <span className="buffer-name">channel list</span>
+                  {channelLists[network.id]?.state === 'loading' && <span className="buffer-loading" aria-label="Loading">…</span>}
+                </button>
+                <button type="button" className="buffer-close" aria-label={`Close channel list for ${network.name}`}
+                  title="Close channel list" onClick={() => closeChannelList(network.id)}>×</button>
+              </div>}
               {networkBuffers.map((buffer) => {
                 const parted = buffer.kind === 'channel' && !isJoined(network, buffer.name);
-                return <div className="buffer-entry" key={buffer.id}
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    setBufferMenu({ id: buffer.id, x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 145) });
-                  }}>
-                  <button type="button" className={`buffer-item${selectedId === buffer.id ? ' buffer-active' : ''}`}
-                    aria-current={selectedId === buffer.id ? 'page' : undefined} onClick={() => selectBuffer(buffer.id)}>
+                const muted = networkMuted || mutedBuffers.includes(buffer.id);
+                return <div className={`buffer-entry${muted ? ' buffer-muted' : ''}`} key={buffer.id}
+                  onContextMenu={(event) => openMenu(event, { kind: 'buffer', bufferId: buffer.id })}>
+                  <button type="button" className={`buffer-item${selectedId === buffer.id && channelListView === null ? ' buffer-active' : ''}`}
+                    aria-current={selectedId === buffer.id && channelListView === null ? 'page' : undefined} onClick={() => selectBuffer(buffer.id)}>
                     <span className="buffer-prefix">{buffer.kind === 'channel' ? '#' : buffer.kind === 'query' ? '@' : '⌁'}</span>
                     <span className="buffer-name">{buffer.kind === 'channel' ? buffer.name.replace(/^#/, '') : buffer.name}</span>
                     {!!mentionUnread[buffer.id] && <span className="unread-badge mention-badge"
@@ -945,7 +1152,7 @@ export default function App() {
                       aria-label={`${unread[buffer.id]} unread messages`}>{unread[buffer.id]}</span>}
                   </button>
                   {parted && <button type="button" className="buffer-rejoin" disabled={joining}
-                    aria-label={`Rejoin ${buffer.name} on ${network.name}`} onClick={() => void rejoin(buffer)}>↻</button>}
+                    aria-label={`Rejoin ${buffer.name} on ${network.name}`} onClick={() => void joinChannel(buffer.networkId, buffer.name)}>↻</button>}
                   <button type="button" className="buffer-close"
                     aria-label={`Close ${buffer.name} on ${network.name}`} title={`Close ${buffer.name}`}
                     onClick={() => void closeBuffer(buffer)}>×</button>
@@ -954,24 +1161,6 @@ export default function App() {
             </nav>}
           </section>;
         })}
-        {bufferMenu && (() => {
-          const buffer = buffers.find((item) => item.id === bufferMenu.id);
-          const network = networks.find((item) => item.id === buffer?.networkId);
-          if (!buffer || buffer.kind === 'server') return null;
-          const joined = buffer.kind === 'channel' && isJoined(network, buffer.name);
-          return <div className="buffer-context-menu" role="menu" aria-label={`${buffer.name} actions`}
-            style={{ left: bufferMenu.x, top: bufferMenu.y }}>
-            <button type="button" role="menuitem" onClick={() => selectBuffer(buffer.id)}>Open {buffer.name}</button>
-            {buffer.kind === 'channel' && <button type="button" role="menuitem" onClick={() => {
-              setBufferMenu(null);
-              if (joined) void part(buffer);
-              else void rejoin(buffer);
-            }}>{joined ? 'Leave channel' : 'Rejoin channel'}</button>}
-            <button type="button" role="menuitem" onClick={() => void closeBuffer(buffer)}>
-              Close {buffer.kind === 'query' ? 'conversation' : 'channel'}
-            </button>
-          </div>;
-        })()}
       </aside>
       <main className="main-pane">
         {notice && <div className="notice" role="alert"><span>{notice}</span><button className="icon-button" type="button" aria-label="Dismiss error" onClick={() => setNotice('')}>×</button></div>}
@@ -986,6 +1175,13 @@ export default function App() {
             setLoginError('Your session expired. Sign in again.');
             setGlobalSettingsOpen(false);
           }} /></div>
+        : channelListNetwork ? <ChannelListPanel key={channelListNetwork.id} network={channelListNetwork}
+          status={channelLists[channelListNetwork.id]}
+          connected={statuses[channelListNetwork.id]?.state === 'connected'}
+          isJoined={(name) => isJoined(channelListNetwork, name)}
+          onJoin={(name) => void joinChannel(channelListNetwork.id, name)}
+          onRefresh={() => void refreshChannelList(channelListNetwork.id)}
+          onClose={() => closeChannelList(channelListNetwork.id)} onUnauthorized={sessionExpired} />
         : selected ? <>
           <header className="conversation-header">
             <div className="conversation-title">
@@ -1001,69 +1197,54 @@ export default function App() {
                 <button className="button button-primary" type="submit">Save</button>
                 <button className="button button-quiet" type="button" onClick={() => setRenameTarget(null)}>Cancel</button>
               </form>}
-              <h1>{selected.name}</h1>
+              <div className="conversation-heading">
+                <h1>{selected.name}</h1>
+                {selected.kind === 'channel' && topicEditing
+                  ? <form className="channel-topic-editor" onSubmit={(event) => void saveTopic(event)}>
+                    <label className="sr-only" htmlFor="channel-topic-input">Topic for {selected.name}</label>
+                    <input id="channel-topic-input" autoFocus value={topicDraft} placeholder="Topic"
+                      onChange={(event) => setTopicDraft(event.target.value)} disabled={topicSaving} />
+                    <button className="button button-primary" type="submit" disabled={topicSaving}>
+                      {topicSaving ? 'Saving…' : 'Save'}
+                    </button>
+                    <button className="button button-quiet" type="button" disabled={topicSaving}
+                      onClick={() => { setTopicEditing(false); setTopicError(''); }}>Cancel</button>
+                    {topicError && <span className="error-text" role="alert">{topicError}</span>}
+                  </form>
+                  : topic && <p className="conversation-topic" title={topic}
+                    onDoubleClick={() => { if (selected.kind === 'channel') beginTopicEdit(selected); }}>{topic}</p>}
+              </div>
             </div>
             <div className="conversation-actions">
               {jump && jump.bufferId === selected.id && <button className="button button-quiet" type="button" onClick={() => setJump(null)}>Back to latest</button>}
               {selected.kind === 'channel' && !selectedJoined && <button className="button button-primary"
-                type="button" onClick={() => void rejoin(selected)} disabled={joining}>
+                type="button" onClick={() => void joinChannel(selected.networkId, selected.name)} disabled={joining}>
                 {joining ? 'Joining…' : 'Rejoin'}
+              </button>}
+              {selected.kind === 'channel' && <button className="button button-quiet users-toggle" type="button"
+                aria-expanded={usersPanelOpen} onClick={() => setUsersPanelOpen((open) => !open)}>
+                Users{selectedDetails?.state ? ` (${selectedDetails.state.users.length})` : ''}
               </button>}
             </div>
           </header>
           <div className="conversation-meta">
-            <span className={`status-dot status-${statuses[selected.networkId]?.state ?? 'disconnected'}`} />
-            {statuses[selected.networkId]?.state ?? 'disconnected'}
+            <span className={`status-dot status-${selectedState}`} />
+            {selectedState}
             {statuses[selected.networkId]?.nick && <span>as {statuses[selected.networkId].nick}</span>}
             {jump && jump.bufferId === selected.id && <span className="history-indicator">Viewing search result</span>}
             {selected.kind === 'channel' && !selectedJoined && <span className="buffer-state">Parted — history is retained</span>}
           </div>
-          {selected.kind === 'channel' && <section className="channel-details" aria-label={`${selected.name} channel details`}>
-            {!selectedJoined ? <p className="buffer-state">Topic and users unavailable while parted.</p>
-              : !channelConnected ? <p className="buffer-state">Topic and users unavailable while {statuses[selected.networkId]?.state ?? 'disconnected'}.</p>
-                : channelDetails?.bufferId !== selected.id || channelDetails.loading
-                ? <p role="status">Loading topic and users…</p>
-                : channelDetails.error ? <p className="error-text" role="alert">{channelDetails.error}</p>
-                  : channelDetails.state && <>
-                    <div className="channel-topic">
-                      {topicEditing ? <form className="channel-topic-editor" onSubmit={(event) => void saveTopic(event)}>
-                        <label htmlFor="channel-topic-input">Topic</label>
-                        <input id="channel-topic-input" autoFocus value={topicDraft}
-                          onChange={(event) => setTopicDraft(event.target.value)} disabled={topicSaving} />
-                        <button className="button button-primary" type="submit" disabled={topicSaving}>
-                          {topicSaving ? 'Saving…' : 'Save'}
-                        </button>
-                        <button className="button button-quiet" type="button" disabled={topicSaving}
-                          onClick={() => { setTopicEditing(false); setTopicError(''); }}>Cancel</button>
-                        {topicError && <span className="error-text" role="alert">{topicError}</span>}
-                      </form> : <>
-                        <span>{channelDetails.state.topic === null ? 'Topic not yet available' : channelDetails.state.topic || 'No topic set'}</span>
-                        <button className="button button-quiet" type="button" onClick={() => {
-                          setTopicDraft(channelDetails.state?.topic ?? '');
-                          setTopicError('');
-                          setTopicEditing(true);
-                        }}>Edit topic</button>
-                      </>}
-                    </div>
-                    <button className="channel-users-toggle" type="button" aria-expanded={usersOpen}
-                      aria-controls="channel-users-list" onClick={() => setUsersOpen((open) => !open)}>
-                      Users ({channelDetails.state.users.length})
-                    </button>
-                    {usersOpen && <ul className="channel-users-list" id="channel-users-list">
-                      {channelDetails.state.users.map((user) => <li key={user.nick}>
-                        <span className="channel-user-prefix" data-prefix={user.prefix}>{user.prefix}</span>
-                        <span>{user.nick}</span>
-                      </li>)}
-                    </ul>}
-                  </>}
-          </section>}
           <Transcript buffer={selected} network={activeNetwork!} messages={messages}
             ownNames={[...new Set([statuses[selected.networkId]?.nick, activeNetwork?.nick, ...(activeNetwork?.mentionAliases ?? [])].filter(Boolean))] as string[]}
             loading={!showingView || view.loading} hasMore={showingView && view.hasMore} olderPending={olderPending}
             error={showingView ? view.error : ''} jumpId={jump?.bufferId === selected.id ? jump.messageId : null}
             onLoadOlder={loadOlder} onRetry={() => setReloadSerial((current) => current + 1)}
-            onRename={beginRename} preferences={preferences} theme={preferences.theme} />
+            onRename={beginRename} onNickMenu={(nick, x, y) => setMenu({ kind: 'user', networkId: selected.networkId, nick, x, y })}
+            preferences={preferences} theme={preferences.theme} />
           <MentionComposer buffer={selected} disabled={!selectedJoined || sending}
+            knownChannels={buffers.filter((buffer) => buffer.networkId === selected.networkId && buffer.kind === 'channel')
+              .map((buffer) => buffer.name)}
+            channelListUpdatedAt={channelLists[selected.networkId]?.updatedAt ?? null}
             onSend={sendMessage} onError={(error) => setNotice(errorText(error))} autocomplete={preferences.autocomplete} />
         </> : <div className="welcome">
           <span className="welcome-glyph" aria-hidden="true">&gt;_</span>
@@ -1076,6 +1257,26 @@ export default function App() {
           }}>Add your first network</button>}
         </div>}
       </main>
+      {showingConversation && selected.kind === 'channel' && <>
+        {usersPanelOpen && <button className="user-panel-scrim" type="button" aria-label="Close users"
+          onClick={() => setUsersPanelOpen(false)} />}
+        <UserList key={selected.id} channel={selected.name} open={usersPanelOpen} onClose={() => setUsersPanelOpen(false)}
+          users={selectedDetails?.state?.users ?? null}
+          message={!selectedJoined ? 'Users are unavailable while parted.'
+            : !channelConnected ? `Users are unavailable while ${selectedState}.`
+              : selectedDetails?.error || 'Loading users…'}
+          onUserMenu={(nick, x, y) => setMenu({ kind: 'user', networkId: selected.networkId, nick, x, y })} />
+      </>}
     </div>
+    {menu && menuSpec && <ContextMenu key={JSON.stringify(menu)} x={menu.x} y={menu.y}
+      label={menuSpec.label} items={menuSpec.items} onClose={() => setMenu(null)} />}
+    {dialog?.kind === 'whois' && dialogNetwork && <WhoisDialog network={dialogNetwork} nick={dialog.nick}
+      onClose={() => setDialog(null)} onMessage={(nick) => void openQuery(dialogNetwork.id, nick)} onUnauthorized={sessionExpired} />}
+    {dialog?.kind === 'bans' && dialogBuffer && <BanListDialog buffer={dialogBuffer}
+      onClose={() => setDialog(null)} onUnauthorized={sessionExpired} />}
+    {dialog?.kind === 'ignores' && dialogNetwork && <IgnoreListDialog network={dialogNetwork}
+      ignores={ignores[dialogNetwork.id] ?? []}
+      onChange={(next) => setIgnores((current) => ({ ...current, [dialogNetwork.id]: next }))}
+      onClose={() => setDialog(null)} onUnauthorized={sessionExpired} />}
   </div>;
 }

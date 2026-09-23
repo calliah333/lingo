@@ -4,7 +4,7 @@ import { upgradeWebSocket, websocket } from 'hono/bun';
 import { getCookie, setCookie } from 'hono/cookie';
 import type { WSContext } from 'hono/ws';
 import { z } from 'zod';
-import type { MentionCandidate, ServerEvent } from '../shared/contracts.ts';
+import type { Bootstrap, MentionCandidate, ServerEvent } from '../shared/contracts.ts';
 import type { IrcManager } from './irc.ts';
 import type { Store } from './store.ts';
 
@@ -52,6 +52,9 @@ const batchBufferInput = z.strictObject({
       'Duplicate channels'),
 });
 const topicInput = z.strictObject({ topic: line(390) });
+const nickInput = z.strictObject({ nick: required(64).regex(/^[^\s,:]+$/, 'Invalid nickname') });
+const queryInput = z.strictObject({ networkId: z.number().int().positive(), nick: nickInput.shape.nick });
+const channelListInput = z.strictObject({ mask: required(100).regex(/^[^\s,:]+$/, 'Invalid mask').optional() });
 
 const sendInput = z.strictObject({
   bufferId: z.number().int().positive(),
@@ -295,7 +298,8 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
     networks: store.listNetworks(),
     buffers: store.listBuffers(),
     statuses: manager.status(),
-  }));
+    ignores: store.allIgnores(),
+  } satisfies Bootstrap));
 
   app.post('/api/networks', async (c) => {
     const input = normalizedNetworkInput(await jsonBody(c, networkInput));
@@ -337,8 +341,88 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
     const id = integer(c.req.param('id'))!;
     if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
     manager.disconnect(id);
+    manager.forgetNetwork(id);
     store.removeNetwork(id);
     publish({ type: 'network_removed', networkId: id });
+    return c.json({ ok: true });
+  });
+
+  for (const [action, connected] of [['connect', true], ['disconnect', false]] as const) {
+    app.post(`/api/networks/:id/${action}`, (c) => {
+      const id = integer(c.req.param('id'))!;
+      if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+      manager.setConnected(id, connected);
+      return c.json({ ok: true });
+    });
+  }
+
+  app.get('/api/networks/:id/channels', (c) => {
+    const id = integer(c.req.param('id'))!;
+    if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+    const query = c.req.query('q') ?? '';
+    if (query.length > 100) throw new BadRequest();
+    const limit = integer(c.req.query('limit'), 1000) ?? 200;
+    return c.json(manager.channelList(id, query, limit, c.req.query('names') === '1'));
+  });
+
+  app.post('/api/networks/:id/channels/refresh', async (c) => {
+    const id = integer(c.req.param('id'))!;
+    const { mask } = await jsonBody(c, channelListInput);
+    if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+    try {
+      manager.requestChannelList(id, mask);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : 'Cannot list channels' }, 400);
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/networks/:id/whois', async (c) => {
+    const id = integer(c.req.param('id'))!;
+    const { nick } = await jsonBody(c, nickInput);
+    if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+    try {
+      return c.json(await manager.whois(id, nick));
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : 'Cannot look up user' }, 400);
+    }
+  });
+
+  for (const [method, ignored] of [['post', true], ['delete', false]] as const) {
+    app[method]('/api/networks/:id/ignores', async (c) => {
+      const id = integer(c.req.param('id'))!;
+      const { nick } = await jsonBody(c, nickInput);
+      if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+      return c.json({ ignores: manager.setIgnored(id, nick, ignored) });
+    });
+  }
+
+  app.post('/api/buffers/query', async (c) => {
+    const { networkId, nick } = await jsonBody(c, queryInput);
+    if (!store.getNetwork(networkId)) return c.json({ error: 'Network not found' }, 404);
+    try {
+      return c.json(manager.openQuery(networkId, nick), 201);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : 'Cannot open conversation' }, 400);
+    }
+  });
+
+  app.post('/api/buffers/:id/bans', async (c) => {
+    const id = integer(c.req.param('id'))!;
+    const buffer = store.getBuffer(id);
+    if (!buffer || buffer.kind !== 'channel') return c.json({ error: 'Channel not found' }, 404);
+    try {
+      return c.json({ bans: await manager.banList(id) });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : 'Cannot list bans' }, 400);
+    }
+  });
+
+  app.delete('/api/buffers/:id/messages', (c) => {
+    const id = integer(c.req.param('id'))!;
+    if (!store.getBuffer(id)) return c.json({ error: 'Buffer not found' }, 404);
+    store.clearMessages(id);
+    publish({ type: 'history_cleared', bufferId: id });
     return c.json({ ok: true });
   });
 

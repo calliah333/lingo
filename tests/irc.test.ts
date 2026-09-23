@@ -249,3 +249,109 @@ test('tracks away presence and persists server-origin and connection events', as
     store.close();
   }
 }, 15_000);
+
+test('ranks LIST results, drops ignored senders, answers WHOIS, and keeps user disconnects', async () => {
+  const updates = new EventEmitter();
+  const connections: Connection[] = [];
+  const server = createServer(socket => {
+    const connection: Connection = {
+      socket, lines: [], pending: '', nick: '', hasUser: false, capEnded: false, welcomed: false,
+    };
+    const connectionIndex = connections.push(connection) - 1;
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string | Buffer) => {
+      connection.pending += chunk.toString();
+      let end: number;
+      while ((end = connection.pending.indexOf('\n')) !== -1) {
+        const line = connection.pending.slice(0, end).replace(/\r$/, '');
+        connection.pending = connection.pending.slice(end + 1);
+        connection.lines.push(line);
+        const nick = connection.nick;
+        if (line.startsWith('CAP LS ')) socket.write(':mock CAP * LS :\r\n');
+        else if (line.startsWith('NICK ')) connection.nick = line.slice('NICK '.length);
+        else if (line.startsWith('USER ')) connection.hasUser = true;
+        else if (line === 'CAP END') connection.capEnded = true;
+        else if (line === 'LIST') {
+          socket.write(`:mock 321 ${nick} Channel :Users Name\r\n` +
+            `:mock 322 ${nick} #small 3 :about linux\r\n` +
+            `:mock 322 ${nick} #linux 900 :kernel talk\r\n` +
+            `:mock 322 ${nick} #rust 40 :\r\n` +
+            `:mock 322 ${nick} #linguistics 40 :words\r\n` +
+            `:mock 323 ${nick} :End of /LIST\r\n`);
+        } else if (line === 'WHOIS alice') {
+          socket.write(`:mock 311 ${nick} alice ident example.org * :Alice Example\r\n` +
+            `:mock 318 ${nick} alice :End of /WHOIS list.\r\n`);
+        } else if (line === 'WHOIS ghost') {
+          socket.write(`:mock 401 ${nick} ghost :No such nick\r\n:mock 318 ${nick} ghost :End of /WHOIS list.\r\n`);
+        }
+        if (!connection.welcomed && connection.nick && connection.hasUser && connection.capEnded) {
+          connection.welcomed = true;
+          socket.write(`:mock 001 ${connection.nick} :Welcome\r\nPING :barrier-${connectionIndex}\r\n`);
+        }
+        updates.emit('change');
+      }
+    });
+    updates.emit('change');
+  });
+  const store = new Store(':memory:');
+  const manager = new IrcManager(store, () => updates.emit('change'));
+  try {
+    const listening = Promise.withResolvers<void>();
+    server.once('error', listening.reject);
+    server.listen(0, '127.0.0.1', listening.resolve);
+    await listening.promise;
+    server.off('error', listening.reject);
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected ephemeral TCP port');
+    const network = store.createNetwork({
+      name: 'actions', host: '127.0.0.1', port: address.port, tls: false,
+      nick: 'tester', username: 'tester', realname: 'Test User',
+      saslAccount: '', autojoin: [], commands: [],
+      relayNicks: [], mentionAliases: [], displayNames: {},
+    });
+    manager.start();
+    await waitFor(updates, () => connections[0]?.lines.some(line => /^PONG :?barrier-0$/.test(line)) ?? false, 'registration');
+
+    manager.requestChannelList(network.id);
+    expect(() => manager.requestChannelList(network.id)).toThrow('Channel list already in progress');
+    await waitFor(updates, () => manager.channelList(network.id, '', 10, false).state === 'complete', 'LIST completion');
+    expect(manager.channelList(network.id, '', 10, false).channels.map(channel => channel.name))
+      .toEqual(['#linux', '#linguistics', '#rust', '#small']);
+    const byName = manager.channelList(network.id, 'lin', 1, true);
+    expect(byName.matched).toBe(2);
+    expect(byName.channels).toEqual([{ name: '#linux', users: 900, topic: 'kernel talk' }]);
+    expect(manager.channelList(network.id, 'linux', 10, false).channels.map(channel => channel.name))
+      .toEqual(['#linux', '#small']);
+
+    manager.setIgnored(network.id, 'Spammer', true);
+    connections[0]!.socket.write(':spammer!s@host PRIVMSG tester :buy now\r\n:alice!a@host PRIVMSG tester :hello\r\n');
+    await waitFor(updates, () => store.listBuffers().some(buffer => buffer.kind === 'query' && buffer.name === 'alice'),
+      'message after the ignored one');
+    expect(store.listBuffers().some(buffer => buffer.name === 'spammer')).toBe(false);
+    expect(store.searchMessages('buy', { networkId: network.id }).messages).toEqual([]);
+
+    expect(await manager.whois(network.id, 'alice')).toMatchObject({
+      nick: 'alice', found: true, ident: 'ident', hostname: 'example.org', realName: 'Alice Example',
+    });
+    expect(await manager.whois(network.id, 'ghost')).toMatchObject({ nick: 'ghost', found: false });
+
+    manager.setConnected(network.id, false);
+    expect(manager.status()[network.id]?.state).toBe('disconnected');
+    manager.stop();
+    manager.start();
+    // A user-disconnected network stays offline across restarts instead of dialing.
+    expect(manager.status()[network.id]?.state).toBe('disconnected');
+    manager.setConnected(network.id, true);
+    await waitFor(updates, () => connections[1]?.lines.some(line => /^PONG :?barrier-1$/.test(line)) ?? false,
+      'reconnect after explicit connect');
+  } finally {
+    manager.stop();
+    for (const connection of connections) connection.socket.destroy();
+    if (server.listening) {
+      const closed = Promise.withResolvers<void>();
+      server.close(() => closed.resolve());
+      await closed.promise;
+    }
+    store.close();
+  }
+}, 15_000);

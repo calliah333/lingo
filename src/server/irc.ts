@@ -1,5 +1,9 @@
 import { Client, type IrcEvent } from 'irc-framework';
 import type {
+  BanEntry,
+  ChannelListEntry,
+  ChannelListPage,
+  ChannelListStatus,
   ChannelState,
   ChannelUser,
   ChatBuffer,
@@ -8,8 +12,22 @@ import type {
   Network,
   NetworkStatus,
   ServerEvent,
+  WhoisInfo,
 } from '../shared/contracts.ts';
+import { displayIdentity } from '../shared/identity.ts';
 import type { Store } from './store.ts';
+
+/** Bounds memory on networks with very large LIST replies. */
+const CHANNEL_LIST_LIMIT = 100_000;
+const REQUEST_TIMEOUT_MS = 10_000;
+const PENDING_LIMIT = 20;
+
+type Pending<T> = {
+  key: string;
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+};
 
 type Runtime = {
   network: Network;
@@ -21,8 +39,15 @@ type Runtime = {
   retryTimer: NodeJS.Timeout | null;
   joined: Set<string>;
   channels: Map<string, { topic: string | null; users: Map<string, { nick: string; modes: string[] }> }>;
-  listRemaining: number;
-  listCount: number;
+  channelList: {
+    state: ChannelListStatus['state'];
+    entries: Map<string, ChannelListEntry>;
+    sorted: ChannelListEntry[] | null;
+    updatedAt: number | null;
+    publishedAt: number;
+  };
+  pendingWhois: Pending<WhoisInfo>[];
+  pendingBans: Pending<BanEntry[]>[];
 };
 
 function isChannel(name: string): boolean {
@@ -55,6 +80,7 @@ export class IrcManager {
   private readonly connections = new Map<number, Runtime>();
   private readonly statuses = new Map<number, NetworkStatus>();
   private readonly knownBuffers = new Set<number>();
+  private readonly ignores = new Map<number, string[]>();
   private started = false;
   private browserPresent = false;
 
@@ -68,7 +94,9 @@ export class IrcManager {
     this.started = true;
     this.knownBuffers.clear();
     for (const buffer of this.store.listBuffers()) this.knownBuffers.add(buffer.id);
-    for (const network of this.store.listNetworks()) this.connect(network);
+    for (const network of this.store.listNetworks()) {
+      if (!this.store.isNetworkDisconnected(network.id)) this.connect(network);
+    }
   }
 
   stop(): void {
@@ -92,8 +120,9 @@ export class IrcManager {
       retryTimer: null,
       joined: new Set(),
       channels: new Map(),
-      listRemaining: -1,
-      listCount: 0,
+      channelList: { state: 'idle', entries: new Map(), sorted: null, updatedAt: null, publishedAt: 0 },
+      pendingWhois: [],
+      pendingBans: [],
     };
     this.connections.set(network.id, runtime);
     this.setStatus(runtime, 'connecting');
@@ -114,7 +143,7 @@ export class IrcManager {
       runtime.registered = false;
       this.clearChannels(runtime);
       runtime.joined.clear();
-      runtime.listRemaining = -1;
+      this.endRequests(runtime, 'Connection lost');
       this.scheduleRetry(runtime, 'Connection lost');
     });
     client.on('privmsg', (event: IrcEvent) => this.incoming(runtime, 'privmsg', event));
@@ -231,25 +260,63 @@ export class IrcManager {
       }
     });
     client.on<IrcEvent[]>('channel list', (entries) => {
-      if (!runtime.active || runtime.listRemaining <= 0) return;
-      const buffer = this.serverBuffer(network.id);
+      const list = runtime.channelList;
+      if (!runtime.active || list.state !== 'loading') return;
       for (const entry of entries) {
-        if (!runtime.listRemaining) break;
-        if (!entry.channel) continue;
-        const count = Number.isFinite(entry.num_users) ? entry.num_users : 0;
-        const topic = (entry.topic ?? '').replace(/[\r\n\0]/g, ' ').slice(0, 250);
-        this.system(buffer, `${entry.channel} — ${count} users${topic ? ` — ${topic}` : ''}`, Date.now(), true);
-        runtime.listRemaining--;
-        runtime.listCount++;
+        if (list.entries.size >= CHANNEL_LIST_LIMIT) break;
+        if (!entry.channel || !isChannel(entry.channel)) continue;
+        list.entries.set(entry.channel.toLowerCase(), {
+          name: entry.channel,
+          users: Number.isFinite(entry.num_users) ? Math.max(0, entry.num_users!) : 0,
+          topic: (entry.topic ?? '').replace(/[\r\n\0]/g, ' ').slice(0, 390),
+        });
       }
+      list.sorted = null;
+      list.updatedAt = Date.now();
+      // Large networks reply in thousands of batches; progress updates are throttled.
+      if (list.updatedAt - list.publishedAt >= 1_000) this.publishChannelList(runtime);
     });
     client.on('channel list end', () => {
-      if (!runtime.active || runtime.listRemaining < 0) return;
-      this.system(this.serverBuffer(network.id),
-        `LIST complete: ${runtime.listCount} channel${runtime.listCount === 1 ? '' : 's'} shown${runtime.listRemaining === 0 ? ' (limit reached)' : ''}`,
-        Date.now());
-      runtime.listRemaining = -1;
+      if (runtime.active) this.finishChannelList(runtime);
     });
+    client.on<Record<string, unknown>>('whois', (event) => {
+      if (!runtime.active || typeof event.nick !== 'string') return;
+      const text = (value: unknown) => typeof value === 'string' && value ? value : undefined;
+      const seconds = (value: unknown) => {
+        const number = typeof value === 'string' || typeof value === 'number' ? Number(value) : NaN;
+        return Number.isFinite(number) && number >= 0 ? number : undefined;
+      };
+      const signon = seconds(event.logon);
+      this.settle(runtime, runtime.pendingWhois, event.nick, {
+        nick: event.nick,
+        found: event.error !== 'not_found',
+        ident: text(event.ident),
+        hostname: text(event.hostname),
+        realName: text(event.real_name),
+        account: text(event.account),
+        server: text(event.server),
+        serverInfo: text(event.server_info),
+        channels: text(event.channels),
+        away: text(event.away),
+        operator: text(event.operator),
+        secure: event.secure === true ? true : undefined,
+        idleSeconds: seconds(event.idle),
+        signonTime: signon === undefined ? undefined : signon * 1000,
+      });
+    });
+    client.on<{ channel?: string; bans?: Array<{ banned?: string; banned_by?: string; banned_at?: string }> }>(
+      'banlist', (event) => {
+        if (!runtime.active || !event.channel) return;
+        this.settle(runtime, runtime.pendingBans, event.channel, (event.bans ?? []).flatMap(ban => {
+          if (!ban.banned) return [];
+          const setAt = Number(ban.banned_at);
+          return [{
+            mask: ban.banned,
+            setBy: ban.banned_by ?? '',
+            setAt: ban.banned_at && Number.isFinite(setAt) && setAt > 0 ? setAt * 1000 : null,
+          }];
+        }));
+      });
     client.on('sasl failed', () => {
       if (runtime.active) this.setStatus(runtime, runtime.status.state, undefined, 'SASL authentication failed');
     });
@@ -265,6 +332,9 @@ export class IrcManager {
     runtime.registered = false;
     clearTimeout(runtime.retryTimer ?? undefined);
     this.clearChannels(runtime);
+    runtime.channelList = { state: 'idle', entries: new Map(), sorted: null, updatedAt: null, publishedAt: 0 };
+    this.endRequests(runtime, 'Network disconnected');
+    this.publishChannelList(runtime);
     runtime.retryTimer = null;
     this.connections.delete(id);
     // end() cancels irc-framework's ping/reconnect timers; disposing the transport also
@@ -277,7 +347,148 @@ export class IrcManager {
   }
 
   update(network: Network): void {
-    this.connect(network);
+    if (this.store.isNetworkDisconnected(network.id)) this.disconnect(network.id);
+    else this.connect(network);
+  }
+
+  /** Persists the user's choice so restarts and settings edits keep the network offline. */
+  setConnected(networkId: number, connected: boolean): void {
+    const network = this.store.getNetwork(networkId);
+    if (!network) throw new Error('Network not found');
+    this.store.setNetworkDisconnected(networkId, !connected);
+    if (connected) this.connect(network);
+    else this.disconnect(networkId);
+  }
+
+  requestChannelList(networkId: number, mask?: string): void {
+    const runtime = this.registeredRuntime(networkId);
+    if (mask !== undefined && (mask.length > 100 || !safeToken(mask))) throw new Error('Usage: /list [mask]');
+    if (runtime.channelList.state === 'loading') throw new Error('Channel list already in progress');
+    runtime.channelList = { state: 'loading', entries: new Map(), sorted: null, updatedAt: Date.now(), publishedAt: 0 };
+    this.publishChannelList(runtime);
+    if (mask) runtime.client.list(mask);
+    else runtime.client.list();
+  }
+
+  channelList(networkId: number, query: string, limit: number, namesOnly: boolean): ChannelListPage {
+    const runtime = this.connections.get(networkId);
+    if (!runtime) return { networkId, state: 'idle', total: 0, updatedAt: null, matched: 0, channels: [] };
+    const list = runtime.channelList;
+    list.sorted ??= [...list.entries.values()]
+      .sort((a, b) => b.users - a.users || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    const needle = query.trim().toLowerCase();
+    const channels: ChannelListEntry[] = [];
+    let matched = 0;
+    for (const entry of list.sorted) {
+      if (needle && !entry.name.toLowerCase().includes(needle) &&
+        (namesOnly || !entry.topic.toLowerCase().includes(needle))) continue;
+      matched++;
+      if (channels.length < limit) channels.push(entry);
+    }
+    return { ...this.channelListStatus(runtime), matched, channels };
+  }
+
+  whois(networkId: number, nick: string): Promise<WhoisInfo> {
+    const runtime = this.registeredRuntime(networkId);
+    if (!safeToken(nick) || isChannel(nick) || nick.length > 64) throw new Error('Invalid nickname');
+    return this.request(runtime, runtime.pendingWhois, nick, () => runtime.client.raw('WHOIS', nick), 'WHOIS');
+  }
+
+  banList(bufferId: number): Promise<BanEntry[]> {
+    const buffer = this.store.getBuffer(bufferId);
+    if (!buffer || buffer.kind !== 'channel') throw new Error('Channel not found');
+    const runtime = this.registeredRuntime(buffer.networkId);
+    return this.request(runtime, runtime.pendingBans, buffer.name,
+      () => runtime.client.raw('MODE', buffer.name, '+b'), 'Ban list');
+  }
+
+  ignoreList(networkId: number): string[] {
+    let ignores = this.ignores.get(networkId);
+    if (!ignores) {
+      ignores = this.store.listIgnores(networkId);
+      this.ignores.set(networkId, ignores);
+    }
+    return ignores;
+  }
+
+  setIgnored(networkId: number, nick: string, ignored: boolean): string[] {
+    if (!this.store.getNetwork(networkId)) throw new Error('Network not found');
+    if (ignored) this.store.addIgnore(networkId, nick);
+    else this.store.removeIgnore(networkId, nick);
+    const ignores = this.store.listIgnores(networkId);
+    this.ignores.set(networkId, ignores);
+    this.publish({ type: 'ignores', networkId, ignores });
+    return ignores;
+  }
+
+  forgetNetwork(networkId: number): void {
+    this.ignores.delete(networkId);
+  }
+
+  openQuery(networkId: number, nick: string): ChatBuffer {
+    if (!this.store.getNetwork(networkId)) throw new Error('Network not found');
+    if (!safeToken(nick) || isChannel(nick) || nick.length > 64) throw new Error('Invalid nickname');
+    return this.ensureBuffer(networkId, nick, 'query');
+  }
+
+  private registeredRuntime(networkId: number): Runtime {
+    const runtime = this.connections.get(networkId);
+    if (!runtime?.registered) throw new Error('Network is not connected');
+    return runtime;
+  }
+
+  private request<T>(runtime: Runtime, queue: Pending<T>[], key: string, send: () => void, label: string): Promise<T> {
+    if (queue.length >= PENDING_LIMIT) throw new Error('Too many pending requests');
+    const { promise, resolve, reject } = Promise.withResolvers<T>();
+    const duplicate = queue.some(entry => runtime.client.caseCompare(entry.key, key));
+    const entry: Pending<T> = {
+      key, resolve, reject,
+      timer: setTimeout(() => {
+        queue.splice(queue.indexOf(entry), 1);
+        reject(new Error(`${label} request timed out`));
+      }, REQUEST_TIMEOUT_MS),
+    };
+    queue.push(entry);
+    // Concurrent requests for the same target share one IRC reply.
+    if (!duplicate) send();
+    return promise;
+  }
+
+  private settle<T>(runtime: Runtime, queue: Pending<T>[], key: string, value: T): void {
+    for (let index = queue.length - 1; index >= 0; index--) {
+      const entry = queue[index]!;
+      if (!runtime.client.caseCompare(entry.key, key)) continue;
+      clearTimeout(entry.timer);
+      queue.splice(index, 1);
+      entry.resolve(value);
+    }
+  }
+
+  private endRequests(runtime: Runtime, reason: string): void {
+    for (const queue of [runtime.pendingWhois, runtime.pendingBans] as Pending<unknown>[][]) {
+      for (const entry of queue.splice(0)) {
+        clearTimeout(entry.timer);
+        entry.reject(new Error(reason));
+      }
+    }
+    if (runtime.channelList.state === 'loading') this.finishChannelList(runtime);
+  }
+
+  private channelListStatus(runtime: Runtime): ChannelListStatus {
+    const list = runtime.channelList;
+    return { networkId: runtime.network.id, state: list.state, total: list.entries.size, updatedAt: list.updatedAt };
+  }
+
+  private publishChannelList(runtime: Runtime): void {
+    runtime.channelList.publishedAt = Date.now();
+    this.publish({ type: 'channel_list', status: this.channelListStatus(runtime) });
+  }
+
+  private finishChannelList(runtime: Runtime): void {
+    if (runtime.channelList.state !== 'loading') return;
+    runtime.channelList.state = 'complete';
+    runtime.channelList.updatedAt = Date.now();
+    this.publishChannelList(runtime);
   }
 
   status(): Record<number, NetworkStatus> {
@@ -483,11 +694,7 @@ export class IrcManager {
         return;
       }
       case 'list': {
-        if (args && (args.length > 100 || !safeToken(args))) throw new Error('Usage: /list [mask]');
-        if (runtime.listRemaining >= 0) throw new Error('Channel list already in progress');
-        runtime.listRemaining = 100;
-        runtime.listCount = 0;
-        runtime.client.raw('LIST', ...(args ? [args] : []));
+        this.requestChannelList(runtime.network.id, args || undefined);
         return;
       }
       case 'part': {
@@ -593,6 +800,15 @@ export class IrcManager {
       runtime.client.caseCompare(event.target, runtime.status.nick) &&
       !event.ident && !event.hostname;
     const fromNetwork = !!event.from_server || serverNotice;
+    const ignores = this.ignoreList(runtime.network.id);
+    if (!fromNetwork && event.nick && ignores.length) {
+      const nick = event.nick;
+      const network = this.store.getNetwork(runtime.network.id) ?? runtime.network;
+      // Ignoring a bridged user matches the relayed nick as well as the IRC sender.
+      const relayed = displayIdentity({ nick, text: event.message }, network.relayNicks).mentionTarget;
+      if (ignores.some(ignored => runtime.client.caseCompare(ignored, nick) ||
+        (!!relayed && runtime.client.caseCompare(ignored, relayed)))) return;
+    }
     const name = isChannel(event.target) ? event.target : fromNetwork ? undefined : event.nick;
     const buffer = name
       ? this.ensureBuffer(runtime.network.id, name, isChannel(event.target) ? 'channel' : 'query')
@@ -650,7 +866,6 @@ export class IrcManager {
     if (!runtime.active || !config) return;
     this.clearChannels(runtime);
     runtime.joined.clear();
-    runtime.listRemaining = -1;
     this.setStatus(runtime, runtime.retryCount ? 'reconnecting' : 'connecting');
     try {
       runtime.client.connect({
