@@ -4,10 +4,12 @@ import { Database } from 'bun:sqlite';
 import type {
   ChatBuffer,
   ChatMessage,
+  MentionCandidate,
   Network,
   NetworkConfig,
   NetworkInput,
 } from '../shared/contracts.ts';
+import { displayIdentity } from '../shared/identity.ts';
 
 type NetworkRow = {
   id: number;
@@ -22,6 +24,9 @@ type NetworkRow = {
   sasl_password: string;
   autojoin: string;
   commands: string;
+  relay_nicks: string;
+  mention_aliases: string;
+  display_names: string;
 };
 
 type BufferRow = {
@@ -54,6 +59,9 @@ function networkFromRow(row: NetworkRow): Network {
     saslAccount: row.sasl_account,
     autojoin: JSON.parse(row.autojoin) as string[],
     commands: JSON.parse(row.commands) as string[],
+    relayNicks: JSON.parse(row.relay_nicks) as string[],
+    mentionAliases: JSON.parse(row.mention_aliases) as string[],
+    displayNames: JSON.parse(row.display_names) as Record<string, string>,
   };
 }
 
@@ -99,12 +107,13 @@ export class Store {
       throw new Error('Could not read database schema version');
     }
     const version = versionRow.user_version;
-    if (version > 1) throw new Error(`Unsupported database schema version ${version}`);
-    if (version !== 0) return;
+    if (version > 2) throw new Error(`Unsupported database schema version ${version}`);
+    if (version === 2) return;
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.exec(`
+      if (version === 0) {
+        this.db.exec(`
         CREATE TABLE networks (
           id INTEGER PRIMARY KEY,
           name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -117,7 +126,10 @@ export class Store {
           sasl_account TEXT NOT NULL,
           sasl_password TEXT NOT NULL,
           autojoin TEXT NOT NULL,
-          commands TEXT NOT NULL
+          commands TEXT NOT NULL,
+          relay_nicks TEXT NOT NULL DEFAULT '[]',
+          mention_aliases TEXT NOT NULL DEFAULT '[]',
+          display_names TEXT NOT NULL DEFAULT '{}'
         );
         CREATE TABLE buffers (
           id INTEGER PRIMARY KEY,
@@ -158,8 +170,15 @@ export class Store {
             VALUES ('delete', old.id, old.text, old.nick);
           INSERT INTO messages_fts(rowid, text, nick) VALUES (new.id, new.text, new.nick);
         END;
-        PRAGMA user_version = 1;
-      `);
+        `);
+      } else {
+        this.db.exec(`
+          ALTER TABLE networks ADD COLUMN relay_nicks TEXT NOT NULL DEFAULT '[]';
+          ALTER TABLE networks ADD COLUMN mention_aliases TEXT NOT NULL DEFAULT '[]';
+          ALTER TABLE networks ADD COLUMN display_names TEXT NOT NULL DEFAULT '{}';
+        `);
+      }
+      this.db.exec('PRAGMA user_version = 2');
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -174,11 +193,14 @@ export class Store {
   createNetwork(input: NetworkInput): Network {
     const result = this.db.query(`
       INSERT INTO networks (name, host, port, tls, nick, username, realname,
-                            sasl_account, sasl_password, autojoin, commands)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            sasl_account, sasl_password, autojoin, commands, relay_nicks,
+                            mention_aliases, display_names)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(input.name, input.host, input.port, Number(input.tls), input.nick,
       input.username, input.realname, input.saslAccount, input.saslPassword ?? '',
-      JSON.stringify(input.autojoin), JSON.stringify(input.commands));
+      JSON.stringify(input.autojoin), JSON.stringify(input.commands),
+      JSON.stringify(input.relayNicks), JSON.stringify(input.mentionAliases),
+      JSON.stringify(input.displayNames));
     return this.getNetwork(Number(result.lastInsertRowid))!;
   }
 
@@ -187,12 +209,15 @@ export class Store {
     if (!existing) return null;
     this.db.query(`
       UPDATE networks SET name = ?, host = ?, port = ?, tls = ?, nick = ?, username = ?,
-                          realname = ?, sasl_account = ?, sasl_password = ?, autojoin = ?, commands = ?
+                          realname = ?, sasl_account = ?, sasl_password = ?, autojoin = ?, commands = ?,
+                          relay_nicks = ?, mention_aliases = ?, display_names = ?
       WHERE id = ?
     `).run(input.name, input.host, input.port, Number(input.tls), input.nick,
       input.username, input.realname, input.saslAccount,
       input.saslPassword?.trim() ? input.saslPassword : existing.saslPassword,
-      JSON.stringify(input.autojoin), JSON.stringify(input.commands), id);
+      JSON.stringify(input.autojoin), JSON.stringify(input.commands),
+      JSON.stringify(input.relayNicks), JSON.stringify(input.mentionAliases),
+      JSON.stringify(input.displayNames), id);
     return this.getNetwork(id);
   }
 
@@ -256,6 +281,39 @@ export class Store {
       ORDER BY id DESC LIMIT ?
     `).all(bufferId, before ?? Number.MAX_SAFE_INTEGER, size + 1) as MessageRow[];
     return { messages: rows.slice(0, size).reverse().map(messageFromRow), hasMore: rows.length > size };
+  }
+
+  listRecentParticipants(bufferId: number, limit = 100): MentionCandidate[] {
+    const size = Number.isFinite(limit) ? Math.max(0, Math.min(100, Math.trunc(limit))) : 100;
+    if (size === 0) return [];
+    const network = this.db.query(`
+      SELECT n.relay_nicks, n.display_names FROM buffers AS b
+      JOIN networks AS n ON n.id = b.network_id
+      WHERE b.id = ?
+    `).get(bufferId) as { relay_nicks: string; display_names: string } | null;
+    if (!network) return [];
+
+    const relayNicks = JSON.parse(network.relay_nicks) as string[];
+    const displayNames = JSON.parse(network.display_names) as Record<string, string>;
+    const rows = this.db.query(`
+      SELECT nick, text FROM messages
+      WHERE buffer_id = ? AND kind != 'system'
+      ORDER BY id DESC LIMIT 2000
+    `).all(bufferId) as Pick<MessageRow, 'nick' | 'text'>[];
+    const seen = new Set<string>();
+    const participants: MentionCandidate[] = [];
+    for (const row of rows) {
+      const identity = displayIdentity(row, relayNicks, displayNames);
+      const name = identity.nick?.trim();
+      const mention = identity.mentionTarget?.trim();
+      if (!name || !mention) continue;
+      const key = mention.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      participants.push({ name, mention });
+      if (participants.length === size) break;
+    }
+    return participants;
   }
 
   searchMessages(

@@ -96,6 +96,7 @@ test('part preserves indexed channel history and prevents rejoin on restart', as
       name: 'mock', host: '127.0.0.1', port: address.port, tls: false,
       nick: 'tester', username: 'tester', realname: 'Test User',
       saslAccount: '', autojoin: [channel], commands: [],
+      relayNicks: [], mentionAliases: [], displayNames: {},
     });
     manager.start();
     await waitFor(updates, () => connections[0]?.lines.includes(`JOIN ${channel}`) ?? false, 'initial autojoin');

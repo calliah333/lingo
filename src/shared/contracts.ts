@@ -10,6 +10,14 @@ export interface NetworkInput {
   saslPassword?: string;
   autojoin: string[];
   commands: string[];
+  relayNicks: string[];
+  mentionAliases: string[];
+  displayNames: Record<string, string>;
+}
+
+export interface MentionCandidate {
+  name: string;
+  mention: string;
 }
 
 export type Network = Omit<NetworkInput, 'saslPassword'> & {

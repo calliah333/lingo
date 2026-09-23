@@ -20,6 +20,9 @@ type Fields = {
   saslPassword: string;
   autojoin: string;
   commands: string;
+  relayNicks: string;
+  mentionAliases: string;
+  displayNames: string;
 };
 
 const emptyFields = (): Fields => ({
@@ -34,10 +37,38 @@ const emptyFields = (): Fields => ({
   saslPassword: '',
   autojoin: '',
   commands: '',
+  relayNicks: '',
+  mentionAliases: '',
+  displayNames: '',
 });
 
 function lines(value: string): string[] {
   return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function parseDisplayNames(value: string): Record<string, string> | string {
+  const entries: Array<[string, string]> = [];
+  const seen = new Set<string>();
+  for (const [index, line] of value.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    const separator = line.indexOf('=');
+    if (separator < 0 || line.indexOf('=', separator + 1) >= 0) {
+      return `Display name line ${index + 1} must use ircNick = Friendly name.`;
+    }
+    const source = line.slice(0, separator).trim();
+    const label = line.slice(separator + 1).trim();
+    if (!source || !label) {
+      return `Display name line ${index + 1} needs both an IRC nickname and a friendly name.`;
+    }
+    const key = source.toLowerCase();
+    if (seen.has(key)) {
+      return `Display name nickname "${source}" is listed more than once.`;
+    }
+    seen.add(key);
+    entries.push([source, label]);
+    if (seen.size > 100) return 'Enter no more than 100 display name overrides.';
+  }
+  return Object.fromEntries(entries);
 }
 
 function errorMessage(error: unknown): string {
@@ -73,6 +104,9 @@ export default function NetworkSettings({
       saslPassword: '',
       autojoin: network.autojoin.join('\n'),
       commands: network.commands.join('\n'),
+      relayNicks: network.relayNicks.join('\n'),
+      mentionAliases: network.mentionAliases.join('\n'),
+      displayNames: Object.entries(network.displayNames).map(([source, label]) => `${source} = ${label}`).join('\n'),
     });
   }, [network]);
 
@@ -97,6 +131,12 @@ export default function NetworkSettings({
       return;
     }
 
+    const displayNames = parseDisplayNames(fields.displayNames);
+    if (typeof displayNames === 'string') {
+      setValidationError(displayNames);
+      return;
+    }
+
     setValidationError('');
     setSaveError('');
     setDeleteError('');
@@ -112,6 +152,9 @@ export default function NetworkSettings({
       saslAccount: fields.saslAccount.trim(),
       autojoin: lines(fields.autojoin),
       commands: lines(fields.commands),
+      relayNicks: lines(fields.relayNicks),
+      mentionAliases: lines(fields.mentionAliases),
+      displayNames,
       ...(fields.saslPassword ? { saslPassword: fields.saslPassword } : {}),
     };
     try {
@@ -200,6 +243,21 @@ export default function NetworkSettings({
           <label htmlFor="network-commands">Registration commands</label>
           <textarea id="network-commands" name="commands" rows={3} value={fields.commands} onChange={(event) => update('commands', event.target.value)} aria-describedby="commands-help" />
           <span className="settings-help" id="commands-help">Run after connecting, one IRC command per line.</span>
+        </div>
+        <div className="settings-field">
+          <label htmlFor="network-relay-nicks">Relay bridge nicknames</label>
+          <textarea id="network-relay-nicks" name="relayNicks" rows={3} value={fields.relayNicks} onChange={(event) => update('relayNicks', event.target.value)} aria-describedby="relay-nicks-help" />
+          <span className="settings-help" id="relay-nicks-help">One relay bot nickname per line. Relay messages appear as [username] message or &lt;username&gt; message.</span>
+        </div>
+        <div className="settings-field">
+          <label htmlFor="network-mention-aliases">Mention aliases</label>
+          <textarea id="network-mention-aliases" name="mentionAliases" rows={3} value={fields.mentionAliases} onChange={(event) => update('mentionAliases', event.target.value)} aria-describedby="mention-aliases-help" />
+          <span className="settings-help" id="mention-aliases-help">One name per line that should highlight you; include your bridge handle.</span>
+        </div>
+        <div className="settings-field">
+          <label htmlFor="network-display-names">Display name overrides</label>
+          <textarea id="network-display-names" name="displayNames" rows={3} value={fields.displayNames} onChange={(event) => update('displayNames', event.target.value)} aria-describedby="display-names-help" />
+          <span className="settings-help" id="display-names-help">One override per line: ircNick = Friendly name.</span>
         </div>
         {validationError && <p className="settings-error" role="alert">{validationError}</p>}
         {saveError && <p className="settings-error" role="alert">Could not save network: {saveError}</p>}

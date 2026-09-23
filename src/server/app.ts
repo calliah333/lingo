@@ -27,6 +27,10 @@ const networkInput = z.strictObject({
   saslPassword: line(1024).optional(),
   autojoin: z.array(required(100).regex(/^[#&+!][^\s,\x00-\x1f\x7f]+$/, 'Invalid channel')).max(100),
   commands: z.array(required(512)).max(50),
+  relayNicks: z.array(required(64)).max(20).default([]),
+  mentionAliases: z.array(required(64)).max(20).default([]),
+  displayNames: z.record(required(64), required(64))
+    .refine(names => Object.keys(names).length <= 100, 'Too many display names').default({}),
 });
 const loginInput = z.strictObject({ password: z.string() });
 const bufferInput = z.strictObject({
@@ -221,9 +225,29 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
   app.patch('/api/networks/:id', async (c) => {
     const id = integer(c.req.param('id'))!;
     const input = normalizedNetworkInput(await jsonBody(c, networkInput));
+    const existing = store.getNetworkConfig(id);
     const network = store.updateNetwork(id, input);
     if (!network) return c.json({ error: 'Network not found' }, 404);
-    manager.update(network);
+
+    const saslPassword = input.saslPassword?.trim() ? input.saslPassword : existing?.saslPassword;
+    const reconnect = !existing ||
+      existing.name !== network.name ||
+      existing.host !== network.host ||
+      existing.port !== network.port ||
+      existing.tls !== network.tls ||
+      existing.nick !== network.nick ||
+      existing.username !== network.username ||
+      existing.realname !== network.realname ||
+      existing.saslAccount !== network.saslAccount ||
+      existing.saslPassword !== saslPassword ||
+      JSON.stringify(existing.autojoin) !== JSON.stringify(network.autojoin) ||
+      JSON.stringify(existing.commands) !== JSON.stringify(network.commands);
+
+    if (reconnect) {
+      manager.update(network);
+    } else {
+      publish({ type: 'network', networkId: id, status: manager.status()[id] });
+    }
     return c.json(network);
   });
 
