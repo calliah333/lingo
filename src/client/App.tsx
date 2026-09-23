@@ -1,9 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type {
   Bootstrap, ChatBuffer, ChatMessage, Network, NetworkInput, NetworkStatus, ServerEvent,
 } from '../shared/contracts';
+import { displayIdentity, mentionsAny } from '../shared/identity';
+import MentionComposer from './MentionComposer';
 import NetworkSettings from './NetworkSettings';
 import SearchPanel from './SearchPanel';
+import ThemePicker, { type Theme } from './ThemePicker';
+import Transcript from './Transcript';
 
 type MessagePage = { messages: ChatMessage[]; hasMore: boolean };
 type View = {
@@ -41,9 +45,25 @@ function errorText(error: unknown): string {
 
 function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
   if (!incoming.length) return current;
-  const byId = new Map(current.map((message) => [message.id, message]));
-  for (const message of incoming) byId.set(message.id, message);
-  return [...byId.values()].sort((a, b) => a.id - b.id);
+  if (!current.length) return incoming;
+  if (incoming[0].id > current.at(-1)!.id) return [...current, ...incoming];
+  if (incoming.at(-1)!.id < current[0].id) return [...incoming, ...current];
+  const merged: ChatMessage[] = [];
+  let left = 0;
+  let right = 0;
+  while (left < current.length && right < incoming.length) {
+    const currentId = current[left].id;
+    const incomingId = incoming[right].id;
+    if (currentId < incomingId) merged.push(current[left++]);
+    else if (currentId > incomingId) merged.push(incoming[right++]);
+    else {
+      merged.push(incoming[right++]);
+      left++;
+    }
+  }
+  while (left < current.length) merged.push(current[left++]);
+  while (right < incoming.length) merged.push(incoming[right++]);
+  return merged;
 }
 
 function messagePage(bufferId: number, before?: number, signal?: AbortSignal): Promise<MessagePage> {
@@ -61,13 +81,14 @@ function isJoined(network: Network | undefined, channel: string): boolean {
   return !!network?.autojoin.some((name) => sameChannel(name, channel));
 }
 
-function nickColor(nick: string): string {
-  let hash = 0;
-  for (const character of nick.toLowerCase()) hash = (Math.imul(hash, 31) + character.charCodeAt(0)) | 0;
-  return `hsl(${Math.abs(hash % 360)} 58% 72%)`;
+function savedTheme(): Theme {
+  try {
+    const theme = localStorage.getItem('lingo-theme');
+    return theme === 'light' || theme === 'gruber' ? theme : 'dark';
+  } catch {
+    return 'dark';
+  }
 }
-
-const clock = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
 
 export default function App() {
   const [auth, setAuth] = useState<'checking' | 'login' | 'ready' | 'unavailable'>('checking');
@@ -80,7 +101,6 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [view, setView] = useState<View>({ bufferId: null, messages: [], hasMore: false, loading: false, error: '' });
   const [olderPending, setOlderPending] = useState(false);
-  const [composer, setComposer] = useState('');
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState('');
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting');
@@ -90,7 +110,11 @@ export default function App() {
   const [joinNetworkId, setJoinNetworkId] = useState<number | null>(null);
   const [joinName, setJoinName] = useState('');
   const [joining, setJoining] = useState(false);
+  const [theme, setTheme] = useState<Theme>(savedTheme);
+  const [renameTarget, setRenameTarget] = useState<{ networkId: number; nick: string } | null>(null);
+  const [renameValue, setRenameValue] = useState('');
   const [unread, setUnread] = useState<Record<number, number>>({});
+  const [mentionUnread, setMentionUnread] = useState<Record<number, number>>({});
   const [jump, setJump] = useState<Jump | null>(null);
   const [reloadSerial, setReloadSerial] = useState(0);
 
@@ -102,17 +126,18 @@ export default function App() {
   jumpRef.current = jump;
   const buffersRef = useRef(buffers);
   buffersRef.current = buffers;
+  const networksRef = useRef(networks);
+  networksRef.current = networks;
+  const statusesRef = useRef(statuses);
+  statusesRef.current = statuses;
   const generation = useRef(0);
   const bootstrapRequest = useRef(0);
   const receivedMessageIds = useRef(new Set<number>());
   const receivedMessageOrder = useRef<number[]>([]);
   const receivedMessageCursor = useRef(0);
   const jumpSerial = useRef(0);
-  const scrolledJump = useRef(0);
-  const logRef = useRef<HTMLDivElement>(null);
-  const atBottom = useRef(true);
-  const prependPosition = useRef<{ height: number; top: number } | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const messageQueue = useRef<ChatMessage[]>([]);
+  const messageFrame = useRef<number | null>(null);
 
   const fail = useCallback((error: unknown) => {
     if (error instanceof ApiError && error.status === 401) {
@@ -149,6 +174,10 @@ export default function App() {
     });
     return () => controller.abort();
   }, [refreshBootstrap]);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem('lingo-theme', theme); } catch { /* Storage may be disabled. */ }
+  }, [theme]);
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -196,15 +225,17 @@ export default function App() {
         setSettingsTarget(null);
         setSidebarOpen(false);
         setJoinNetworkId(null);
+        setRenameTarget(null);
         return;
       }
       const target = event.target;
       const typing = target instanceof HTMLElement
         && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
       if (event.key === '/' && !typing && !event.altKey && !event.ctrlKey && !event.metaKey) {
-        if (inputRef.current) {
+        const input = document.querySelector<HTMLInputElement>('.composer input');
+        if (input) {
           event.preventDefault();
-          inputRef.current.focus();
+          input.focus();
         }
       }
     }
@@ -245,25 +276,49 @@ export default function App() {
 
     function receive(event: ServerEvent) {
       switch (event.type) {
-        case 'message':
+        case 'message': {
           if (receivedMessageIds.current.has(event.message.id)) break;
           const order = receivedMessageOrder.current;
           const slot = receivedMessageCursor.current % 2000;
           const expired = order[slot];
           if (expired !== undefined) receivedMessageIds.current.delete(expired);
           order[slot] = event.message.id;
+          receivedMessageIds.current.add(event.message.id);
           receivedMessageCursor.current++;
-          if (!jumpRef.current && selectedRef.current === event.message.bufferId) {
-            setView((current) => current.bufferId === event.message.bufferId
-              ? { ...current, messages: mergeMessages(current.messages, [event.message]) }
-              : current);
-          } else {
-            setUnread((current) => ({ ...current, [event.message.bufferId]: (current[event.message.bufferId] ?? 0) + 1 }));
+          messageQueue.current.push(event.message);
+          if (messageFrame.current === null) {
+            messageFrame.current = requestAnimationFrame(() => {
+              messageFrame.current = null;
+              const queued = messageQueue.current;
+              messageQueue.current = [];
+              const selectedBufferId = selectedRef.current;
+              if (selectedBufferId !== null && !jumpRef.current) {
+                const selectedMessages = queued.filter((message) => message.bufferId === selectedBufferId);
+                if (selectedMessages.length) setView((current) => current.bufferId === selectedBufferId
+                  ? { ...current, messages: mergeMessages(current.messages, selectedMessages) }
+                  : current);
+              }
+            });
           }
-          if (!buffersRef.current.some((buffer) => buffer.id === event.message.bufferId)) {
+          const buffer = buffersRef.current.find((item) => item.id === event.message.bufferId);
+          const network = buffer && networksRef.current.find((item) => item.id === buffer.networkId);
+          if (selectedRef.current !== event.message.bufferId || jumpRef.current) {
+            setUnread((current) => ({ ...current, [event.message.bufferId]: (current[event.message.bufferId] ?? 0) + 1 }));
+            if (network && event.message.nick) {
+              const ownNames = [...new Set([statusesRef.current[network.id]?.nick, network.nick, ...network.mentionAliases].filter(Boolean))] as string[];
+              const identity = displayIdentity(event.message, network.relayNicks, network.displayNames);
+              const sender = identity.mentionTarget ?? event.message.nick;
+              const isOwnMessage = ownNames.some((name) => name.toLowerCase() === sender.toLowerCase());
+              if (!isOwnMessage && mentionsAny(identity.text, ownNames)) {
+                setMentionUnread((current) => ({ ...current, [event.message.bufferId]: (current[event.message.bufferId] ?? 0) + 1 }));
+              }
+            }
+          }
+          if (!buffer) {
             void refreshBootstrap(controller.signal).catch((error: unknown) => { if (!controller.signal.aborted) fail(error); });
           }
           break;
+        }
         case 'buffer':
           setBuffers((current) => current.some((buffer) => buffer.id === event.buffer.id)
             ? current.map((buffer) => buffer.id === event.buffer.id ? event.buffer : buffer)
@@ -274,6 +329,7 @@ export default function App() {
           setBuffers(remaining);
           setSelectedId((selected) => selected === event.bufferId ? (remaining[0]?.id ?? null) : selected);
           setUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
+          setMentionUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
           break;
         }
         case 'network':
@@ -324,6 +380,9 @@ export default function App() {
       active = false;
       controller.abort();
       window.clearTimeout(retryTimer);
+      if (messageFrame.current !== null) cancelAnimationFrame(messageFrame.current);
+      messageFrame.current = null;
+      messageQueue.current = [];
       socket?.close();
     };
   }, [auth, fail, refreshBootstrap]);
@@ -338,8 +397,10 @@ export default function App() {
       if (bufferId === null || !current[bufferId]) return current;
       const next = { ...current }; delete next[bufferId]; return next;
     });
-    atBottom.current = true;
-    prependPosition.current = null;
+    setMentionUnread((current) => {
+      if (bufferId === null || !current[bufferId]) return current;
+      const next = { ...current }; delete next[bufferId]; return next;
+    });
     setView({ bufferId, messages: [], hasMore: false, loading: bufferId !== null, error: '' });
     if (bufferId !== null) {
       const before = jump?.bufferId === bufferId ? jump.messageId + 1 : undefined;
@@ -357,34 +418,17 @@ export default function App() {
     return () => controller.abort();
   }, [auth, selectedId, jump, reloadSerial, fail]);
 
-  useLayoutEffect(() => {
-    const log = logRef.current;
-    if (!log || view.bufferId !== selectedId) return;
-    if (prependPosition.current) {
-      log.scrollTop = prependPosition.current.top + log.scrollHeight - prependPosition.current.height;
-      atBottom.current = false;
-      prependPosition.current = null;
-    } else if (jump && !view.loading && jump.bufferId === selectedId && scrolledJump.current !== jump.serial) {
-      const target = Array.from(log.querySelectorAll<HTMLElement>('[data-message-id]'))
-        .find((element) => element.dataset.messageId === String(jump.messageId));
-      if (target) {
-        target.scrollIntoView({ block: 'center' });
-        scrolledJump.current = jump.serial;
-      }
-    } else if (atBottom.current && !jump) {
-      log.scrollTop = log.scrollHeight;
-    }
-  }, [view, selectedId, jump]);
-
   function selectBuffer(id: number) {
     setJump(null);
     setSelectedId(id);
+    setRenameTarget(null);
     setSearchOpen(false);
     setSettingsTarget(null);
     setSidebarOpen(false);
     setNotice('');
     setUnread((current) => { const next = { ...current }; delete next[id]; return next; });
-    inputRef.current?.focus();
+    setMentionUnread((current) => { const next = { ...current }; delete next[id]; return next; });
+    document.querySelector<HTMLInputElement>('.composer input')?.focus();
   }
 
   async function loadOlder() {
@@ -397,9 +441,6 @@ export default function App() {
     try {
       const page = await messagePage(selectedId, oldest);
       if (generation.current !== currentGeneration || selectedRef.current !== selectedId) return;
-      const log = logRef.current;
-      atBottom.current = false;
-      if (log) prependPosition.current = { height: log.scrollHeight, top: log.scrollTop };
       setView((current) => current.bufferId !== selectedId ? current : {
         ...current, messages: mergeMessages(current.messages, page.messages), hasMore: page.hasMore,
       });
@@ -410,23 +451,63 @@ export default function App() {
     }
   }
 
-  async function send(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (selectedId === null || sending || !composer.trim()) return;
-    const text = composer;
+  async function sendMessage(text: string) {
+    if (selectedId === null || sending || !text.trim()) return;
     setSending(true);
     setNotice('');
     try {
       await api<{ ok: true }>('/api/send', json('POST', { bufferId: selectedId, text }));
-      setComposer((current) => current === text ? '' : current);
-      inputRef.current?.focus();
     } catch (error) {
       fail(error);
+      throw error;
     } finally {
       setSending(false);
     }
   }
 
+  async function renameNick(mentionTarget: string, displayName: string) {
+    const network = activeNetwork;
+    if (!network) return;
+    const canonicalKey = mentionTarget.toLowerCase();
+    const displayNames = { ...network.displayNames };
+    for (const key of Object.keys(displayNames)) {
+      if (key.toLowerCase() === canonicalKey) delete displayNames[key];
+    }
+    if (displayName.trim()) displayNames[canonicalKey] = displayName.trim();
+    const input: NetworkInput = {
+      name: network.name,
+      host: network.host,
+      port: network.port,
+      tls: network.tls,
+      nick: network.nick,
+      username: network.username,
+      realname: network.realname,
+      saslAccount: network.saslAccount,
+      autojoin: network.autojoin,
+      commands: network.commands,
+      relayNicks: network.relayNicks,
+      mentionAliases: network.mentionAliases,
+      displayNames,
+    };
+    setNotice('');
+    try {
+      await api<Network>(`/api/networks/${network.id}`, json('PATCH', input));
+      await refreshBootstrap();
+      setRenameTarget(null);
+      setRenameValue('');
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  function beginRename(mentionTarget: string) {
+    if (!activeNetwork) return;
+    const canonicalKey = mentionTarget.toLowerCase();
+    const existing = Object.entries(activeNetwork.displayNames)
+      .find(([key]) => key.toLowerCase() === canonicalKey)?.[1] ?? '';
+    setRenameTarget({ networkId: activeNetwork.id, nick: canonicalKey });
+    setRenameValue(existing);
+  }
   async function join(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (joinNetworkId === null || joining || !joinName.trim()) return;
@@ -497,6 +578,7 @@ export default function App() {
     setJump({ bufferId: message.bufferId, messageId: message.id, serial: ++jumpSerial.current });
     setSelectedId(message.bufferId);
     setSearchOpen(false);
+    setRenameTarget(null);
     setSidebarOpen(false);
     setSettingsTarget(null);
     setNotice('');
@@ -528,6 +610,7 @@ export default function App() {
             {loginPending ? 'Signing in…' : 'Sign in'}
           </button>
         </form>}
+        <ThemePicker theme={theme} onChange={setTheme} />
       </div>
     </main>;
   }
@@ -553,6 +636,7 @@ export default function App() {
         <button className="button button-quiet" type="button" onClick={() => { setSearchOpen(true); setSettingsTarget(null); }}>Search <kbd>⌕</kbd></button>
         <button className="button button-quiet" type="button" onClick={() => { setSettingsTarget('new'); setSearchOpen(false); }}>Add network</button>
         <button className="button button-quiet logout-button" type="button" onClick={() => void logout()}>Sign out</button>
+        <ThemePicker theme={theme} onChange={setTheme} />
       </div>
     </header>
     <div className="workspace">
@@ -591,8 +675,10 @@ export default function App() {
                     aria-current={selectedId === buffer.id ? 'page' : undefined} onClick={() => selectBuffer(buffer.id)}>
                     <span className="buffer-prefix">{buffer.kind === 'channel' ? '#' : buffer.kind === 'query' ? '@' : '⌁'}</span>
                     <span className="buffer-name">{buffer.kind === 'channel' ? buffer.name.replace(/^#/, '') : buffer.name}</span>
-                    {parted && <span className="buffer-parted">left</span>}
-                    {!!unread[buffer.id] && <span className="unread-badge" aria-label={`${unread[buffer.id]} unread messages`}>{unread[buffer.id]}</span>}
+                    {!!mentionUnread[buffer.id] && <span className="unread-badge mention-badge"
+                      aria-label={`${mentionUnread[buffer.id]} unread mentions`}>{mentionUnread[buffer.id]}</span>}
+                    {!!unread[buffer.id] && <span className="unread-badge"
+                      aria-label={`${unread[buffer.id]} unread messages`}>{unread[buffer.id]}</span>}
                   </button>
                   {parted && <button type="button" className="buffer-rejoin" disabled={joining}
                     aria-label={`Rejoin ${buffer.name} on ${network.name}`} onClick={() => void rejoin(buffer)}>↻</button>}
@@ -612,6 +698,17 @@ export default function App() {
           <header className="conversation-header">
             <div className="conversation-title">
               <span className="conversation-overline">{activeNetwork?.name ?? 'Network'} <span className="divider">/</span> {selected.kind}</span>
+              {renameTarget && renameTarget.networkId === activeNetwork?.id && <form className="nick-rename" onSubmit={(event) => {
+                event.preventDefault();
+                void renameNick(renameTarget.nick, renameValue);
+              }}>
+                <label className="sr-only" htmlFor="nick-display-name">Display name for {renameTarget.nick}</label>
+                <span aria-hidden="true">{renameTarget.nick}</span>
+                <input id="nick-display-name" autoFocus value={renameValue} onChange={(event) => setRenameValue(event.target.value)}
+                  placeholder="Display name" maxLength={64} />
+                <button className="button button-primary" type="submit">Save</button>
+                <button className="button button-quiet" type="button" onClick={() => setRenameTarget(null)}>Cancel</button>
+              </form>}
               <h1>{selected.name}</h1>
             </div>
             <div className="conversation-actions">
@@ -630,35 +727,14 @@ export default function App() {
             {jump && jump.bufferId === selected.id && <span className="history-indicator">Viewing search result</span>}
             {selected.kind === 'channel' && !selectedJoined && <span className="buffer-state">Parted — history is retained</span>}
           </div>
-          <div className="message-scroll" ref={logRef} role="log" aria-label={`Messages in ${selected.name}`} aria-live="off"
-            onScroll={(event) => {
-              const element = event.currentTarget;
-              atBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
-            }}>
-            <div className="history-controls">
-              {showingView && view.hasMore && <button className="button button-quiet" type="button" onClick={() => void loadOlder()} disabled={olderPending}>
-                {olderPending ? 'Loading…' : 'Load older messages'}
-              </button>}
-              {showingView && view.error && <div className="error-text" role="alert">{view.error} <button className="text-button" type="button" onClick={() => setReloadSerial((current) => current + 1)}>Retry</button></div>}
-              {(!showingView || view.loading) && <span className="muted" role="status">Loading messages…</span>}
-              {showingView && !view.loading && !view.error && !messages.length && <span className="muted">No messages yet. This buffer is ready when you are.</span>}
-            </div>
-            <ol className="message-list">
-              {messages.map((message) => <li className={`message-row message-${message.kind}${jump?.messageId === message.id ? ' message-highlight' : ''}`}
-                key={message.id} data-message-id={message.id}>
-                <time className="message-time" dateTime={new Date(message.time).toISOString()} title={new Date(message.time).toLocaleString()}>{clock.format(message.time)}</time>
-                <span className="message-nick" style={message.nick ? { color: nickColor(message.nick) } : undefined}>{message.nick ?? (message.kind === 'system' ? 'server' : 'notice')}</span>
-                <span className="message-text">{message.text}</span>
-              </li>)}
-            </ol>
-          </div>
-          <form className="composer" onSubmit={send}>
-            <span className="composer-prompt" aria-hidden="true">›</span>
-            <label className="sr-only" htmlFor="message-input">Message to {selected.name}</label>
-            <input id="message-input" ref={inputRef} type="text" autoComplete="off" value={composer}
-              onChange={(event) => setComposer(event.target.value)} placeholder={selected.kind === 'server' ? 'Type a command…' : `Message ${selected.name} or /command…`} disabled={!selectedJoined} />
-            <button className="button button-primary send-button" type="submit" disabled={sending || !composer.trim()}>{sending ? 'Sending…' : 'Send ↵'}</button>
-          </form>
+          <Transcript buffer={selected} network={activeNetwork!} messages={messages}
+            ownNames={[...new Set([statuses[selected.networkId]?.nick, activeNetwork?.nick, ...(activeNetwork?.mentionAliases ?? [])].filter(Boolean))] as string[]}
+            loading={!showingView || view.loading} hasMore={showingView && view.hasMore} olderPending={olderPending}
+            error={showingView ? view.error : ''} jumpId={jump?.bufferId === selected.id ? jump.messageId : null}
+            onLoadOlder={loadOlder} onRetry={() => setReloadSerial((current) => current + 1)}
+            onRename={beginRename} theme={theme} />
+          <MentionComposer buffer={selected} disabled={!selectedJoined || sending}
+            onSend={sendMessage} onError={(error) => setNotice(errorText(error))} />
         </> : <div className="welcome">
           <span className="welcome-glyph" aria-hidden="true">&gt;_</span>
           <h1>{networks.length ? 'Select a buffer' : 'Connect to IRC'}</h1>

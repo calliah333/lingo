@@ -441,8 +441,8 @@ kbd { font: 16px var(--mono); color: var(--kbd); }
   .topbar-actions { gap: 0; }
   .topbar-actions .button { padding-inline: 8px; }
   .topbar-actions .button:nth-child(2) { display: none; }
-  .sidebar { position: absolute; z-index: 10; top: 0; bottom: 0; left: 0; width: min(83vw, 275px); transform: translateX(-100%); transition: transform .18s ease; box-shadow: 12px 0 36px var(--drawer-shadow); }
-  .sidebar-open { transform: translateX(0); }
+  .sidebar { position: absolute; z-index: 10; top: 0; bottom: 0; left: 0; width: min(83vw, 275px); transform: translateX(-100%); transition: transform .18s ease; }
+  .sidebar-open { transform: translateX(0); box-shadow: 12px 0 36px var(--drawer-shadow); }
   .sidebar-scrim { position: absolute; z-index: 9; inset: 0; background: var(--scrim); border: 0; }
   .conversation-header { padding-inline: 16px; min-height: 67px; }
   .conversation-meta { padding-inline: 16px; }
@@ -461,4 +461,39 @@ kbd { font: 16px var(--mono); color: var(--kbd); }
   .search-panel__query-label { grid-column: auto; }
   .settings-actions-spacer { flex-basis: 100%; }
   .theme-picker select { max-width: 86px; }
+}
+
+.message-list { position: relative; }
+.message-row { position: absolute; top: 0; left: 0; width: 100%; min-height: 23px; }
+.message-nick {
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.message-nick:hover { text-decoration: underline; text-underline-offset: 2px; }
+.message-nick:focus-visible { border-radius: 2px; }
+.nick-rename { display: flex; align-items: center; gap: 6px; margin-top: 7px; color: var(--muted); font: 11px var(--mono); }
+.nick-rename input { width: min(190px, 38vw); height: 31px; font: 11px var(--mono); }
+.nick-rename .button { min-height: 30px; padding: 3px 8px; font-size: 11px; }
+.auth-card > .theme-picker { margin-top: 22px; }
+.theme-picker__label { color: var(--muted); }
+
+@media (max-width: 640px) {
+  .topbar { gap: 5px; }
+  .topbar-actions { gap: 2px; }
+  .topbar-actions .theme-picker { margin-left: 4px; }
+  .conversation-header { align-items: flex-start; }
+  .conversation-title { flex: 1; }
+  .nick-rename { flex-wrap: wrap; }
+  .message-row { grid-template-columns: 40px minmax(58px, 88px) minmax(0, 1fr); gap: 7px; padding-inline: 12px; }
+}
+@media (max-width: 430px) {
+  .message-row { grid-template-columns: 34px minmax(48px, 68px) minmax(0, 1fr); gap: 5px; padding-inline: 8px; }
+  .topbar-actions .theme-picker { gap: 0; }
+  .topbar-actions .theme-picker select { max-width: 105px; }
+  .topbar-actions .button:first-child { font-size: 0; padding-inline: 6px; }
+  .nick-rename input { width: 120px; }
 }

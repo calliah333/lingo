@@ -1,13 +1,13 @@
-import { Client } from 'irc-framework';
+import { Client, type IrcEvent } from 'irc-framework';
 import type {
   ChatBuffer,
   ChatMessage,
+  MentionCandidate,
   Network,
   NetworkStatus,
   ServerEvent,
 } from '../shared/contracts.ts';
 import type { Store } from './store.ts';
-import type { IrcEvent } from 'irc-framework';
 
 type Runtime = {
   network: Network;
@@ -18,6 +18,7 @@ type Runtime = {
   retryCount: number;
   retryTimer: NodeJS.Timeout | null;
   joined: Set<string>;
+  liveUsers: Map<string, Set<string>>;
 };
 
 function isChannel(name: string): boolean {
@@ -76,6 +77,7 @@ export class IrcManager {
       retryCount: 0,
       retryTimer: null,
       joined: new Set(),
+      liveUsers: new Map(),
     };
     this.connections.set(network.id, runtime);
     this.setStatus(runtime, 'connecting');
@@ -96,20 +98,62 @@ export class IrcManager {
     client.on('privmsg', (event: IrcEvent) => this.incoming(runtime, 'privmsg', event));
     client.on('notice', (event: IrcEvent) => this.incoming(runtime, 'notice', event));
     client.on('action', (event: IrcEvent) => this.incoming(runtime, 'action', event));
+    client.on('userlist', (event: IrcEvent) => {
+      if (!runtime.active || !event.channel || !Array.isArray(event.users)) return;
+      const users = new Set<string>();
+      for (const user of event.users) {
+        if (user?.nick) users.add(user.nick);
+      }
+      runtime.liveUsers.set(event.channel.toLowerCase(), users);
+    });
     client.on('join', (event: IrcEvent) => {
-      if (!runtime.active || !event.channel || !event.nick ||
-        !client.caseCompare(event.nick, client.user.nick)) return;
-      runtime.joined.add(event.channel.toLowerCase());
+      if (!runtime.active || !event.channel || !event.nick) return;
+      const key = event.channel.toLowerCase();
+      const users = runtime.liveUsers.get(key) ?? new Set<string>();
+      users.add(event.nick);
+      runtime.liveUsers.set(key, users);
+      if (!client.caseCompare(event.nick, client.user.nick)) return;
+      runtime.joined.add(key);
       const buffer = this.ensureBuffer(network.id, event.channel, 'channel');
       this.system(buffer, `Joined ${event.channel}`, eventTime(event));
     });
     client.on('part', (event: IrcEvent) => {
-      if (!runtime.active || !event.channel || !event.nick ||
-        !client.caseCompare(event.nick, client.user.nick)) return;
-      runtime.joined.delete(event.channel.toLowerCase());
+      if (!runtime.active || !event.channel || !event.nick) return;
+      const key = event.channel.toLowerCase();
+      const users = runtime.liveUsers.get(key);
+      if (users) {
+        this.deleteNick(client, users, event.nick);
+        if (users.size === 0) runtime.liveUsers.delete(key);
+      }
+      if (!client.caseCompare(event.nick, client.user.nick)) return;
+      runtime.joined.delete(key);
+      runtime.liveUsers.delete(key);
+    });
+    client.on('quit', (event: IrcEvent) => {
+      if (!runtime.active || !event.nick) return;
+      for (const [channel, users] of runtime.liveUsers) {
+        this.deleteNick(client, users, event.nick);
+        if (users.size === 0) runtime.liveUsers.delete(channel);
+      }
+    });
+    client.on('kick', (event: IrcEvent) => {
+      if (!runtime.active || !event.channel || !event.kicked) return;
+      const key = event.channel.toLowerCase();
+      const users = runtime.liveUsers.get(key);
+      if (users) {
+        this.deleteNick(client, users, event.kicked);
+        if (users.size === 0) runtime.liveUsers.delete(key);
+      }
+      if (client.caseCompare(event.kicked, client.user.nick)) {
+        runtime.joined.delete(key);
+        runtime.liveUsers.delete(key);
+      }
     });
     client.on('nick', (event: IrcEvent) => {
       if (!runtime.active || !event.nick || !event.new_nick) return;
+      for (const users of runtime.liveUsers.values()) {
+        if (this.deleteNick(client, users, event.nick)) users.add(event.new_nick);
+      }
       if (client.caseCompare(event.nick, runtime.status.nick)) {
         this.setStatus(runtime, runtime.status.state, event.new_nick);
         const buffer = this.serverBuffer(network.id);
@@ -153,6 +197,41 @@ export class IrcManager {
     return Object.fromEntries(this.store.listNetworks().map(network => [
       network.id, { ...(this.statuses.get(network.id) ?? { state: 'disconnected', nick: network.nick }) },
     ]));
+  }
+
+  listLiveParticipants(bufferId: number): MentionCandidate[] {
+    const buffer = this.store.getBuffer(bufferId);
+    if (!buffer || buffer.kind !== 'channel') return [];
+    const runtime = this.connections.get(buffer.networkId);
+    if (!runtime) return [];
+    const users = runtime.liveUsers.get(buffer.name.toLowerCase());
+    if (!users) return [];
+    const network = this.store.getNetwork(buffer.networkId) ?? runtime.network;
+    const relayNicks = new Set(network.relayNicks.map(nick => nick.toLowerCase()));
+    const displayNames = network.displayNames;
+    const participants: MentionCandidate[] = [];
+    for (const mention of users) {
+      if (relayNicks.has(mention.toLowerCase())) continue;
+      let name = mention;
+      for (const source in displayNames) {
+        if (Object.hasOwn(displayNames, source) && source.toLowerCase() === mention.toLowerCase() &&
+          displayNames[source]?.trim()) {
+          name = displayNames[source]!;
+          break;
+        }
+      }
+      participants.push({ name, mention });
+    }
+    return participants;
+  }
+
+  private deleteNick(client: Client, users: Set<string>, nick: string): boolean {
+    for (const current of users) {
+      if (!client.caseCompare(current, nick)) continue;
+      users.delete(current);
+      return true;
+    }
+    return false;
   }
 
   forgetBuffer(id: number): void {
@@ -375,6 +454,7 @@ export class IrcManager {
   private dial(runtime: Runtime, config = this.store.getNetworkConfig(runtime.network.id)): void {
     if (!runtime.active || !config) return;
     runtime.joined.clear();
+    runtime.liveUsers.clear();
     this.setStatus(runtime, runtime.retryCount ? 'reconnecting' : 'connecting');
     try {
       runtime.client.connect({

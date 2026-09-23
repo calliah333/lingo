@@ -4,7 +4,7 @@ import { upgradeWebSocket, websocket } from 'hono/bun';
 import { getCookie, setCookie } from 'hono/cookie';
 import type { WSContext } from 'hono/ws';
 import { z } from 'zod';
-import type { ServerEvent } from '../shared/contracts.ts';
+import type { MentionCandidate, ServerEvent } from '../shared/contracts.ts';
 import type { IrcManager } from './irc.ts';
 import type { Store } from './store.ts';
 
@@ -269,6 +269,24 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
       return c.json({ error: error instanceof Error ? error.message : 'Cannot join channel' }, 400);
     }
     return c.json(store.getOrCreateBuffer(networkId, name, 'channel'), 201);
+  });
+
+  app.get('/api/buffers/:id/participants', (c) => {
+    const id = integer(c.req.param('id'))!;
+    const buffer = store.getBuffer(id);
+    if (!buffer) return c.json({ error: 'Buffer not found' }, 404);
+    const seen = new Set<string>();
+    const participants: MentionCandidate[] = [];
+    for (const candidate of [...manager.listLiveParticipants(id), ...store.listRecentParticipants(id)]) {
+      const mention = candidate.mention.trim();
+      if (!mention) continue;
+      const key = mention.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      participants.push({ name: candidate.name, mention });
+      if (participants.length === 100) break;
+    }
+    return c.json({ participants });
   });
 
   app.delete('/api/buffers/:id', (c) => {

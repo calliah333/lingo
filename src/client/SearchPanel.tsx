@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { displayIdentity } from '../shared/identity';
 import type { ChatBuffer, ChatMessage, Network } from '../shared/contracts';
 
 type SearchResponse = {
@@ -24,16 +26,30 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
   const [error, setError] = useState('');
   const requestId = useRef(0);
   const activeRequest = useRef<AbortController | null>(null);
-
+  const loadingMore = useRef(false);
+  const resultsRef = useRef<HTMLDivElement>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: messages.length,
+    getScrollElement: () => resultsRef.current,
+    estimateSize: () => 84,
+    overscan: 6,
+    getItemKey: (index) => messages[index]?.id ?? index,
+  });
   const resetResults = () => {
     requestId.current += 1;
     activeRequest.current?.abort();
     activeRequest.current = null;
+    loadingMore.current = false;
     setMessages([]);
     setHasMore(false);
     setError('');
     setLoading(false);
+    if (resultsRef.current) resultsRef.current.scrollTop = 0;
   };
+  useEffect(() => () => {
+    requestId.current += 1;
+    activeRequest.current?.abort();
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setQuery(input.trim()), 250);
@@ -81,10 +97,10 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
 
     return () => controller.abort();
   }, [query, networkId, bufferId]);
-
   const loadMore = async () => {
     const lastMessage = messages[messages.length - 1];
-    if (!query || !hasMore || !lastMessage || loading) return;
+    if (!query || !hasMore || !lastMessage || loading || loadingMore.current) return;
+    loadingMore.current = true;
 
     activeRequest.current?.abort();
     const controller = new AbortController();
@@ -108,14 +124,20 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
         setError(reason instanceof Error ? reason.message : 'Search failed');
       }
     } finally {
-      if (requestId.current === currentRequest) setLoading(false);
+      if (requestId.current === currentRequest) {
+        loadingMore.current = false;
+        setLoading(false);
+      }
     }
   };
 
-  const networkNames = new Map(networks.map((network) => [network.id, network.name]));
-  const filteredBuffers = networkId
-    ? buffers.filter((buffer) => String(buffer.networkId) === networkId)
-    : buffers;
+  const networkById = useMemo(() => new Map(networks.map((network) => [network.id, network])), [networks]);
+  const networkNames = useMemo(() => new Map(networks.map((network) => [network.id, network.name])), [networks]);
+  const bufferById = useMemo(() => new Map(buffers.map((buffer) => [buffer.id, buffer])), [buffers]);
+  const filteredBuffers = useMemo(
+    () => networkId ? buffers.filter((buffer) => String(buffer.networkId) === networkId) : buffers,
+    [buffers, networkId],
+  );
 
   return (
     <section className="search-panel" aria-label="Search history">
@@ -172,33 +194,41 @@ export default function SearchPanel({ networks, buffers, onClose, onJump }: Sear
           </select>
         </label>
       </div>
-      <div className="search-panel__results" aria-live="polite" aria-busy={loading}>
+      <div className="search-panel__results" ref={resultsRef} aria-live="polite" aria-busy={loading}>
         {!input.trim() && <p className="search-panel__status">Enter a search phrase to find stored messages.</p>}
         {input.trim() && query !== input.trim() && <p className="search-panel__status">Waiting to search…</p>}
-        {loading && <p className="search-panel__status">Searching…</p>}
-        {error && <p className="search-panel__error" role="alert">{error}</p>}
         {!loading && !error && query && messages.length === 0 && <p className="search-panel__status">No matching messages.</p>}
         {messages.length > 0 && (
-          <ol className="search-panel__list">
-            {messages.map((message) => {
-              const buffer = buffers.find((item) => item.id === message.bufferId);
-              const networkName = networkNames.get(message.networkId) ?? 'Unknown network';
+          <ol className="search-panel__list" style={{ height: rowVirtualizer.getTotalSize(), position: 'relative' }}>
+            {rowVirtualizer.getVirtualItems().map((row) => {
+              const message = messages[row.index]!;
+              const buffer = bufferById.get(message.bufferId);
+              const network = networkById.get(message.networkId);
+              const identity = displayIdentity(message, network?.relayNicks ?? [], network?.displayNames);
               return (
-                <li className="search-panel__item" key={message.id}>
+                <li
+                  className="search-panel__item"
+                  key={row.key}
+                  data-index={row.index}
+                  ref={rowVirtualizer.measureElement}
+                  style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${row.start}px)` }}
+                >
                   <button className="search-panel__result" type="button" onClick={() => onJump(message)}>
                     <span className="search-panel__context">
                       <time dateTime={new Date(message.time).toISOString()}>{new Date(message.time).toLocaleString()}</time>
-                      <span>{networkName}</span>
+                      <span>{network?.name ?? 'Unknown network'}</span>
                       <span>{buffer?.name ?? 'Unknown buffer'}</span>
-                      {message.nick && <span>{message.nick}</span>}
+                      {identity.nick && <span>{identity.nick}</span>}
                     </span>
-                    <span className="search-panel__text">{message.text}</span>
+                    <span className="search-panel__text">{identity.text}</span>
                   </button>
                 </li>
               );
             })}
           </ol>
         )}
+        {loading && <p className="search-panel__status">Searching…</p>}
+        {error && <p className="search-panel__error" role="alert">{error}</p>}
         {hasMore && (
           <button className="search-panel__more" type="button" onClick={() => void loadMore()} disabled={loading}>
             {loading ? 'Loading…' : 'Load more'}

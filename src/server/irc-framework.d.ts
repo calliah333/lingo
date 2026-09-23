@@ -16,6 +16,8 @@ declare module 'irc-framework' {
     new_nick?: string;
     target?: string;
     channel?: string;
+    users?: Array<{ nick: string }>;
+    kicked?: string;
     topic?: string;
     message?: string;
     time?: number;
