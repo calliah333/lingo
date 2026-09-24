@@ -1,0 +1,11 @@
+.git
+node_modules
+dist
+local
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db3

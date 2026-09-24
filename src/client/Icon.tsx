@@ -26,6 +26,9 @@ const paths = {
   user: <><circle cx="12" cy="8.5" r="3.8" /><path d="M4.5 20c.7-4 3.6-6 7.5-6s6.8 2 7.5 6" /></>,
   palette: <><path d="M12 3.5a8.5 8.5 0 1 0 0 17c1.1 0 1.8-.7 1.8-1.6 0-.5-.2-.9-.5-1.3s-.5-.8-.5-1.3c0-1 .8-1.7 1.8-1.7h2.1a3.8 3.8 0 0 0 3.8-3.8c0-4-3.8-7.3-8.5-7.3Z" /><circle cx="7.8" cy="11.5" r="1" /><circle cx="10.4" cy="7.6" r="1" /><circle cx="15" cy="8" r="1" /></>,
   check: <path d="m5 12.5 4.5 4.5L19 7.5" />,
+  download: <path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14" />,
+  keyboard: <><rect x="2.5" y="6" width="19" height="12" rx="2" /><path d="M6.5 10h.01M10 10h.01M13.5 10h.01M17 10h.01M8 14.5h8" /></>,
+  paperclip: <path d="m20 11.5-7.8 7.8a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8" />,
 } as const;
 
 export type IconName = keyof typeof paths;

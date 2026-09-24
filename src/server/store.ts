@@ -12,6 +12,8 @@ import type {
   NetworkConfig,
   NetworkInput,
   SyncedSettings,
+  UploadPage,
+  UploadRecord,
 } from '../shared/contracts.ts';
 import { displayIdentity } from '../shared/identity.ts';
 
@@ -31,6 +33,9 @@ type NetworkRow = {
   relay_nicks: string;
   mention_aliases: string;
   display_names: string;
+  backfill: number;
+  join_delay_seconds: number;
+  regain_nick: number;
 };
 
 type BufferRow = {
@@ -57,6 +62,9 @@ type MessageRow = {
 /** A browser push subscription: its endpoint URL and the keys that encrypt payloads for it. */
 export type PushTarget = { endpoint: string; p256dh: string; auth: string };
 
+/** What a history export covers: one buffer, or every buffer on a network. */
+export type ExportScope = { bufferId: number } | { networkId: number };
+
 type SettingsRow = { data: string };
 
 function defaultSettings(): SyncedSettings {
@@ -82,6 +90,9 @@ function networkFromRow(row: NetworkRow): Network {
     relayNicks: JSON.parse(row.relay_nicks) as string[],
     mentionAliases: JSON.parse(row.mention_aliases) as string[],
     displayNames: JSON.parse(row.display_names) as Record<string, string>,
+    backfill: row.backfill === 1,
+    joinDelaySeconds: row.join_delay_seconds,
+    regainNick: row.regain_nick === 1,
   };
 }
 
@@ -116,6 +127,14 @@ function pageSize(limit: number | undefined): number {
   return Math.max(1, Math.trunc(limit));
 }
 
+type UploadRow = { id: number; url: string; filename: string; size: number; expires_at: number | null; created_at: number };
+
+function uploadFromRow(row: UploadRow): UploadRecord {
+  return {
+    id: row.id, url: row.url, filename: row.filename, size: row.size, expiresAt: row.expires_at, createdAt: row.created_at,
+  };
+}
+
 /** A user's network quota prevented a new network from being created. */
 export class NetworkLimitReached extends Error {
   constructor() {
@@ -146,8 +165,8 @@ export class Store {
       throw new Error('Could not read database schema version');
     }
     const version = versionRow.user_version;
-    if (version > 10) throw new Error(`Unsupported database schema version ${version}`);
-    if (version === 10) return;
+    if (version > 14) throw new Error(`Unsupported database schema version ${version}`);
+    if (version === 14) return;
 
     // Rebuilding tables that other tables reference requires foreign keys off outside the
     // transaction (https://sqlite.org/lang_altertable.html#otheralter); integrity is rechecked below.
@@ -172,11 +191,15 @@ export class Store {
         if (version < 7) this.migrateToV7();
         if (version < 8) this.migrateToV8();
         if (version < 9) this.migrateToV9();
-        this.migrateToV10();
+        if (version < 10) this.migrateToV10();
+        if (version < 11) this.migrateToV11();
+        if (version < 12) this.migrateToV12();
+        if (version < 13) this.migrateToV13();
+        this.migrateToV14();
         if (this.db.query('PRAGMA foreign_key_check').all().length) {
           throw new Error('Database migration left dangling references');
         }
-        this.db.exec('PRAGMA user_version = 10');
+        this.db.exec('PRAGMA user_version = 14');
         this.db.exec('COMMIT');
       } catch (error) {
         this.db.exec('ROLLBACK');
@@ -320,6 +343,51 @@ export class Store {
     `);
   }
 
+  /** IRCv3 message ids, unique per buffer, so echoed and replayed copies are stored once. */
+  private migrateToV11(): void {
+    this.db.exec(`
+      ALTER TABLE messages ADD COLUMN msgid TEXT;
+      CREATE UNIQUE INDEX messages_msgid ON messages(buffer_id, msgid) WHERE msgid IS NOT NULL;
+    `);
+  }
+
+  /** Per-network choice to replay missed history with IRCv3 chathistory; existing networks opt in. */
+  private migrateToV12(): void {
+    this.db.exec('ALTER TABLE networks ADD COLUMN backfill INTEGER NOT NULL DEFAULT 1 CHECK (backfill IN (0, 1))');
+  }
+
+  /** Per-network connect options: a delay before autojoin and regaining the preferred nick; both off. */
+  private migrateToV13(): void {
+    this.db.exec(`
+      ALTER TABLE networks ADD COLUMN join_delay_seconds INTEGER NOT NULL DEFAULT 0
+        CHECK (join_delay_seconds BETWEEN 0 AND 30);
+      ALTER TABLE networks ADD COLUMN regain_nick INTEGER NOT NULL DEFAULT 0 CHECK (regain_nick IN (0, 1));
+    `);
+  }
+
+  /**
+   * Upload permission (on for the admin) and the record of files each user sent to teacup.
+   * Deleted rows keep `deleted_at` for a day so the daily upload limits still count them.
+   */
+  private migrateToV14(): void {
+    this.db.exec(`
+      ALTER TABLE users ADD COLUMN can_upload INTEGER NOT NULL DEFAULT 0 CHECK (can_upload IN (0, 1));
+      UPDATE users SET can_upload = 1 WHERE is_admin = 1;
+      CREATE TABLE uploads (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        teacup_hash TEXT NOT NULL,
+        url TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        expires_at INTEGER,
+        created_at INTEGER NOT NULL,
+        deleted_at INTEGER
+      );
+      CREATE INDEX uploads_user ON uploads(user_id, created_at);
+    `);
+  }
+
   private migrateToV3(version: number): void {
     if (version === 0) {
       this.db.exec(`
@@ -413,8 +481,8 @@ export class Store {
     const row = this.db.query(`
       INSERT INTO networks (user_id, name, host, port, tls, nick, username, realname,
                             sasl_account, sasl_password, autojoin, commands, relay_nicks,
-                            mention_aliases, display_names)
-      SELECT u.id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            mention_aliases, display_names, backfill, join_delay_seconds, regain_nick)
+      SELECT u.id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       FROM users AS u WHERE u.id = ?
         AND (u.max_networks IS NULL OR
              (SELECT COUNT(*) FROM networks AS n WHERE n.user_id = u.id) < u.max_networks)
@@ -423,7 +491,8 @@ export class Store {
       input.username, input.realname, input.saslAccount, input.saslPassword ?? '',
       JSON.stringify(input.autojoin), JSON.stringify(input.commands),
       JSON.stringify(input.relayNicks), JSON.stringify(input.mentionAliases),
-      JSON.stringify(input.displayNames), userId) as { id: number } | null;
+      JSON.stringify(input.displayNames), Number(input.backfill), input.joinDelaySeconds,
+      Number(input.regainNick), userId) as { id: number } | null;
     if (!row) {
       if (!this.getUser(userId)) throw new Error('User not found');
       throw new NetworkLimitReached();
@@ -437,14 +506,16 @@ export class Store {
     this.db.query(`
       UPDATE networks SET name = ?, host = ?, port = ?, tls = ?, nick = ?, username = ?,
                           realname = ?, sasl_account = ?, sasl_password = ?, autojoin = ?, commands = ?,
-                          relay_nicks = ?, mention_aliases = ?, display_names = ?
+                          relay_nicks = ?, mention_aliases = ?, display_names = ?, backfill = ?,
+                          join_delay_seconds = ?, regain_nick = ?
       WHERE id = ?
     `).run(input.name, input.host, input.port, Number(input.tls), input.nick,
       input.username, input.realname, input.saslAccount,
       input.saslPassword?.trim() ? input.saslPassword : existing.saslPassword,
       JSON.stringify(input.autojoin), JSON.stringify(input.commands),
       JSON.stringify(input.relayNicks), JSON.stringify(input.mentionAliases),
-      JSON.stringify(input.displayNames), id);
+      JSON.stringify(input.displayNames), Number(input.backfill), input.joinDelaySeconds,
+      Number(input.regainNick), id);
     return this.getNetwork(id);
   }
 
@@ -600,14 +671,43 @@ export class Store {
   }
 
   appendMessage(input: Omit<ChatMessage, 'id'>): ChatMessage {
-    const result = this.db.query(`
+    return this.appendUniqueMessage(input, null)!;
+  }
+
+  /**
+   * Stores a message, or returns null when this buffer already holds its IRCv3 msgid. Replayed
+   * history (`replayed`) is also skipped when an identical line with the same time is stored.
+   */
+  appendUniqueMessage(input: Omit<ChatMessage, 'id'>, msgid: string | null, replayed = false): ChatMessage | null {
+    const row = this.db.query(`
       INSERT INTO messages (network_id, buffer_id, kind, nick, text, time,
-                            from_network, connection_event, is_motd, highlight)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(input.networkId, input.bufferId, input.kind, input.nick, input.text, input.time,
+                            from_network, connection_event, is_motd, highlight, msgid)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+      WHERE ?12 = 0 OR NOT EXISTS (
+        SELECT 1 FROM messages
+        WHERE network_id = ?1 AND time = ?6 AND buffer_id = ?2 AND nick IS ?4 AND text = ?5
+      )
+      ON CONFLICT DO NOTHING
+      RETURNING id
+    `).get(input.networkId, input.bufferId, input.kind, input.nick, input.text, input.time,
       Number(input.fromNetwork === true), input.connectionEvent ?? null, Number(input.isMotd === true),
-      Number(input.highlight === true));
-    return { id: Number(result.lastInsertRowid), ...input };
+      Number(input.highlight === true), msgid, Number(replayed)) as { id: number } | null;
+    return row ? { id: row.id, ...input } : null;
+  }
+
+  /** Time of the newest non-system message in a buffer, where chathistory backfill resumes. */
+  latestMessageTime(bufferId: number): number | null {
+    const row = this.db.query(`
+      SELECT MAX(time) AS time FROM messages WHERE buffer_id = ? AND kind != 'system'
+    `).get(bufferId) as { time: number | null };
+    return row.time;
+  }
+
+  /** Time of the newest stored line on a network, including connection markers. */
+  latestNetworkTime(networkId: number): number | null {
+    const row = this.db.query('SELECT MAX(time) AS time FROM messages WHERE network_id = ?')
+      .get(networkId) as { time: number | null };
+    return row.time;
   }
 
   getMessages(bufferId: number, before?: number, limit?: number): { messages: ChatMessage[]; hasMore: boolean } {
@@ -617,6 +717,20 @@ export class Store {
       ORDER BY id DESC LIMIT ?
     `).all(bufferId, before ?? Number.MAX_SAFE_INTEGER, size + 1) as MessageRow[];
     return { messages: rows.slice(0, size).reverse().map(messageFromRow), hasMore: rows.length > size };
+  }
+
+  /** One export page after `afterId`, oldest first; `since`/`until` are inclusive message times. */
+  exportMessages(
+    scope: ExportScope, afterId: number, limit: number, range: { since?: number; until?: number } = {},
+  ): Array<{ message: ChatMessage; bufferName: string }> {
+    const column = 'bufferId' in scope ? 'm.buffer_id' : 'm.network_id';
+    const rows = this.db.query(`
+      SELECT m.*, b.name AS buffer_name FROM messages AS m JOIN buffers AS b ON b.id = m.buffer_id
+      WHERE ${column} = ? AND m.id > ? AND (? IS NULL OR m.time >= ?) AND (? IS NULL OR m.time <= ?)
+      ORDER BY m.id LIMIT ?
+    `).all('bufferId' in scope ? scope.bufferId : scope.networkId, afterId, range.since ?? null, range.since ?? null,
+      range.until ?? null, range.until ?? null, limit) as Array<MessageRow & { buffer_name: string }>;
+    return rows.map(row => ({ message: messageFromRow(row), bufferName: row.buffer_name }));
   }
 
   listRecentParticipants(bufferId: number, limit = 100): MentionCandidate[] {
@@ -748,13 +862,13 @@ export class Store {
   listAdminUsers(now: number): Array<Omit<AdminUserSummary, 'connectedCount'>> {
     const rows = this.db.query(`
       SELECT u.id, u.username, u.is_admin, u.created_at, u.disabled, u.last_login_at,
-        u.max_networks, u.retention_days,
+        u.max_networks, u.retention_days, u.can_upload,
         (SELECT COUNT(*) FROM networks AS n WHERE n.user_id = u.id) AS network_count,
         (SELECT COUNT(*) FROM sessions AS s WHERE s.user_id = u.id AND s.expires_at > ?) AS session_count
       FROM users AS u ORDER BY u.id
     `).all(now) as Array<UserRow & {
       disabled: number; last_login_at: number | null; network_count: number; session_count: number;
-      max_networks: number | null; retention_days: number | null;
+      max_networks: number | null; retention_days: number | null; can_upload: number;
     }>;
     return rows.map(row => ({
       ...userFromRow(row),
@@ -764,18 +878,84 @@ export class Store {
       sessionCount: row.session_count,
       maxNetworks: row.max_networks,
       retentionDays: row.retention_days,
+      canUpload: row.can_upload === 1,
     }));
   }
 
-  /** Omitted limits stay unchanged; null clears a user-specific limit. */
-  setUserLimits(userId: number, limits: { maxNetworks?: number | null; retentionDays?: number | null }): void {
+  /** Omitted fields stay unchanged; null clears a user-specific limit. */
+  setUserLimits(
+    userId: number, limits: { maxNetworks?: number | null; retentionDays?: number | null; canUpload?: boolean },
+  ): void {
     this.db.query(`
       UPDATE users SET
         max_networks = CASE WHEN ? THEN ? ELSE max_networks END,
-        retention_days = CASE WHEN ? THEN ? ELSE retention_days END
+        retention_days = CASE WHEN ? THEN ? ELSE retention_days END,
+        can_upload = COALESCE(?, can_upload)
       WHERE id = ?
     `).run(Number(limits.maxNetworks !== undefined), limits.maxNetworks ?? null,
-      Number(limits.retentionDays !== undefined), limits.retentionDays ?? null, userId);
+      Number(limits.retentionDays !== undefined), limits.retentionDays ?? null,
+      limits.canUpload === undefined ? null : Number(limits.canUpload), userId);
+  }
+
+  canUpload(userId: number): boolean {
+    const row = this.db.query('SELECT can_upload FROM users WHERE id = ?').get(userId) as { can_upload: number } | null;
+    return row?.can_upload === 1;
+  }
+
+  addUpload(userId: number, upload: Omit<UploadRecord, 'id'> & { hash: string }): UploadRecord {
+    const row = this.db.query(`
+      INSERT INTO uploads (user_id, teacup_hash, url, filename, size, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
+    `).get(userId, upload.hash, upload.url, upload.filename, upload.size, upload.expiresAt, upload.createdAt) as
+      { id: number };
+    const { hash: _hash, ...record } = upload;
+    return { id: row.id, ...record };
+  }
+
+  /** Undeleted uploads that teacup still serves, newest first, below `before`. */
+  listUploads(userId: number, now: number, before?: number, limit?: number): UploadPage {
+    const size = pageSize(limit);
+    const rows = this.db.query(`
+      SELECT id, url, filename, size, expires_at, created_at FROM uploads
+      WHERE user_id = ? AND id < ? AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+      ORDER BY id DESC LIMIT ?
+    `).all(userId, before ?? Number.MAX_SAFE_INTEGER, now, size + 1) as UploadRow[];
+    return { uploads: rows.slice(0, size).map(uploadFromRow), hasMore: rows.length > size };
+  }
+
+  /** The teacup id of an undeleted upload owned by `userId`, or null. */
+  uploadHash(userId: number, id: number): string | null {
+    const row = this.db.query(`
+      SELECT teacup_hash FROM uploads WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+    `).get(id, userId) as { teacup_hash: string } | null;
+    return row?.teacup_hash ?? null;
+  }
+
+  markUploadDeleted(id: number, now: number): void {
+    this.db.query('UPDATE uploads SET deleted_at = ? WHERE id = ?').run(now, id);
+  }
+
+  /** Teacup ids of a user's uploads that are neither deleted nor expired. */
+  liveUploadHashes(userId: number, now: number): string[] {
+    return (this.db.query(`
+      SELECT teacup_hash FROM uploads
+      WHERE user_id = ? AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+    `).all(userId, now) as Array<{ teacup_hash: string }>).map(row => row.teacup_hash);
+  }
+
+  /** Upload times and sizes since `since`, oldest first, including deleted uploads; feeds the rate limits. */
+  recentUploads(userId: number, since: number): Array<{ createdAt: number; size: number }> {
+    return this.db.query(`
+      SELECT created_at AS createdAt, size FROM uploads WHERE user_id = ? AND created_at > ? ORDER BY created_at
+    `).all(userId, since) as Array<{ createdAt: number; size: number }>;
+  }
+
+  /** Drops rows older than `before` that are deleted or expired; newer ones still count toward limits. */
+  pruneUploads(now: number, before: number): void {
+    this.db.query(`
+      DELETE FROM uploads WHERE created_at < ?
+        AND (deleted_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?))
+    `).run(before, now);
   }
 
   isUserDisabled(userId: number): boolean {

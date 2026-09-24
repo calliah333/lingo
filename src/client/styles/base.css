@@ -75,6 +75,7 @@ kbd {
   font-size: 13px;
   font-weight: 550;
   white-space: nowrap;
+  text-decoration: none;
   transition: background .12s, border-color .12s, color .12s;
 }
 .button .icon { font-size: 16px; }

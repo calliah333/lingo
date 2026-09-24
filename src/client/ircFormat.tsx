@@ -160,7 +160,7 @@ export function renderFormatted(formatted: Formatted, options: {
     const content = pieces(formatted, mark.start, mark.end);
     nodes.push(mark.link
       ? <a key={`link-${mark.start}`} className="irc-link" href={formatted.plain.slice(mark.start, mark.end)} target="_blank"
-        rel="noopener noreferrer" onClick={(event) => event.stopPropagation()}
+        rel="noopener noreferrer nofollow" referrerPolicy="no-referrer" onClick={(event) => event.stopPropagation()}
         onDoubleClick={(event) => event.stopPropagation()}>{content}</a>
       : <mark key={`mention-${mark.start}`} className="mention-token">{content}</mark>);
     cursor = mark.end;

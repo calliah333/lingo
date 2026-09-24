@@ -26,18 +26,35 @@ declare module 'irc-framework' {
     modes?: Array<{ mode: string; param?: string }>;
     num_users?: number;
     from_server?: boolean;
+    tags?: Record<string, string>;
+    /** Set on commands delivered inside an IRCv3 batch, such as a chathistory replay. */
+    batch?: { id: string; type: string; params: string[] };
+  }
+
+  export interface IrcBatch {
+    id: string;
+    type: string;
+    params: string[];
+    commands: Array<{ command: string; params: string[]; tags: Record<string, string> }>;
   }
 
   export class Client {
     readonly connected: boolean;
     readonly user: { nick: string };
-    readonly network: { options: { PREFIX: Array<{ symbol: string; mode: string }> } };
+    readonly network: {
+      options: { PREFIX: Array<{ symbol: string; mode: string }>; CHATHISTORY?: string | boolean };
+      cap: { isEnabled(name: string): boolean };
+      /** Whether `message-tags` is enabled and CLIENTTAGDENY allows this client-only tag (name without `+`). */
+      supportsTag(name: string): boolean;
+    };
     readonly connection: {
       end(data?: string): void;
       clearTimers(): void;
       transport: { disposeSocket(): void } | null;
     };
     connect(options: ClientOptions): void;
+    /** Adds capabilities to request on the next connect. */
+    requestCap(cap: string | string[]): void;
     on<T = IrcEvent>(event: string, callback: (event: T) => void): this;
     removeAllListeners(): this;
     caseCompare(left: string, right: string): boolean;
@@ -48,6 +65,7 @@ declare module 'irc-framework' {
     notice(target: string, message: string): void;
     action(target: string, message: string): void;
     setTopic(channel: string, topic: string): void;
+    tagmsg(target: string, tags: Record<string, string>): void;
     list(mask?: string): void;
     raw(command: string, ...args: string[]): void;
   }

@@ -7,6 +7,7 @@ import { isJoined, sidebarOrder } from './chat';
 import type { MenuSubject } from './ContextMenu';
 import Icon from './Icon';
 import { clampSidebarWidth, maxSidebarWidth, minSidebarWidth } from './preferences';
+import { commandKey } from './shortcuts';
 
 type SidebarProps = {
   sidebarRef: RefObject<HTMLElement | null>;
@@ -51,7 +52,6 @@ type SidebarProps = {
 };
 
 const connectionLabel = { connecting: 'Connecting…', live: 'Live', offline: 'Reconnecting…' } as const;
-const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 
 function sameSubject(left: MenuSubject | null, right: MenuSubject): boolean {
   return !!left && JSON.stringify(left) === JSON.stringify(right);
@@ -145,7 +145,7 @@ export default function Sidebar(props: SidebarProps) {
         aria-expanded onClick={onHide}><Icon name={drawer ? 'x' : 'sidebar'} /></button>
     </div>
     <button type="button" className={`sidebar__search${searchOpen ? ' is-active' : ''}`} onClick={onSearch}>
-      <Icon name="search" /><span>Search</span><kbd>{isMac ? '⌘' : 'Ctrl'} K</kbd>
+      <Icon name="search" /><span>Search</span><kbd>{commandKey} F</kbd>
     </button>
     <nav className="sidebar__networks" aria-label="Networks">
       {networks.length === 0 && <div className="sidebar__empty">

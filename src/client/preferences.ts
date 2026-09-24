@@ -1,3 +1,4 @@
+import type { UploadExpiry } from '../shared/contracts';
 import type { Theme } from './ThemePicker';
 
 export type AppPreferences = {
@@ -19,6 +20,8 @@ export type AppPreferences = {
   userListHidden: boolean;
   browserNotifications: boolean;
   notificationSound: boolean;
+  /** Last expiry chosen for uploads on this device; `null` uses the server's default. */
+  uploadExpiry: UploadExpiry | null;
 };
 
 export const fontFamilies = {
@@ -58,6 +61,7 @@ const defaults: AppPreferences = {
   userListHidden: false,
   browserNotifications: false,
   notificationSound: false,
+  uploadExpiry: null,
 };
 
 function isTheme(value: unknown): value is Theme {
@@ -66,6 +70,10 @@ function isTheme(value: unknown): value is Theme {
 
 function isFontFamily(value: unknown): value is FontFamily {
   return typeof value === 'string' && Object.hasOwn(fontFamilies, value);
+}
+
+function isUploadExpiry(value: unknown): value is UploadExpiry {
+  return value === '1h' || value === '1d' || value === '7d' || value === '30d' || value === 'permanent';
 }
 
 /** Legacy account choices are read only during the first server-settings bootstrap. */
@@ -124,6 +132,7 @@ export function loadPreferences(): AppPreferences {
     userListHidden: typeof value.userListHidden === 'boolean' ? value.userListHidden : defaults.userListHidden,
     browserNotifications: typeof value.browserNotifications === 'boolean' ? value.browserNotifications : defaults.browserNotifications,
     notificationSound: typeof value.notificationSound === 'boolean' ? value.notificationSound : defaults.notificationSound,
+    uploadExpiry: isUploadExpiry(value.uploadExpiry) ? value.uploadExpiry : defaults.uploadExpiry,
   };
 }
 

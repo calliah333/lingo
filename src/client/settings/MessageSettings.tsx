@@ -89,6 +89,9 @@ export default function MessageSettings({ preferences, update, settings, onSetti
         onChange={(checked) => update('showMotd', checked)} />
       <SettingsToggle label="Autocomplete mentions and commands" checked={preferences.autocomplete}
         onChange={(checked) => update('autocomplete', checked)} />
+      <SettingsToggle label="Tell others when I'm typing" checked={settings.sendTyping}
+        help="Sends IRCv3 typing notifications while you write a message, on servers that support them. Applies to all your devices."
+        onChange={(checked) => onSettingsChange({ sendTyping: checked })} />
     </SettingsCard>
     <SettingsCard title="Highlights" description="Messages containing these phrases are highlighted like mentions of your nick. Synced to all your devices.">
       <SettingsField label="Custom highlight phrases" htmlFor="highlight-phrases" helpId="highlight-phrases-help"

@@ -27,6 +27,9 @@ type Fields = {
   relayNicks: string;
   mentionAliases: string;
   displayNames: string;
+  backfill: boolean;
+  joinDelaySeconds: string;
+  regainNick: boolean;
 };
 
 type Sections = { connection: boolean; sasl: boolean; advanced: boolean };
@@ -46,12 +49,17 @@ const emptyFields = (): Fields => ({
   relayNicks: '',
   mentionAliases: '',
   displayNames: '',
+  backfill: true,
+  joinDelaySeconds: '0',
+  regainNick: false,
 });
 
 /** Optional sections start open when the network already uses them. */
 function openSections(network: Network | null): Sections {
   return {
-    connection: Boolean(network && (network.autojoin.length || network.commands.length)),
+    connection: Boolean(network && (
+      network.autojoin.length || network.commands.length || !network.backfill || network.joinDelaySeconds
+    )),
     sasl: Boolean(network?.saslAccount),
     advanced: Boolean(network && (
       network.relayNicks.length || network.mentionAliases.length || Object.keys(network.displayNames).length
@@ -122,6 +130,9 @@ export default function NetworkSettings({
       relayNicks: network.relayNicks.join('\n'),
       mentionAliases: network.mentionAliases.join('\n'),
       displayNames: Object.entries(network.displayNames).map(([source, label]) => `${source} = ${label}`).join('\n'),
+      backfill: network.backfill,
+      joinDelaySeconds: String(network.joinDelaySeconds),
+      regainNick: network.regainNick,
     });
   }, [network]);
 
@@ -143,6 +154,12 @@ export default function NetworkSettings({
     }
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       setValidationError('Enter a valid port between 1 and 65535.');
+      return;
+    }
+    const joinDelaySeconds = Number(fields.joinDelaySeconds || 0);
+    if (!Number.isInteger(joinDelaySeconds) || joinDelaySeconds < 0 || joinDelaySeconds > 30) {
+      setOpen((current) => ({ ...current, connection: true }));
+      setValidationError('Enter a join delay between 0 and 30 seconds.');
       return;
     }
 
@@ -171,6 +188,9 @@ export default function NetworkSettings({
       relayNicks: lines(fields.relayNicks),
       mentionAliases: lines(fields.mentionAliases),
       displayNames,
+      backfill: fields.backfill,
+      joinDelaySeconds,
+      regainNick: fields.regainNick,
       ...(fields.saslPassword ? { saslPassword: fields.saslPassword } : {}),
     };
     try {
@@ -249,7 +269,7 @@ export default function NetworkSettings({
               </div>
             </SettingsCard>
             <SettingsDisclosure title={<>Connection options {optional}</>}
-              description="Channels to join and commands to run after connecting."
+              description="Channels to join, commands to run after connecting, a join delay, and history replay."
               open={open.connection} onToggle={(connection) => setOpen((current) => ({ ...current, connection }))}>
               <div className="settings-form">
                 <SettingsField label="Autojoin channels" htmlFor="network-autojoin" helpId="autojoin-help"
@@ -262,7 +282,19 @@ export default function NetworkSettings({
                   <textarea id="network-commands" name="commands" rows={3} value={fields.commands} className="settings-mono"
                     spellCheck={false} onChange={(event) => update('commands', event.target.value)} aria-describedby="commands-help" />
                 </SettingsField>
+                <SettingsField label="Join delay" htmlFor="network-join-delay" helpId="join-delay-help"
+                  help="Waits after connecting before joining channels, so services can identify you and apply a host cloak first (0–30).">
+                  <div className="settings-number">
+                    <input id="network-join-delay" name="joinDelaySeconds" type="number" min="0" max="30" step="1"
+                      inputMode="numeric" value={fields.joinDelaySeconds} aria-describedby="join-delay-help"
+                      onChange={(event) => update('joinDelaySeconds', event.target.value)} />
+                    <span className="settings-number__unit">seconds</span>
+                  </div>
+                </SettingsField>
               </div>
+              <SettingsToggle id="network-backfill" name="backfill" label="Replay missed history"
+                help="Fetches messages sent while Lingo was offline when the server supports chathistory (Ergo, soju)."
+                checked={fields.backfill} onChange={(checked) => update('backfill', checked)} />
             </SettingsDisclosure>
             <SettingsDisclosure title={<>SASL authentication {optional}</>}
               description="Signs in to your services account while connecting."
@@ -278,6 +310,9 @@ export default function NetworkSettings({
                     onChange={(event) => update('saslPassword', event.target.value)} />
                 </SettingsField>
               </div>
+              <SettingsToggle id="network-regain-nick" name="regainNick" label="Regain nickname"
+                help="If your nickname is taken when connecting, asks NickServ to release it to your SASL account (NickServ REGAIN)."
+                checked={fields.regainNick} onChange={(checked) => update('regainNick', checked)} />
             </SettingsDisclosure>
             <SettingsDisclosure title="Advanced" description="Relay bridges, mention aliases, and display names."
               open={open.advanced} onToggle={(advanced) => setOpen((current) => ({ ...current, advanced }))}>

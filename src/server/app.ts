@@ -3,15 +3,22 @@ import { promisify } from 'node:util';
 import { Hono, type Context } from 'hono';
 import { getConnInfo, upgradeWebSocket, websocket } from 'hono/bun';
 import { getCookie, setCookie } from 'hono/cookie';
+import { secureHeaders } from 'hono/secure-headers';
 import type { WSContext } from 'hono/ws';
 import { z } from 'zod';
 import type {
-  AccountUser, Bootstrap, ChatBuffer, MentionCandidate, PushKey, ServerEvent, SetupStatus,
+  AccountUser, Bootstrap, ChatBuffer, MentionCandidate, PushKey, ServerEvent, SetupStatus, UploadCapabilities, UploadExpiry,
+  UploadRecord,
 } from '../shared/contracts.ts';
+import { exportFilename, exportResponse } from './export.ts';
 import type { IrcManager } from './irc.ts';
 import { RateLimiter } from './limits.ts';
 import type { PushNotifier } from './push.ts';
 import { NetworkLimitReached, type Store } from './store.ts';
+import {
+  cleanFilename, defaultExpiry, EXPIRY_SECONDS, MULTIPART_OVERHEAD, offeredExpiries, type TeacupClient, UploadError,
+  uploadRetryAfter,
+} from './uploads.ts';
 
 const COOKIE = 'lingo_session';
 const SESSION_AGE_SECONDS = 30 * 24 * 60 * 60;
@@ -37,6 +44,9 @@ const networkInput = z.strictObject({
   mentionAliases: z.array(required(64)).max(20).default([]),
   displayNames: z.record(required(64), required(64))
     .refine(names => Object.keys(names).length <= 100, 'Too many display names').default({}),
+  backfill: z.boolean().default(true),
+  joinDelaySeconds: z.number().int().min(0).max(30).default(0),
+  regainNick: z.boolean().default(false),
 });
 const newPassword = z.string().min(8).max(1024);
 const loginInput = z.strictObject({ username: z.string().max(64), password: z.string().max(1024) });
@@ -51,6 +61,7 @@ const userUpdateInput = z.strictObject({
   disabled: z.boolean().optional(),
   maxNetworks: z.number().int().min(0).nullable().optional(),
   retentionDays: z.number().int().min(1).max(3650).nullable().optional(),
+  canUpload: z.boolean().optional(),
 }).refine(value => Object.values(value).some(field => field !== undefined));
 const awayInput = z.strictObject({
   message: line(300).refine(value => Buffer.byteLength(value, 'utf8') <= 300, 'Message too long'),
@@ -67,6 +78,7 @@ const batchBufferInput = z.strictObject({
 });
 const topicInput = z.strictObject({ topic: line(390) });
 const readInput = z.strictObject({ messageId: z.number().int().positive().safe() });
+const typingInput = z.strictObject({ state: z.enum(['active', 'paused', 'done']) });
 const nickInput = z.strictObject({ nick: required(64).regex(/^[^\s,:]+$/, 'Invalid nickname') });
 const queryInput = z.strictObject({ networkId: z.number().int().positive(), nick: nickInput.shape.nick });
 const channelListInput = z.strictObject({ mask: required(100).regex(/^[^\s,:]+$/, 'Invalid mask').optional() });
@@ -192,18 +204,36 @@ function normalizedNetworkInput(input: z.output<typeof networkInput>): z.output<
 export type AppEnv = { Variables: { user: AccountUser; session: string } };
 type Client = { ws: WSContext; tokenHash: string; userId: number };
 
-/** Routes reachable without a session: sign-in and first-login admin setup. */
-const PUBLIC_ROUTES = new Set(['POST /api/login', 'GET /api/setup', 'POST /api/setup']);
+/** Routes reachable without a session: sign-in, first-login admin setup, and the liveness probe. */
+const PUBLIC_ROUTES = new Set(['POST /api/login', 'GET /api/setup', 'POST /api/setup', 'GET /api/health']);
 
 export function createApp(
   store: Store,
   manager: IrcManager,
   options: {
     publicOrigin?: string; setupToken?: string; trustProxy?: boolean; now?: () => number; push?: PushNotifier;
+    /** teacup uploads; absent when not configured. */
+    uploads?: TeacupClient;
   } = {},
 ) {
   const clients = new Map<unknown, Client>();
   const app = new Hono<AppEnv>();
+  // The client is one same-origin bundle: no inline scripts, no third-party hosts, and a canvas favicon (data: URL).
+  app.use('*', secureHeaders({
+    contentSecurityPolicy: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'", 'data:'],
+      connectSrc: ["'self'"],
+      workerSrc: ["'self'"],
+      manifestSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      baseUri: ["'none'"],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"],
+    },
+  }));
   // Unknown usernames are checked against this hash so response time does not reveal which accounts exist.
   const unknownUserHash = hashPassword(randomBytes(32).toString('hex'));
   const loginUsers = new RateLimiter(10, 15 * 60_000);
@@ -211,6 +241,8 @@ export function createApp(
   const setupIps = new RateLimiter(10, 15 * 60_000);
   const passwordUsers = new RateLimiter(10, 15 * 60_000);
   const now = options.now ?? Date.now;
+  /** Per-user uploads still streaming to teacup; they count toward the limits before their row exists. */
+  const uploadsInFlight = new Map<number, { count: number; bytes: number }>();
 
   function clientIp(c: Context): string {
     if (options.trustProxy) {
@@ -279,7 +311,8 @@ export function createApp(
       case 'message': return store.networkOwner(event.message.networkId);
       case 'buffer': return store.networkOwner(event.buffer.networkId);
       case 'buffer_removed':
-      case 'read': return store.bufferOwner(event.bufferId);
+      case 'read':
+      case 'typing': return store.bufferOwner(event.bufferId);
       case 'history_cleared': return store.bufferOwner(event.bufferId);
       case 'network':
       case 'network_removed':
@@ -359,6 +392,7 @@ export function createApp(
     await next();
   });
 
+  app.get('/api/health', (c) => c.json({ ok: true }));
   app.get('/api/setup', (c) => c.json({ required: store.setupRequired() } satisfies SetupStatus));
 
   app.post('/api/setup', async (c) => {
@@ -464,12 +498,12 @@ export function createApp(
 
   app.patch('/api/users/:id', async (c) => {
     const id = integer(c.req.param('id'))!;
-    const { disabled, maxNetworks, retentionDays } = await jsonBody(c, userUpdateInput);
+    const { disabled, maxNetworks, retentionDays, canUpload } = await jsonBody(c, userUpdateInput);
     const target = store.getUser(id);
     if (!target) return c.json({ error: 'User not found' }, 404);
     if (disabled !== undefined && target.isAdmin) return c.json({ error: 'Cannot disable admin account' }, 400);
-    if (maxNetworks !== undefined || retentionDays !== undefined) {
-      store.setUserLimits(id, { maxNetworks, retentionDays });
+    if (maxNetworks !== undefined || retentionDays !== undefined || canUpload !== undefined) {
+      store.setUserLimits(id, { maxNetworks, retentionDays, canUpload });
     }
     if (disabled !== undefined && store.isUserDisabled(id) !== disabled) {
       store.setUserDisabled(id, disabled);
@@ -495,7 +529,7 @@ export function createApp(
     return c.json({ ok: true });
   });
 
-  app.delete('/api/users/:id', (c) => {
+  app.delete('/api/users/:id', async (c) => {
     const id = integer(c.req.param('id'))!;
     const target = store.getUser(id);
     if (!target || target.isAdmin) return c.json({ error: 'User not found' }, 404);
@@ -505,6 +539,13 @@ export function createApp(
       manager.forgetNetwork(network.id);
     }
     for (const buffer of store.listBuffers(id)) manager.forgetBuffer(buffer.id);
+    const teacup = options.uploads;
+    if (teacup) {
+      // Their links should not outlive the account; teacup's own expiry covers any that fail here.
+      const results = await Promise.allSettled(store.liveUploadHashes(id, now()).map(hash => teacup.remove(hash)));
+      const failed = results.filter(result => result.status === 'rejected').length;
+      if (failed) console.error(`Could not delete ${failed} uploads of deleted user ${id}`);
+    }
     store.removeUser(id);
     return c.json({ ok: true });
   });
@@ -561,6 +602,101 @@ export function createApp(
       { bufferId: null, title: 'Lingo', body: 'Test notification' });
     if (!delivered) return c.json({ error: 'No device accepted the notification' }, 502);
     return c.json({ delivered });
+  });
+
+  async function uploadCapabilities(userId: number): Promise<UploadCapabilities> {
+    if (!options.uploads) return { enabled: false, reason: 'not_configured' };
+    if (!store.canUpload(userId)) return { enabled: false, reason: 'not_permitted' };
+    const teacup = await options.uploads.capabilities();
+    const expiries = teacup ? offeredExpiries(teacup) : [];
+    if (!teacup || !expiries.length) return { enabled: false, reason: 'unavailable' };
+    return {
+      enabled: true,
+      maxBytes: Math.min(options.uploads.maxBytes, teacup.maxFileSizeBytes),
+      expiries,
+      defaultExpiry: defaultExpiry(expiries),
+    };
+  }
+
+  app.get('/api/uploads/capabilities', async (c) => c.json(await uploadCapabilities(c.get('user').id)));
+
+  app.post('/api/uploads', async (c) => {
+    const teacup = options.uploads;
+    if (!teacup) return c.json({ error: 'Not found' }, 404);
+    const userId = c.get('user').id;
+    const capabilities = await uploadCapabilities(userId);
+    if (!capabilities.enabled) {
+      return capabilities.reason === 'not_permitted'
+        ? c.json({ error: 'Uploads are not enabled for this account' }, 403)
+        : c.json({ error: 'Upload service unavailable' }, 502);
+    }
+    const tooLarge = () => c.json({ error: `Files must be at most ${Math.floor(capabilities.maxBytes / 1048576)} MB` }, 413);
+    const length = c.req.header('content-length');
+    if (length === undefined || !/^\d+$/.test(length)) return c.json({ error: 'Content-Length required' }, 411);
+    if (Number(length) > capabilities.maxBytes + MULTIPART_OVERHEAD) return tooLarge();
+    let form: FormData;
+    try {
+      form = await c.req.formData();
+    } catch {
+      throw new BadRequest();
+    }
+    const file = form.get('file');
+    const expiry = form.get('expiry') as UploadExpiry | null;
+    const fileCount = [...form.values()].filter(value => typeof value !== 'string').length;
+    if (!(file instanceof File) || fileCount !== 1 || !expiry || !capabilities.expiries.includes(expiry)) {
+      throw new BadRequest();
+    }
+    if (file.size > capabilities.maxBytes) return tooLarge();
+    // Bun 1.2.0 also parses parts of up to 8 bytes as empty, nameless files.
+    if (!file.size) return c.json({ error: 'File is empty' }, 400);
+    const time = now();
+    const inFlight = uploadsInFlight.get(userId) ?? { count: 0, bytes: 0 };
+    const wait = uploadRetryAfter(store.recentUploads(userId, time - 86_400_000), inFlight, file.size, time);
+    if (wait) {
+      c.header('Retry-After', String(Math.ceil(wait / 1000)));
+      return c.json({ error: 'Upload limit reached, try again later' }, 429);
+    }
+    inFlight.count++;
+    inFlight.bytes += file.size;
+    uploadsInFlight.set(userId, inFlight);
+    const filename = cleanFilename(file.name, file.type);
+    try {
+      const { hash, url } = await teacup.upload(file, filename, expiry, c.req.raw.signal);
+      const createdAt = now();
+      const expiresAt = expiry === 'permanent' ? null : createdAt + EXPIRY_SECONDS[expiry] * 1000;
+      const record: UploadRecord = store.addUpload(userId, { hash, url, filename, size: file.size, expiresAt, createdAt });
+      return c.json(record, 201);
+    } catch (error) {
+      if (error instanceof UploadError) return c.json({ error: error.message }, error.status);
+      if (c.req.raw.signal.aborted) return c.json({ error: 'Upload cancelled' }, 400);
+      throw error;
+    } finally {
+      inFlight.count--;
+      inFlight.bytes -= file.size;
+      if (!inFlight.count) uploadsInFlight.delete(userId);
+    }
+  });
+
+  app.get('/api/uploads', (c) => {
+    if (!options.uploads) return c.json({ error: 'Not found' }, 404);
+    const before = integer(c.req.query('before'));
+    const limit = integer(c.req.query('limit'), 100);
+    return c.json(store.listUploads(c.get('user').id, now(), before, limit));
+  });
+
+  app.delete('/api/uploads/:id', async (c) => {
+    const id = integer(c.req.param('id'))!;
+    if (!options.uploads) return c.json({ error: 'Not found' }, 404);
+    const hash = store.uploadHash(c.get('user').id, id);
+    if (hash === null) return c.json({ error: 'Upload not found' }, 404);
+    try {
+      await options.uploads.remove(hash);
+    } catch (error) {
+      if (error instanceof UploadError) return c.json({ error: error.message }, error.status);
+      throw error;
+    }
+    store.markUploadDeleted(id, now());
+    return c.json({ ok: true });
   });
 
   app.get('/api/bootstrap', (c) => {
@@ -808,6 +944,14 @@ export function createApp(
     return c.json({ bufferId: id, lastReadId });
   });
 
+  app.post('/api/buffers/:id/typing', async (c) => {
+    const id = integer(c.req.param('id'))!;
+    const { state } = await jsonBody(c, typingInput);
+    if (!ownedBuffer(c, id)) return c.json({ error: 'Buffer not found' }, 404);
+    manager.sendTyping(id, state);
+    return c.json({ ok: true });
+  });
+
   app.get('/api/messages', (c) => {
     const bufferId = integer(c.req.query('bufferId'));
     if (bufferId === undefined) throw new BadRequest();
@@ -815,6 +959,35 @@ export function createApp(
     const before = integer(c.req.query('before'));
     const limit = integer(c.req.query('limit'), 100);
     return c.json(store.getMessages(bufferId, before, limit));
+  });
+
+  /** Parses inclusive `since`/`until` millisecond bounds; an inverted range is a bad request. */
+  function exportRange(c: Context): { since?: number; until?: number } {
+    const since = timestamp(c.req.query('since'));
+    const until = timestamp(c.req.query('until'));
+    if (since !== undefined && until !== undefined && since > until) throw new BadRequest();
+    return { since, until };
+  }
+
+  app.get('/api/buffers/:id/export', (c) => {
+    const id = integer(c.req.param('id'))!;
+    const format = c.req.query('format') ?? 'txt';
+    if (format !== 'txt' && format !== 'jsonl') throw new BadRequest();
+    const range = exportRange(c);
+    const buffer = ownedBuffer(c, id);
+    if (!buffer) return c.json({ error: 'Buffer not found' }, 404);
+    const network = store.getNetwork(buffer.networkId)!;
+    return exportResponse(store, { bufferId: id }, format,
+      exportFilename([network.name, buffer.name], now(), format), range);
+  });
+
+  app.get('/api/networks/:id/export', (c) => {
+    const id = integer(c.req.param('id'))!;
+    if ((c.req.query('format') ?? 'jsonl') !== 'jsonl') throw new BadRequest();
+    const range = exportRange(c);
+    const network = ownsNetwork(c, id) ? store.getNetwork(id) : null;
+    if (!network) return c.json({ error: 'Network not found' }, 404);
+    return exportResponse(store, { networkId: id }, 'jsonl', exportFilename([network.name], now(), 'jsonl'), range);
   });
 
   app.get('/api/search', (c) => {

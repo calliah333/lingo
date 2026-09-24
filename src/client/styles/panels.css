@@ -93,6 +93,8 @@
 .settings-help { color: var(--text-muted); font-size: 12.5px; line-height: 1.5; }
 .settings-label-note { color: var(--text-faint); font-weight: 400; }
 .settings-mono { font-family: var(--mono); font-size: var(--font-size); }
+.settings-shortcut { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; font-size: 13px; }
+.settings-shortcut__keys { display: flex; flex: none; align-items: center; gap: 4px; color: var(--text-faint); font-size: 12px; }
 .settings-number { display: flex; align-items: center; gap: 8px; }
 .settings-number input { width: 80px; font-variant-numeric: tabular-nums; }
 .settings-number__unit { color: var(--text-muted); font-size: 13px; }
@@ -168,6 +170,21 @@
 .settings-inline-form { display: flex; flex-wrap: wrap; gap: 8px; }
 .settings-inline-form input { flex: 1 1 200px; }
 .settings-badge-danger { background: var(--danger-soft); color: var(--danger); }
+/* A compact switch among a list row's action buttons, e.g. "Can upload" */
+.settings-list__switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 6px 0 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 550;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.settings-list__switch:has(:disabled) { cursor: not-allowed; }
+.upload-link { font-family: var(--mono); font-size: 12px; user-select: all; }
 
 .settings-identity { display: flex; align-items: center; gap: 12px; }
 .settings-identity__avatar {

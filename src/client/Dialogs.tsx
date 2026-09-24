@@ -232,3 +232,39 @@ export function DisplayNameDialog({ network, nick, initial, onSave, onClose }: D
     </form>
   </Modal>;
 }
+
+type ExportDialogProps = { network: Network; buffer: ChatBuffer | null; onClose: () => void };
+
+const exportFormats = [
+  { value: 'txt', label: 'Plain text', help: 'One readable line per message, without colors or formatting.' },
+  { value: 'jsonl', label: 'JSON Lines', help: 'One JSON message per line, for scripts and other tools.' },
+] as const;
+
+/** Downloads a buffer's history as text or JSONL, or a whole network's history as JSONL. */
+export function ExportDialog({ network, buffer, onClose }: ExportDialogProps) {
+  const [format, setFormat] = useState<'txt' | 'jsonl'>(buffer ? 'txt' : 'jsonl');
+  const downloadRef = useRef<HTMLAnchorElement>(null);
+  const name = useId();
+  const href = buffer
+    ? `/api/buffers/${buffer.id}/export?format=${format}`
+    : `/api/networks/${network.id}/export?format=jsonl`;
+
+  return <Modal title={`Export history · ${buffer?.name ?? network.name}`} onClose={onClose} initialFocusRef={downloadRef}>
+    {buffer ? <div className="modal__fields" role="radiogroup" aria-label="Format">
+      {exportFormats.map((option) => <label key={option.value} className="modal__choice">
+        <input type="radio" name={name} value={option.value} checked={format === option.value}
+          onChange={() => setFormat(option.value)} />
+        <span><strong>{option.label}</strong> <span className="modal__help">{option.help}</span></span>
+      </label>)}
+    </div> : <p className="modal__status">
+      Every conversation on {network.name}, as JSON Lines: one message per line, each with its conversation name.
+    </p>}
+    <div className="modal__actions">
+      <button className="button button-quiet" type="button" onClick={onClose}>Cancel</button>
+      {/* Closing on the next task leaves the link connected until the browser has started the download. */}
+      <a ref={downloadRef} className="button button-primary" href={href} download onClick={() => setTimeout(onClose)}>
+        <Icon name="download" />Download
+      </a>
+    </div>
+  </Modal>;
+}

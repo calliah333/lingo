@@ -1,29 +1,32 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import type {
   AccountUser, Bootstrap, BufferUnread, ChannelListStatus, ChannelState, ChatBuffer, ChatMessage, Network, NetworkInput,
-  NetworkStatus, ServerEvent, SetupStatus, SyncedSettings,
+  NetworkStatus, ServerEvent, SetupStatus, SyncedSettings, UploadCapabilities,
 } from '../shared/contracts';
 import { displayIdentity } from '../shared/identity';
 import { api, ApiError, errorText, json } from './api';
 import AuthScreen, { type AuthMode } from './AuthScreen';
 import ChannelListPanel from './ChannelListPanel';
-import { isJoined, mergeMessages, messagePage, ownNames } from './chat';
+import { attention, isJoined, mergeMessages, messagePage, orderedBuffers, ownNames, stepBuffer, stepUnread, visibleBuffers } from './chat';
 import ContextMenu, { type MenuItem, type MenuSubject } from './ContextMenu';
 import ConversationHeader from './ConversationHeader';
-import { BanListDialog, DisplayNameDialog, IgnoreListDialog, WhoisDialog } from './Dialogs';
+import { BanListDialog, DisplayNameDialog, ExportDialog, IgnoreListDialog, WhoisDialog } from './Dialogs';
 import Icon from './Icon';
-import MentionComposer from './MentionComposer';
+import MentionComposer, { type ComposerHandle } from './MentionComposer';
 import { playChime } from './notify';
 import PaneHeader, { SidebarContext, type SidebarControl } from './PaneHeader';
 import { applyAppearance, loadPreferences, savePreferences, type AppPreferences } from './preferences';
 import { forgetPush, pushSupported, registerServiceWorker, syncPush } from './push';
+import QuickSwitcher from './QuickSwitcher';
 import SearchPanel from './SearchPanel';
 import { rememberChannel } from './sessionRecents';
 import GlobalSettings from './settings/GlobalSettings';
 import NetworkSettings from './settings/NetworkSettings';
 import Sidebar, { SidebarResizer } from './Sidebar';
+import { showAttention } from './tabBadge';
 import { clearLegacySettings, defaultSyncedSettings, legacySettings, savedIds } from './syncedSettings';
 import Transcript from './Transcript';
+import { useTypers } from './typing';
 import UserList from './UserList';
 
 type ChannelDetails = { bufferId: number; state: ChannelState | null; loading: boolean; error: string };
@@ -40,7 +43,8 @@ type DialogTarget =
   | { kind: 'whois'; networkId: number; nick: string }
   | { kind: 'bans'; bufferId: number }
   | { kind: 'ignores'; networkId: number }
-  | { kind: 'displayName'; networkId: number; nick: string; initial: string };
+  | { kind: 'displayName'; networkId: number; nick: string; initial: string }
+  | { kind: 'export'; networkId: number; bufferId: number | null };
 
 /** Matches the stylesheet breakpoint where the networks sidebar becomes a drawer. */
 const drawerLayout = '(max-width: 640px)';
@@ -98,12 +102,14 @@ export default function App() {
   const [syncedSettings, setSyncedSettings] = useState<SyncedSettings>(defaultSyncedSettings);
   const [menu, setMenu] = useState<MenuTarget | null>(null);
   const [dialog, setDialog] = useState<DialogTarget | null>(null);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
   const [ignores, setIgnores] = useState<Record<number, string[]>>({});
   const [channelListTabs, setChannelListTabs] = useState<number[]>(() => savedIds('lingo-channel-lists'));
   const [channelListView, setChannelListView] = useState<number | null>(null);
   const [channelLists, setChannelLists] = useState<Record<number, ChannelListStatus>>({});
   const [joining, setJoining] = useState(false);
   const [channelDetails, setChannelDetails] = useState<ChannelDetails | null>(null);
+  const { typers, update: updateTyping, retain: retainTypers } = useTypers();
   const [usersPanelOpen, setUsersPanelOpen] = useState(false);
   const [topicEditing, setTopicEditing] = useState(false);
   const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences);
@@ -111,6 +117,9 @@ export default function App() {
   const [jump, setJump] = useState<Jump | null>(null);
   const [divider, setDivider] = useState<{ bufferId: number; after: number } | null>(null);
   const [reloadSerial, setReloadSerial] = useState(0);
+  /** `null` until fetched after sign-in; a failed fetch counts as unavailable. */
+  const [uploadCapabilities, setUploadCapabilities] = useState<UploadCapabilities | null>(null);
+  const [dropping, setDropping] = useState(false);
 
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -147,12 +156,18 @@ export default function App() {
   settingsRef.current = syncedSettings;
   const pendingTopicEdit = useRef<number | null>(null);
   const overlayOpen = useRef(false);
-  overlayOpen.current = menu !== null || dialog !== null;
+  overlayOpen.current = menu !== null || dialog !== null || switcherOpen;
+  const dialogOpen = useRef(false);
+  dialogOpen.current = dialog !== null;
   const generation = useRef(0);
   const bootstrapRequest = useRef(0);
   const receivedMessageIds = useRef(new Set<number>());
   const receivedMessageOrder = useRef<number[]>([]);
   const receivedMessageCursor = useRef(0);
+  const uploadCapabilitiesRequest = useRef(0);
+  const composerRef = useRef<ComposerHandle>(null);
+  /** Nesting depth of a file drag over the main pane; enter/leave fire for every child crossed. */
+  const dragDepth = useRef(0);
   const jumpSerial = useRef(0);
   const messageQueue = useRef<ChatMessage[]>([]);
   const messageFrame = useRef<number | null>(null);
@@ -232,6 +247,7 @@ export default function App() {
     setUser(null);
     setAuthMessage('Your session expired. Sign in again.');
     setDialog(null);
+    setSwitcherOpen(false);
     setMenu(null);
   }, [resetSyncedSettings]);
   const fail = useCallback((error: unknown) => {
@@ -474,6 +490,9 @@ export default function App() {
     else if (readPending.current?.bufferId === bufferId) readPending.current = null;
   }, [requestRead]);
   const selectedUnread = selectedId === null ? undefined : unread[selectedId];
+  const { mentions: tabMentions, unread: tabUnread } = useMemo(() => attention(buffers, unread, syncedSettings),
+    [buffers, unread, syncedSettings]);
+  useEffect(() => showAttention({ mentions: tabMentions, unread: tabUnread }), [tabMentions, tabUnread]);
   // The divider stays where the buffer's marker was when unread lines first appeared during
   // this visit, so reading them (which advances the marker) does not remove it.
   useEffect(() => {
@@ -513,6 +532,30 @@ export default function App() {
     void openSession(controller.signal);
     return () => controller.abort();
   }, [openSession]);
+
+  const refreshUploadCapabilities = useCallback(async () => {
+    const request = ++uploadCapabilitiesRequest.current;
+    let next: UploadCapabilities;
+    try {
+      next = await api<UploadCapabilities>('/api/uploads/capabilities');
+    } catch {
+      // The attach button simply stays hidden; this is not worth a notice.
+      next = { enabled: false, reason: 'unavailable' };
+    }
+    if (request === uploadCapabilitiesRequest.current) setUploadCapabilities(next);
+  }, []);
+  useEffect(() => {
+    if (auth === 'ready') {
+      void refreshUploadCapabilities();
+      return;
+    }
+    uploadCapabilitiesRequest.current++;
+    setUploadCapabilities(null);
+  }, [auth, refreshUploadCapabilities]);
+  // Permission and limits can change while signed in; Settings shows the current state.
+  useEffect(() => {
+    if (globalSettingsOpen) void refreshUploadCapabilities();
+  }, [globalSettingsOpen, refreshUploadCapabilities]);
   useEffect(() => {
     applyAppearance(preferences);
     savePreferences(preferences);
@@ -553,6 +596,7 @@ export default function App() {
       setView({ bufferId: null, messages: [], hasMore: false, loading: false, error: '' });
       closePanels();
       setDialog(null);
+      setSwitcherOpen(false);
       setMenu(null);
       setNotice('');
     } catch (error) {
@@ -582,14 +626,22 @@ export default function App() {
   useEffect(() => {
     if (auth !== 'ready') return;
     function onKeyDown(event: KeyboardEvent) {
-      if ((event.metaKey || event.ctrlKey) && ['f', 'k'].includes(event.key.toLowerCase())) {
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'f') {
         event.preventDefault();
         setSearchOpen(true);
         window.setTimeout(() => document.querySelector<HTMLInputElement>('.search-panel__query')?.focus(), 0);
         setMenu(null);
+        setSwitcherOpen(false);
         setSettingsTarget(null);
         setGlobalSettingsOpen(false);
         setSidebarOpen(false);
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        if (dialogOpen.current) return;
+        setMenu(null);
+        setSwitcherOpen((open) => !open);
         return;
       }
       if (event.key === 'Escape') {
@@ -598,6 +650,7 @@ export default function App() {
         if (overlayOpen.current) {
           setMenu(null);
           setDialog(null);
+          setSwitcherOpen(false);
           return;
         }
         setSearchOpen(false);
@@ -612,6 +665,29 @@ export default function App() {
       const target = event.target;
       const typing = target instanceof HTMLElement
         && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+      // Buffer navigation works from the composer and outside text fields, never over a menu or dialog.
+      if (event.altKey && !event.ctrlKey && !event.metaKey && !event.defaultPrevented && !overlayOpen.current
+        && (!typing || (target as HTMLElement).closest('.composer'))) {
+        const settings = settingsRef.current;
+        const ordered = orderedBuffers(networksRef.current, buffersRef.current, settings);
+        const current = selectedRef.current;
+        let next: ChatBuffer | null | undefined;
+        if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+          const direction = event.key === 'ArrowDown' ? 1 : -1;
+          next = event.shiftKey ? stepUnread(ordered, current, direction, unreadRef.current, settings)
+            : stepBuffer(visibleBuffers(ordered, settings), current, direction);
+        } else if (!event.shiftKey && /^Digit[1-9]$/.test(event.code)) {
+          // Match the physical key: on macOS, Option+digit reports a symbol in `event.key`.
+          next = visibleBuffers(ordered, settings)[Number(event.code.slice(5)) - 1];
+        } else {
+          next = undefined;
+        }
+        if (next !== undefined) {
+          event.preventDefault();
+          if (next && next.id !== current) selectBufferRef.current(next.id);
+          return;
+        }
+      }
       if (event.key === '/' && !typing && !event.altKey && !event.ctrlKey && !event.metaKey) {
         const input = document.querySelector<HTMLInputElement>('.composer input');
         if (input) {
@@ -670,6 +746,7 @@ export default function App() {
           receivedMessageIds.current.add(event.message.id);
           receivedMessageCursor.current++;
           messageQueue.current.push(event.message);
+          if (event.message.nick) updateTyping(event.message.bufferId, event.message.nick, 'done');
           if (messageFrame.current === null) {
             messageFrame.current = requestAnimationFrame(() => {
               messageFrame.current = null;
@@ -707,7 +784,8 @@ export default function App() {
           }
           const muted = settingsRef.current.mutedBuffers.includes(event.message.bufferId)
             || (!!buffer && settingsRef.current.mutedNetworks.includes(buffer.networkId));
-          if (!muted && identity && highlight) {
+          // Backfilled history counts as unread but never notifies.
+          if (!muted && !event.replayed && identity && highlight) {
             const settings = preferencesRef.current;
             if (settings.browserNotifications && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
               try {
@@ -781,10 +859,14 @@ export default function App() {
           break;
         }
         case 'channel_state':
+          retainTypers(event.state.bufferId, event.state.users.map((user) => user.nick));
           if (selectedRef.current === event.state.bufferId) {
             channelStateVersion.current++;
             setChannelDetails({ bufferId: event.state.bufferId, state: event.state, loading: false, error: '' });
           }
+          break;
+        case 'typing':
+          updateTyping(event.bufferId, event.nick, event.state);
           break;
         case 'history_cleared':
           setView((current) => current.bufferId === event.bufferId ? { ...current, messages: [], hasMore: false } : current);
@@ -853,7 +935,7 @@ export default function App() {
       messageQueue.current = [];
       socket?.close();
     };
-  }, [auth, advanceRead, applyServerSettings, fail, refreshBootstrap, updateUnread]);
+  }, [auth, advanceRead, applyServerSettings, fail, refreshBootstrap, updateUnread, updateTyping, retainTypers]);
 
   useEffect(() => {
     if (auth !== 'ready') return;
@@ -1030,6 +1112,9 @@ export default function App() {
       relayNicks: network.relayNicks,
       mentionAliases: network.mentionAliases,
       displayNames,
+      backfill: network.backfill,
+      joinDelaySeconds: network.joinDelaySeconds,
+      regainNick: network.regainNick,
     };
     try {
       await api<Network>(`/api/networks/${network.id}`, json('PATCH', input));
@@ -1235,6 +1320,7 @@ export default function App() {
         } },
         { label: 'List all channels', disabled: offline, onSelect: () => openChannelList(network.id, true) },
         { label: 'Ignored users…', onSelect: () => setDialog({ kind: 'ignores', networkId: network.id }) },
+        { label: 'Export history…', onSelect: () => setDialog({ kind: 'export', networkId: network.id, bufferId: null }) },
         { label: syncedSettings.mutedNetworks.includes(network.id) ? 'Unmute network' : 'Mute network',
           onSelect: () => toggleSettingId('mutedNetworks', network.id) },
         { label: 'Network settings…', onSelect: () => openNetworkSettings(network.id) },
@@ -1266,6 +1352,7 @@ export default function App() {
         { label: 'Set display name…', onSelect: () => beginRename(buffer.networkId, buffer.name) },
         { label: muteLabel, onSelect: () => toggleSettingId('mutedBuffers', buffer.id) },
         { label: 'Clear history…', onSelect: () => void clearHistory(buffer) },
+        { label: 'Export history…', onSelect: () => setDialog({ kind: 'export', networkId: buffer.networkId, bufferId: buffer.id }) },
         { label: 'Close conversation', onSelect: () => void closeBuffer(buffer) },
       ] };
     }
@@ -1277,6 +1364,7 @@ export default function App() {
       { label: 'Ban list…', disabled: !live, onSelect: () => setDialog({ kind: 'bans', bufferId: buffer.id }) },
       { label: muteLabel, onSelect: () => toggleSettingId('mutedBuffers', buffer.id) },
       { label: 'Clear history…', onSelect: () => void clearHistory(buffer) },
+      { label: 'Export history…', onSelect: () => setDialog({ kind: 'export', networkId: buffer.networkId, bufferId: buffer.id }) },
       joined
         ? { label: 'Leave channel', danger: true, onSelect: () => void part(buffer) }
         : { label: 'Rejoin channel', onSelect: () => void joinChannel(buffer.networkId, buffer.name) },
@@ -1341,12 +1429,41 @@ export default function App() {
   const selectedDetails = selected && channelDetails?.bufferId === selected.id ? channelDetails : null;
   const menuSpec = menu && menuItems(menu.subject);
   const dialogNetwork = dialog && dialog.kind !== 'bans' ? networks.find((network) => network.id === dialog.networkId) : undefined;
-  const dialogBuffer = dialog?.kind === 'bans' ? buffers.find((buffer) => buffer.id === dialog.bufferId) : undefined;
+  const dialogBuffer = dialog?.kind === 'bans' || dialog?.kind === 'export'
+    ? buffers.find((buffer) => buffer.id === dialog.bufferId) : undefined;
   const usersVisible = drawerUsers ? usersPanelOpen : !preferences.userListHidden;
   const headerSubject: MenuSubject | null = selected
     ? selected.kind === 'server' ? { kind: 'network', networkId: selected.networkId } : { kind: 'buffer', bufferId: selected.id }
     : null;
   const jumped = !!selected && jump?.bufferId === selected.id;
+  // Files dragged onto the conversation go to the composer; other drags (text, links) keep their default behavior.
+  const dropEnabled = showingConversation && !!activeNetwork && selectedJoined && !!uploadCapabilities?.enabled;
+  const fileDrop = {
+    onDragEnter(event: DragEvent<HTMLElement>) {
+      if (!event.dataTransfer.types.includes('Files')) return;
+      dragDepth.current += 1;
+      if (!dropEnabled) return;
+      event.preventDefault();
+      setDropping(true);
+    },
+    onDragOver(event: DragEvent<HTMLElement>) {
+      if (!dropEnabled || !event.dataTransfer.types.includes('Files')) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    },
+    onDragLeave(event: DragEvent<HTMLElement>) {
+      if (!event.dataTransfer.types.includes('Files')) return;
+      dragDepth.current = Math.max(0, dragDepth.current - 1);
+      if (dragDepth.current === 0) setDropping(false);
+    },
+    onDrop(event: DragEvent<HTMLElement>) {
+      dragDepth.current = 0;
+      setDropping(false);
+      if (!dropEnabled || !event.dataTransfer.files.length) return;
+      event.preventDefault();
+      composerRef.current?.upload([...event.dataTransfer.files]);
+    },
+  };
 
   return <SidebarContext.Provider value={sidebarControl}>
     <div className={`app-shell${preferences.sidebarCollapsed && !drawerSidebar ? ' is-sidebar-collapsed' : ''}`}>
@@ -1378,7 +1495,14 @@ export default function App() {
         onSignOut={() => void logout()} onHide={toggleSidebar} />
       {!drawerSidebar && !preferences.sidebarCollapsed && <SidebarResizer sidebarRef={sidebarRef} width={preferences.sidebarWidth}
         onResize={(width) => setPreferences((current) => ({ ...current, sidebarWidth: width }))} />}
-      <main className="main-pane">
+      <main className="main-pane" {...fileDrop}>
+        {dropping && dropEnabled && <div className="drop-overlay" aria-hidden="true">
+          <div className="drop-overlay__panel">
+            <Icon name="paperclip" />
+            <strong>Drop files to upload</strong>
+            <span>Their links are added to your message.</span>
+          </div>
+        </div>}
         {connection === 'offline' && <div className="connection-banner" role="status">
           <span className="status-dot status-reconnecting" aria-hidden="true" />
           Connection to Lingo lost. Reconnecting…
@@ -1394,8 +1518,9 @@ export default function App() {
         : searchOpen ? <SearchPanel networks={networks} buffers={buffers} initialBufferId={selectedId ?? undefined}
           onClose={() => setSearchOpen(false)} onJump={jumpTo} />
         : globalSettingsOpen && user ? <GlobalSettings user={user} preferences={preferences}
-          settings={syncedSettings} onSettingsChange={updateSettings}
+          settings={syncedSettings} onSettingsChange={updateSettings} uploads={uploadCapabilities}
           onChange={setPreferences} onEnableNotifications={enableNotifications} onSoundChange={changeSound}
+          onUploadsChanged={() => void refreshUploadCapabilities()}
           onClose={() => setGlobalSettingsOpen(false)} onUnauthorized={() => {
             sessionExpired();
             setGlobalSettingsOpen(false);
@@ -1438,12 +1563,18 @@ export default function App() {
             <button className="button button-primary button-small" type="button" disabled={joining}
               onClick={() => void joinChannel(selected.networkId, selected.name)}>{joining ? 'Joining…' : 'Rejoin'}</button>
           </div>}
-          <MentionComposer buffer={selected} network={activeNetwork} messages={messages}
+          <MentionComposer ref={composerRef} buffer={selected} network={activeNetwork} messages={messages}
             ownNames={ownNames(activeNetwork, statuses[selected.networkId])} disabled={!selectedJoined || sending}
             knownChannels={buffers.filter((buffer) => buffer.networkId === selected.networkId && buffer.kind === 'channel')
               .map((buffer) => buffer.name)}
             channelListUpdatedAt={channelLists[selected.networkId]?.updatedAt ?? null}
-            onSend={sendMessage} onError={(error) => setNotice(errorText(error))} autocomplete={preferences.autocomplete} />
+            sendTyping={syncedSettings.sendTyping}
+            typing={(typers[selected.id] ?? []).map(({ nick }) =>
+              displayIdentity({ nick, text: '' }, [], activeNetwork.displayNames).nick ?? nick)}
+            uploads={uploadCapabilities} uploadExpiry={preferences.uploadExpiry}
+            onUploadExpiryChange={(uploadExpiry) => setPreferences((current) => ({ ...current, uploadExpiry }))}
+            onUploadLimitsChanged={() => void refreshUploadCapabilities()}
+            onSend={sendMessage} onError={fail} autocomplete={preferences.autocomplete} />
         </> : <>
           <PaneHeader title="lingo" />
           <div className="welcome">
@@ -1483,5 +1614,10 @@ export default function App() {
     {dialog?.kind === 'displayName' && dialogNetwork && <DisplayNameDialog network={dialogNetwork} nick={dialog.nick}
       initial={dialog.initial} onSave={(name) => renameNick(dialogNetwork.id, dialog.nick, name)}
       onClose={() => setDialog(null)} />}
+    {dialog?.kind === 'export' && dialogNetwork && (dialog.bufferId === null || dialogBuffer) &&
+      <ExportDialog network={dialogNetwork} buffer={dialogBuffer ?? null} onClose={() => setDialog(null)} />}
+    {switcherOpen && <QuickSwitcher networks={networks} buffers={buffers} unread={unread} settings={syncedSettings}
+      currentId={selectedId} onClose={() => setSwitcherOpen(false)}
+      onSelect={(id) => { setSwitcherOpen(false); selectBuffer(id); }} />}
   </SidebarContext.Provider>;
 }

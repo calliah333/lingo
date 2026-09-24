@@ -1,4 +1,4 @@
-import { Client, type IrcEvent } from 'irc-framework';
+import { Client, type IrcBatch, type IrcEvent } from 'irc-framework';
 import type {
   BanEntry,
   ChannelListEntry,
@@ -12,6 +12,7 @@ import type {
   Network,
   NetworkStatus,
   ServerEvent,
+  TypingState,
   WhoisInfo,
 } from '../shared/contracts.ts';
 import { displayIdentity, mentionsAny } from '../shared/identity.ts';
@@ -22,6 +23,17 @@ import type { Store } from './store.ts';
 const CHANNEL_LIST_LIMIT = 100_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const PENDING_LIMIT = 20;
+/** Lines per CHATHISTORY request, lowered to the server's advertised maximum. */
+const HISTORY_LIMIT = 200;
+/** AFTER requests per target and connection, so one backfill replays at most 1000 lines. */
+const HISTORY_PAGES = 5;
+const HISTORY_CAPS = ['draft/chathistory', 'chathistory'];
+const HISTORY_BATCHES = ['chathistory', 'draft/chathistory'];
+/** A repeated `+typing` state for the same target within this window is dropped (several tabs, retries). */
+const TYPING_REPEAT_MS = 2_000;
+const TYPING_STATES: readonly string[] = ['active', 'paused', 'done'] satisfies TypingState[];
+/** Fallback nicks tried while registering under a taken nick; afterwards the server's timeout closes the link. */
+const NICK_ATTEMPTS = 10;
 
 type Pending<T> = {
   key: string;
@@ -50,6 +62,18 @@ type Runtime = {
   };
   pendingWhois: Pending<WhoisInfo>[];
   pendingBans: Pending<BanEntry[]>[];
+  /** Configured commands may carry secrets; their echo-message copies are dropped, never stored. */
+  unrecordedEchoes: Array<{ key: string; text: string }>;
+  /** Newest stored line before this connection registered; CHATHISTORY TARGETS starts there. */
+  backfillSince: number | null;
+  /** Lowercased CHATHISTORY targets awaiting a reply, with the page number requested. */
+  historyPages: Map<string, number>;
+  /** Last `+typing` state sent per buffer on this connection. */
+  typingSent: Map<number, { state: TypingState; at: number }>;
+  /** Pending delayed autojoin (`joinDelaySeconds`) for this connection. */
+  joinTimer: NodeJS.Timeout | null;
+  /** Fallback nicks tried during the current registration. */
+  nickAttempts: number;
 };
 
 function isChannel(name: string): boolean {
@@ -76,6 +100,15 @@ function safeText(value: string): boolean {
 function eventTime(event: IrcEvent): number {
   return typeof event.time === 'number' && Number.isFinite(event.time) && event.time >= 0
     ? event.time : Date.now();
+}
+
+function isReplay(event: IrcEvent): boolean {
+  return !!event.batch && HISTORY_BATCHES.includes(event.batch.type);
+}
+
+/** Registration fallbacks for a taken nick: `nick_`, `nick__`, then a short numbered variant. */
+function alternateNick(nick: string, attempt: number): string {
+  return attempt <= 2 ? nick + '_'.repeat(attempt) : `${nick.slice(0, 12)}${Math.floor(Math.random() * 1000)}`;
 }
 
 export class IrcManager {
@@ -121,6 +154,7 @@ export class IrcManager {
     if (this.connections.has(network.id)) this.disconnect(network.id);
 
     const client = new Client();
+    client.requestCap(HISTORY_CAPS);
     const runtime: Runtime = {
       network,
       userId,
@@ -135,6 +169,12 @@ export class IrcManager {
       channelList: { state: 'idle', entries: new Map(), sorted: null, updatedAt: null, publishedAt: 0 },
       pendingWhois: [],
       pendingBans: [],
+      unrecordedEchoes: [],
+      backfillSince: null,
+      historyPages: new Map(),
+      typingSent: new Map(),
+      joinTimer: null,
+      nickAttempts: 0,
     };
     this.connections.set(network.id, runtime);
     this.setStatus(runtime, 'connecting');
@@ -145,22 +185,32 @@ export class IrcManager {
       runtime.registered = true;
       runtime.retryCount = 0;
       this.setStatus(runtime, 'connected', event.nick || client.user.nick);
+      runtime.backfillSince = this.store.latestNetworkTime(network.id);
       this.connectionMarker(runtime, 'connected');
       this.applyAway(runtime);
       this.onRegistered(runtime);
+      this.requestTargets(runtime);
     });
     client.on('close', () => {
       if (!runtime.active) return;
       if (runtime.registered) this.connectionMarker(runtime, 'disconnected');
       runtime.registered = false;
+      this.cancelJoin(runtime);
       this.clearChannels(runtime);
       runtime.joined.clear();
+      runtime.historyPages.clear();
       this.endRequests(runtime, 'Connection lost');
       this.scheduleRetry(runtime, 'Connection lost');
+    });
+    client.on('nick in use', () => {
+      // irc-framework keeps waiting for 001 after ERR_NICKNAMEINUSE, so registration picks another nick.
+      if (!runtime.active || runtime.registered || runtime.nickAttempts >= NICK_ATTEMPTS) return;
+      client.changeNick(alternateNick(network.nick, ++runtime.nickAttempts));
     });
     client.on('privmsg', (event: IrcEvent) => this.incoming(runtime, 'privmsg', event));
     client.on('notice', (event: IrcEvent) => this.incoming(runtime, 'notice', event));
     client.on('action', (event: IrcEvent) => this.incoming(runtime, 'action', event));
+    client.on('tagmsg', (event: IrcEvent) => this.typing(runtime, event));
     client.on('motd', (event: { motd?: string; error?: string }) => {
       if (!runtime.active || !event.motd) return;
       const buffer = this.serverBuffer(network.id);
@@ -192,6 +242,7 @@ export class IrcManager {
         // Some networks omit topic or NAMES from the automatic JOIN burst.
         client.raw('TOPIC', event.channel);
         client.raw('NAMES', event.channel);
+        this.requestHistory(runtime, event.channel, this.store.latestMessageTime(buffer.id));
       }
       if (!runtime.joined.has(key)) return;
       this.liveChannel(runtime, key).users.set(event.nick.toLowerCase(), { nick: event.nick, modes: [] });
@@ -267,7 +318,7 @@ export class IrcManager {
         this.publishChannel(runtime, event.channel);
       }
       if (event.nick && state) {
-        const buffer = this.channelBuffer(network.id, event.channel);
+        const buffer = this.storedBuffer(network.id, event.channel, 'channel');
         if (buffer) this.system(buffer, `${event.nick} changed the topic to: ${event.topic || '(none)'}`, eventTime(event), true);
       }
     });
@@ -291,6 +342,32 @@ export class IrcManager {
     client.on('channel list end', () => {
       if (runtime.active) this.finishChannelList(runtime);
     });
+    for (const type of HISTORY_BATCHES) {
+      client.on<IrcBatch>(`batch end ${type}`, (batch) => {
+        const target = batch.params[0];
+        if (!runtime.active || !target) return;
+        const key = target.toLowerCase();
+        const page = runtime.historyPages.get(key);
+        if (page === undefined) return;
+        runtime.historyPages.delete(key);
+        // A full page may not reach the present: continue after its newest line.
+        const last = Date.parse(batch.commands.at(-1)?.tags?.time ?? '');
+        if (page < HISTORY_PAGES && batch.commands.length >= this.historyLimit(runtime) && Number.isFinite(last))
+          this.requestHistory(runtime, target, last, page + 1);
+      });
+      client.on<IrcBatch>(`batch end ${type}-targets`, (batch) => {
+        if (!runtime.active || !runtime.registered) return;
+        for (const command of batch.commands) {
+          const [subcommand, target] = command.params;
+          // Channels are backfilled when they are joined.
+          if (command.command !== 'CHATHISTORY' || subcommand !== 'TARGETS' || !target || isChannel(target) ||
+            !safeToken(target) || client.caseCompare(target, runtime.status.nick)) continue;
+          const buffer = this.storedBuffer(network.id, target, 'query');
+          this.requestHistory(runtime, target,
+            (buffer && this.store.latestMessageTime(buffer.id)) ?? runtime.backfillSince);
+        }
+      });
+    }
     client.on<Record<string, unknown>>('whois', (event) => {
       if (!runtime.active || typeof event.nick !== 'string') return;
       const text = (value: unknown) => typeof value === 'string' && value ? value : undefined;
@@ -343,6 +420,7 @@ export class IrcManager {
     runtime.active = false;
     runtime.registered = false;
     clearTimeout(runtime.retryTimer ?? undefined);
+    this.cancelJoin(runtime);
     this.clearChannels(runtime);
     runtime.channelList = { state: 'idle', entries: new Map(), sorted: null, updatedAt: null, publishedAt: 0 };
     this.endRequests(runtime, 'Network disconnected');
@@ -447,6 +525,21 @@ export class IrcManager {
     if (!this.store.getNetwork(networkId)) throw new Error('Network not found');
     if (!safeToken(nick) || isChannel(nick) || nick.length > 64) throw new Error('Invalid nickname');
     return this.ensureBuffer(networkId, nick, 'query');
+  }
+
+  /** Relays our `+typing` state only when the user opted in and the server accepts the client tag. */
+  sendTyping(bufferId: number, state: TypingState): void {
+    const buffer = this.store.getBuffer(bufferId);
+    if (!buffer || buffer.kind === 'server' || !safeToken(buffer.name)) return;
+    const runtime = this.connections.get(buffer.networkId);
+    if (!runtime?.registered || !runtime.client.network.supportsTag('typing') ||
+      (buffer.kind === 'channel' && !runtime.joined.has(buffer.name.toLowerCase())) ||
+      !this.store.getSettingsState(runtime.userId).settings.sendTyping) return;
+    const now = Date.now();
+    const last = runtime.typingSent.get(bufferId);
+    if (last?.state === state && now - last.at < TYPING_REPEAT_MS) return;
+    runtime.typingSent.set(bufferId, { state, at: now });
+    runtime.client.tagmsg(buffer.name, { '+typing': state });
   }
 
   private registeredRuntime(networkId: number): Runtime {
@@ -614,7 +707,7 @@ export class IrcManager {
   }
 
   private publishChannel(runtime: Runtime, channel: string): void {
-    const buffer = this.channelBuffer(runtime.network.id, channel);
+    const buffer = this.storedBuffer(runtime.network.id, channel, 'channel');
     if (buffer) this.publish({ type: 'channel_state', state: this.channelState(buffer.id) });
   }
 
@@ -726,7 +819,7 @@ export class IrcManager {
         let target = buffer;
         if (args) {
           if (!isChannel(args)) throw new Error('Usage: /part [#channel]');
-          const found = this.channelBuffer(runtime.network.id, args);
+          const found = this.storedBuffer(runtime.network.id, args, 'channel');
           if (!found) throw new Error('Channel not found');
           target = found;
         }
@@ -784,14 +877,111 @@ export class IrcManager {
     if (kind === 'privmsg') runtime.client.say(buffer.name, text);
     else if (kind === 'notice') runtime.client.notice(buffer.name, text);
     else runtime.client.action(buffer.name, text);
-    if (record) {
-      const message = this.message(buffer, kind, runtime.status.nick, text, Date.now());
-      const lastReadId = this.store.markRead(buffer.id, message.id);
-      if (lastReadId !== null) this.publish({ type: 'read', bufferId: buffer.id, lastReadId });
+    if (runtime.client.network.cap.isEnabled('echo-message')) {
+      // The server's echo is recorded instead, carrying its time and msgid.
+      if (!record) {
+        runtime.unrecordedEchoes.push({ key: `${kind} ${buffer.name.toLowerCase()}`, text });
+        runtime.unrecordedEchoes.splice(0, runtime.unrecordedEchoes.length - PENDING_LIMIT);
+      }
+    } else if (record) {
+      this.outbound(buffer, kind, runtime.status.nick, text, Date.now(), null);
     }
   }
 
+  /** Stores our own line and advances the read marker past it. */
+  private outbound(
+    buffer: ChatBuffer, kind: 'privmsg' | 'notice' | 'action', nick: string, text: string, time: number,
+    msgid: string | null, replayed = false,
+  ): void {
+    const message = this.message(buffer, kind, nick, text, time, {}, msgid, replayed);
+    if (!message) return;
+    const lastReadId = this.store.markRead(buffer.id, message.id);
+    if (lastReadId !== null) this.publish({ type: 'read', bufferId: buffer.id, lastReadId });
+  }
+
+  /**
+   * Records the server's echo, or a chathistory replay, of our own line. Lines sent by configured
+   * commands are dropped: live echoes by matching `unrecordedEchoes`, replays by their text.
+   */
+  private echoed(runtime: Runtime, kind: 'privmsg' | 'notice' | 'action', nick: string, target: string,
+    text: string, event: IrcEvent, replayed: boolean): void {
+    if (replayed) {
+      if (this.configuredLine(runtime, target, text)) return;
+    } else {
+      const key = `${kind} ${target.toLowerCase()}`;
+      const pending = runtime.unrecordedEchoes.find(entry => entry.key === key && entry.text.includes(text));
+      if (pending) {
+        // Long lines are echoed in several parts; consume each part until the whole line is seen.
+        pending.text = pending.text.slice(pending.text.indexOf(text) + text.length);
+        if (!pending.text.trim()) runtime.unrecordedEchoes.splice(runtime.unrecordedEchoes.indexOf(pending), 1);
+        return;
+      }
+    }
+    if (!safeToken(target)) return;
+    const buffer = this.ensureBuffer(runtime.network.id, target, isChannel(target) ? 'channel' : 'query');
+    this.outbound(buffer, kind, nick, text, eventTime(event), event.tags?.msgid || null, replayed);
+  }
+
+  /** Whether a configured `/msg`, `/notice`, or raw PRIVMSG/NOTICE command, or REGAIN, sent `text` to `target`. */
+  private configuredLine(runtime: Runtime, target: string, text: string): boolean {
+    if (runtime.network.regainNick && runtime.client.caseCompare(target, 'NickServ') &&
+      text === `REGAIN ${runtime.network.nick}`) return true;
+    return runtime.network.commands.some(command => {
+      const match = /^(\/?)(msg|notice|privmsg)\s+(\S+)\s+(.+)$/i.exec(command.trim());
+      if (!match) return false;
+      const [, slash, verb, recipient, body] = match;
+      const raw = !slash || verb.toLowerCase() === 'privmsg';
+      if (raw && verb.toLowerCase() === 'msg') return false;
+      const sent = raw && body.startsWith(':') ? body.slice(1) : body;
+      return runtime.client.caseCompare(recipient, target) && sent.includes(text);
+    });
+  }
+
+  /** Reads the stored choice: toggling backfill saves the network without reconnecting. */
+  private backfillEnabled(runtime: Runtime): boolean {
+    return (this.store.getNetwork(runtime.network.id) ?? runtime.network).backfill &&
+      HISTORY_CAPS.some(cap => runtime.client.network.cap.isEnabled(cap));
+  }
+
+  private historyLimit(runtime: Runtime): number {
+    const advertised = Number(runtime.client.network.options.CHATHISTORY);
+    return Number.isInteger(advertised) && advertised > 0 ? Math.min(HISTORY_LIMIT, advertised) : HISTORY_LIMIT;
+  }
+
+  /** Replays a target's history after `since`, or its latest lines when nothing is stored yet. */
+  private requestHistory(runtime: Runtime, target: string, since: number | null, page = 1): void {
+    if (!runtime.registered || !this.backfillEnabled(runtime) || !safeToken(target)) return;
+    const limit = String(this.historyLimit(runtime));
+    // LATEST already ends at the present, so it is never continued.
+    runtime.historyPages.set(target.toLowerCase(), since === null ? HISTORY_PAGES : page);
+    if (since === null) runtime.client.raw('CHATHISTORY', 'LATEST', target, '*', limit);
+    else runtime.client.raw('CHATHISTORY', 'AFTER', target, `timestamp=${new Date(since).toISOString()}`, limit);
+  }
+
+  /** Lists private conversations active since the last stored line; their replies continue in `requestHistory`. */
+  private requestTargets(runtime: Runtime): void {
+    if (runtime.backfillSince === null || !this.backfillEnabled(runtime)) return;
+    runtime.client.raw('CHATHISTORY', 'TARGETS', `timestamp=${new Date(runtime.backfillSince).toISOString()}`,
+      `timestamp=${new Date().toISOString()}`, '50');
+  }
+
   private onRegistered(runtime: Runtime): void {
+    this.regainNick(runtime);
+    this.runCommands(runtime);
+    // Commands run first so services can identify (and cloak the host) before channels see us.
+    const delay = runtime.network.joinDelaySeconds;
+    if (delay > 0) {
+      runtime.joinTimer = setTimeout(() => {
+        runtime.joinTimer = null;
+        if (runtime.active && runtime.registered) this.autojoin(runtime);
+      }, delay * 1000);
+    } else {
+      this.autojoin(runtime);
+    }
+  }
+
+  /** Reads `autojoin` when it runs, so channels parted during a join delay stay parted. */
+  private autojoin(runtime: Runtime): void {
     for (const channel of runtime.network.autojoin) {
       if (!isChannel(channel)) continue;
       const key = channel.toLowerCase();
@@ -800,6 +990,29 @@ export class IrcManager {
       runtime.joined.add(key);
       runtime.client.join(channel);
     }
+  }
+
+  private cancelJoin(runtime: Runtime): void {
+    clearTimeout(runtime.joinTimer ?? undefined);
+    runtime.joinTimer = null;
+  }
+
+  /** Asks services for the configured nick when registration fell back to another one; SASL identified us. */
+  private regainNick(runtime: Runtime): void {
+    const config = this.store.getNetworkConfig(runtime.network.id);
+    const { client } = runtime;
+    // `status.nick` comes from 001; client.user.nick may not be updated yet while `registered` listeners run.
+    if (!config?.regainNick || !config.saslAccount || !config.saslPassword || !safeToken(config.nick) ||
+      client.caseCompare(runtime.status.nick, config.nick)) return;
+    const text = `REGAIN ${config.nick}`;
+    client.raw('PRIVMSG', 'NickServ', text);
+    if (client.network.cap.isEnabled('echo-message')) {
+      runtime.unrecordedEchoes.push({ key: 'privmsg nickserv', text });
+      runtime.unrecordedEchoes.splice(0, runtime.unrecordedEchoes.length - PENDING_LIMIT);
+    }
+  }
+
+  private runCommands(runtime: Runtime): void {
     for (const command of runtime.network.commands) {
       if (!safeText(command)) continue;
       const line = command.trim();
@@ -819,9 +1032,29 @@ export class IrcManager {
     }
   }
 
+  /** Publishes another user's `+typing` TAGMSG for an existing buffer; typing never creates one. */
+  private typing(runtime: Runtime, event: IrcEvent): void {
+    const state = event.tags?.['+typing'];
+    const { client } = runtime;
+    if (!runtime.active || !event.nick || !event.target || event.from_server || isReplay(event) ||
+      !state || !TYPING_STATES.includes(state) || client.caseCompare(event.nick, runtime.status.nick) ||
+      this.ignoreList(runtime.network.id).some(ignored => client.caseCompare(ignored, event.nick!))) return;
+    const buffer = isChannel(event.target)
+      ? this.storedBuffer(runtime.network.id, event.target, 'channel')
+      : client.caseCompare(event.target, runtime.status.nick)
+        ? this.storedBuffer(runtime.network.id, event.nick, 'query')
+        : undefined;
+    if (buffer) this.publish({ type: 'typing', bufferId: buffer.id, nick: event.nick, state: state as TypingState });
+  }
+
   private incoming(runtime: Runtime, kind: 'privmsg' | 'notice' | 'action', event: IrcEvent): void {
     if (!runtime.active || !event.message || !event.target) return;
-    if (event.nick && runtime.client.caseCompare(event.nick, runtime.status.nick)) return;
+    const replayed = isReplay(event);
+    if (event.nick && runtime.client.caseCompare(event.nick, runtime.status.nick)) {
+      if (replayed || runtime.client.network.cap.isEnabled('echo-message'))
+        this.echoed(runtime, kind, event.nick, event.target, event.message, event, replayed);
+      return;
+    }
     // irc-framework parses bare server prefixes such as `:mock` as nick values.
     // A server NOTICE addressed to our nick has no user/host mask, so retain it
     // in the server buffer even when `from_server` is false.
@@ -851,9 +1084,10 @@ export class IrcManager {
     const highlight = inbound && (mentionsAny(identity.text, ownNames) ||
       this.store.getSettingsState(runtime.userId).settings.highlights.some(phrase =>
         identity.text.toLowerCase().includes(phrase.toLowerCase())));
-    this.message(buffer, kind, event.nick || null, event.message, eventTime(event),
-      { ...(fromNetwork ? { fromNetwork: true } : {}), ...(highlight ? { highlight: true } : {}) });
-    if (inbound && (highlight || buffer.kind === 'query')) {
+    const message = this.message(buffer, kind, event.nick || null, event.message, eventTime(event),
+      { ...(fromNetwork ? { fromNetwork: true } : {}), ...(highlight ? { highlight: true } : {}) },
+      event.tags?.msgid || null, replayed);
+    if (message && !replayed && inbound && (highlight || buffer.kind === 'query')) {
       this.pushNotify(runtime.userId, buffer, `${identity.nick ?? sender} · ${buffer.name}`, identity.text, highlight);
     }
   }
@@ -885,9 +1119,9 @@ export class IrcManager {
     return existing ?? this.ensureBuffer(networkId, this.connections.get(networkId)!.network.name, 'server');
   }
 
-  private channelBuffer(networkId: number, channel: string): ChatBuffer | undefined {
+  private storedBuffer(networkId: number, name: string, kind: ChatBuffer['kind']): ChatBuffer | undefined {
     return this.store.listBuffers().find(buffer => buffer.networkId === networkId &&
-      buffer.kind === 'channel' && buffer.name.toLowerCase() === channel.toLowerCase());
+      buffer.kind === kind && buffer.name.toLowerCase() === name.toLowerCase());
   }
 
 
@@ -898,11 +1132,13 @@ export class IrcManager {
     text: string,
     time: number,
     metadata: Pick<ChatMessage, 'fromNetwork' | 'connectionEvent' | 'isMotd' | 'highlight'> = {},
-  ): ChatMessage {
-    const message = this.store.appendMessage({
+    msgid: string | null = null,
+    replayed = false,
+  ): ChatMessage | null {
+    const message = this.store.appendUniqueMessage({
       networkId: buffer.networkId, bufferId: buffer.id, kind, nick, text, time, ...metadata,
-    });
-    this.publish({ type: 'message', message });
+    }, msgid, replayed);
+    if (message) this.publish(replayed ? { type: 'message', message, replayed: true } : { type: 'message', message });
     return message;
   }
 
@@ -924,6 +1160,11 @@ export class IrcManager {
     }
     this.clearChannels(runtime);
     runtime.joined.clear();
+    runtime.unrecordedEchoes = [];
+    runtime.nickAttempts = 0;
+    this.cancelJoin(runtime);
+    runtime.typingSent.clear();
+    runtime.historyPages.clear();
     this.setStatus(runtime, runtime.retryCount ? 'reconnecting' : 'connecting');
     try {
       runtime.client.connect({
@@ -936,7 +1177,7 @@ export class IrcManager {
         ...(config.saslAccount && config.saslPassword
           ? { account: { account: config.saslAccount, password: config.saslPassword } }
           : {}),
-        enable_echomessage: false,
+        enable_echomessage: true,
         auto_reconnect: false,
       });
     } catch {

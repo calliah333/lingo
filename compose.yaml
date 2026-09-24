@@ -1,0 +1,22 @@
+services:
+  lingo:
+    build: .
+    image: lingo
+    restart: unless-stopped
+    # Publish on loopback only; put a TLS reverse proxy in front (see README).
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - path: .env
+        required: false
+    # These describe the container itself and override anything in .env.
+    environment:
+      LINGO_HOST: 0.0.0.0
+      LINGO_PORT: "3000"
+      LINGO_DB_PATH: /data/lingo.sqlite
+    volumes:
+      - lingo-data:/data
+    stop_grace_period: 15s
+
+volumes:
+  lingo-data:

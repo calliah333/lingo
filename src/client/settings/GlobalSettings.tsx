@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
-import type { AccountUser, SyncedSettings } from '../../shared/contracts';
+import type { AccountUser, SyncedSettings, UploadCapabilities } from '../../shared/contracts';
 import Icon, { type IconName } from '../Icon';
 import PaneHeader from '../PaneHeader';
 import type { AppPreferences } from '../preferences';
 import AccountSettings from './AccountSettings';
 import AppearanceSettings from './AppearanceSettings';
+import KeyboardSettings from './KeyboardSettings';
 import MessageSettings from './MessageSettings';
 import NotificationSettings from './NotificationSettings';
+import UploadsSettings from './UploadsSettings';
 import UsersSettings from './UsersSettings';
 
 type GlobalSettingsProps = {
@@ -19,14 +21,20 @@ type GlobalSettingsProps = {
   onSoundChange: (enabled: boolean) => void;
   onClose: () => void;
   onUnauthorized: () => void;
+  /** `null` until fetched; the Uploads tab and upload permissions show once uploads are configured. */
+  uploads: UploadCapabilities | null;
+  /** The current user's upload permission changed; fetch the capabilities again. */
+  onUploadsChanged: () => void;
 };
 
-type Tab = 'appearance' | 'messages' | 'notifications' | 'account' | 'users';
+type Tab = 'appearance' | 'messages' | 'notifications' | 'keyboard' | 'account' | 'uploads' | 'users';
 const tabs: Array<{ id: Tab; label: string; icon: IconName }> = [
   { id: 'appearance', label: 'Appearance', icon: 'palette' },
   { id: 'messages', label: 'Messages', icon: 'message' },
   { id: 'notifications', label: 'Notifications', icon: 'bell' },
+  { id: 'keyboard', label: 'Keyboard', icon: 'keyboard' },
   { id: 'account', label: 'Account', icon: 'user' },
+  { id: 'uploads', label: 'Uploads', icon: 'paperclip' },
   { id: 'users', label: 'Users', icon: 'users' },
 ];
 
@@ -46,8 +54,11 @@ function useNarrow(): boolean {
 
 export default function GlobalSettings({
   user, preferences, settings, onChange, onSettingsChange, onEnableNotifications, onSoundChange, onClose, onUnauthorized,
+  uploads, onUploadsChanged,
 }: GlobalSettingsProps) {
-  const visibleTabs = user.isAdmin ? tabs : tabs.filter((tab) => tab.id !== 'users');
+  // Users who lost permission can still delete what they uploaded, so only an unconfigured server hides the tab.
+  const uploadsConfigured = uploads !== null && (uploads.enabled || uploads.reason !== 'not_configured');
+  const visibleTabs = tabs.filter((tab) => (tab.id !== 'users' || user.isAdmin) && (tab.id !== 'uploads' || uploadsConfigured));
   const [active, setActive] = useState<Tab>('appearance');
   const selected = visibleTabs.some((tab) => tab.id === active) ? active : 'appearance';
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -96,8 +107,11 @@ export default function GlobalSettings({
     notifications: <NotificationSettings preferences={preferences} update={update} settings={settings}
       onSettingsChange={onSettingsChange} onEnableNotifications={onEnableNotifications} onSoundChange={onSoundChange}
       onUnauthorized={onUnauthorized} />,
+    keyboard: <KeyboardSettings />,
     account: <AccountSettings user={user} onUnauthorized={onUnauthorized} />,
-    users: <UsersSettings onUnauthorized={onUnauthorized} />,
+    uploads: <UploadsSettings onUnauthorized={onUnauthorized} />,
+    users: <UsersSettings onUnauthorized={onUnauthorized} uploadsConfigured={uploadsConfigured}
+      onCanUploadChange={(userId) => { if (userId === user.id) onUploadsChanged(); }} />,
   };
 
   return <section className="settings-view" aria-labelledby="settings-title">

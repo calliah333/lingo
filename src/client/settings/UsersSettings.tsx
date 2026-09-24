@@ -4,8 +4,16 @@ import { api, errorText, isSessionExpired, json } from '../api';
 import Icon from '../Icon';
 import { SettingsCard, SettingsField, SettingsStatus } from './SettingsControls';
 
+type UsersSettingsProps = {
+  onUnauthorized: () => void;
+  /** Shows the per-user "Can upload" switch; hidden when the server has no upload service. */
+  uploadsConfigured: boolean;
+  /** A user's upload permission changed (the admin's own included). */
+  onCanUploadChange: (userId: number) => void;
+};
+
 /** Admin-only account management. */
-export default function UsersSettings({ onUnauthorized }: { onUnauthorized: () => void }) {
+export default function UsersSettings({ onUnauthorized, uploadsConfigured, onCanUploadChange }: UsersSettingsProps) {
   const [users, setUsers] = useState<AdminUserSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -16,7 +24,7 @@ export default function UsersSettings({ onUnauthorized }: { onUnauthorized: () =
   const [createSuccess, setCreateSuccess] = useState('');
   const [resetId, setResetId] = useState<number | null>(null);
   const [resetPassword, setResetPassword] = useState('');
-  const [pending, setPending] = useState<{ id: number; action: 'reset' | 'delete' | 'toggle' | 'limits' } | null>(null);
+  const [pending, setPending] = useState<{ id: number; action: 'reset' | 'delete' | 'toggle' | 'limits' | 'upload' } | null>(null);
   const [actionError, setActionError] = useState('');
   const [actionSuccess, setActionSuccess] = useState('');
   const [limitsId, setLimitsId] = useState<number | null>(null);
@@ -103,6 +111,23 @@ export default function UsersSettings({ onUnauthorized }: { onUnauthorized: () =
       const updated = await api<AdminUserSummary>(`/api/users/${target.id}`, json('PATCH', { disabled: !target.disabled }));
       setUsers((current) => current.map((user) => user.id === target.id ? updated : user));
       setActionSuccess(`${updated.username} ${updated.disabled ? 'disabled' : 'enabled'}.`);
+    } catch (error) {
+      fail(error, setActionError);
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function toggleUpload(target: AdminUserSummary, canUpload: boolean) {
+    if (pending !== null) return;
+    setPending({ id: target.id, action: 'upload' });
+    setActionError('');
+    setActionSuccess('');
+    try {
+      const updated = await api<AdminUserSummary>(`/api/users/${target.id}`, json('PATCH', { canUpload }));
+      setUsers((current) => current.map((user) => user.id === target.id ? updated : user));
+      setActionSuccess(`${updated.username} ${updated.canUpload ? 'can now upload files' : 'can no longer upload files'}.`);
+      onCanUploadChange(updated.id);
     } catch (error) {
       fail(error, setActionError);
     } finally {
@@ -214,6 +239,11 @@ export default function UsersSettings({ onUnauthorized }: { onUnauthorized: () =
           </span>
         </div>
         <div className="settings-list__actions">
+          {uploadsConfigured && <label className="settings-list__switch">
+            <input className="settings-switch" type="checkbox" role="switch" checked={user.canUpload}
+              disabled={pending !== null} onChange={(event) => void toggleUpload(user, event.target.checked)} />
+            Can upload
+          </label>}
           <button className="button button-quiet button-small" type="button" disabled={pending !== null}
             aria-expanded={limitsId === user.id}
             onClick={() => limitsId === user.id ? setLimitsId(null) : startLimits(user)}>

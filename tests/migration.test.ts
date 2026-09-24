@@ -104,7 +104,7 @@ test('migrates a v1 database without losing networks, history, or indexed search
       id: 7, name: 'Old IRC', host: 'irc.example.test', port: 6697, tls: true,
       nick: 'oldnick', username: 'olduser', realname: 'Old User', saslAccount: 'account',
       autojoin: ['#chat'], commands: ['MODE +i'], relayNicks: [], mentionAliases: [],
-      displayNames: {},
+      displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
     };
 
     store = new Store(path);
@@ -130,6 +130,7 @@ test('migrates a v1 database without losing networks, history, or indexed search
       relayNicks: ['bridgebot'],
       mentionAliases: ['anothernick'],
       displayNames: { alice: 'Alice A.' },
+      backfill: false, joinDelaySeconds: 0, regainNick: false,
     };
     expect(store.updateNetwork(7, { ...updatedNetwork, saslPassword: '' })).toEqual(updatedNetwork);
     store.close();
@@ -317,12 +318,12 @@ test(`migrates v${version} accounts in place while retaining networks and messag
     expect(store.listAdminUsers(500)).toEqual([
       {
         id: 1, username: 'admin', isAdmin: true, createdAt: 100, disabled: false,
-        lastLoginAt: null, networkCount: 0, sessionCount: 0, maxNetworks: null, retentionDays: null,
+        lastLoginAt: null, networkCount: 0, sessionCount: 0, maxNetworks: null, retentionDays: null, canUpload: true,
       },
       {
         id: 2, username: 'alice', isAdmin: false, createdAt: 200, disabled: false,
         lastLoginAt: version === 6 ? 450 : null, networkCount: 2, sessionCount: 1,
-        maxNetworks: null, retentionDays: null,
+        maxNetworks: null, retentionDays: null, canUpload: false,
       },
     ]);
     expect(store.listNetworks(2).map(network => network.id)).toEqual([3, 4]);
@@ -349,7 +350,7 @@ test(`migrates v${version} accounts in place while retaining networks and messag
     expect(store.listAdminUsers(0)[1]).toMatchObject({ disabled: false, lastLoginAt: 600, networkCount: 2 });
     const migrated = new Database(path);
     try {
-      expect(migrated.query('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+      expect(migrated.query('PRAGMA user_version').get()).toEqual({ user_version: 14 });
     } finally {
       migrated.close();
     }
@@ -374,7 +375,7 @@ test('v8 migration preserves v7 user data and keeps settings unconfigured until 
     const network = store.createNetwork(alice.id, {
       name: 'IRC', host: 'irc.example.test', port: 6697, tls: true,
       nick: 'alice', username: 'alice', realname: 'Alice', saslAccount: '',
-      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
     });
     const buffer = store.getOrCreateBuffer(network.id, '#room', 'channel');
     store.appendMessage({ networkId: network.id, bufferId: buffer.id, kind: 'privmsg', nick: 'bob', text: 'kept', time: 1 });
@@ -384,12 +385,14 @@ test('v8 migration preserves v7 user data and keeps settings unconfigured until 
     const legacy = new Database(path);
     try {
       legacy.exec(`
+        ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP INDEX messages_msgid;
+        ALTER TABLE messages DROP COLUMN msgid;
         DROP TABLE push_subscriptions;
         DROP TABLE server_settings;
         DROP TABLE read_markers;
         ALTER TABLE messages DROP COLUMN highlight;
         DROP TABLE user_settings;
-        PRAGMA user_version = 7;
+        DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 7;
       `);
     } finally {
       legacy.close();
@@ -436,7 +439,7 @@ test('v9 migration seeds each buffer marker at its latest v8 message and cascade
     const input = {
       name: 'IRC', host: 'irc.example.test', port: 6697, tls: true,
       nick: 'alice', username: 'alice', realname: 'Alice', saslAccount: '',
-      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
     };
     const network = store.createNetwork(alice.id, input);
     const otherNetwork = store.createNetwork(bob.id, { ...input, nick: 'bob' });
@@ -455,8 +458,9 @@ test('v9 migration seeds each buffer marker at its latest v8 message and cascade
     const legacy = new Database(path);
     try {
       legacy.exec(`
+        ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP INDEX messages_msgid; ALTER TABLE messages DROP COLUMN msgid;
         DROP TABLE push_subscriptions; DROP TABLE server_settings;
-        DROP TABLE read_markers; ALTER TABLE messages DROP COLUMN highlight; PRAGMA user_version = 8;
+        DROP TABLE read_markers; ALTER TABLE messages DROP COLUMN highlight; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 8;
       `);
     } finally {
       legacy.close();
@@ -484,7 +488,7 @@ test('v9 migration seeds each buffer marker at its latest v8 message and cascade
         .toEqual({ last_read_id: otherLast.id });
       expect(db.query('SELECT * FROM read_markers WHERE buffer_id = ?').all(channel.id)).toEqual([]);
       expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
-      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 14 });
     } finally {
       db.close();
     }
@@ -510,7 +514,10 @@ test('v10 migration adds push storage whose subscriptions follow their session a
     store = undefined;
     const legacy = new Database(path);
     try {
-      legacy.exec('DROP TABLE push_subscriptions; DROP TABLE server_settings; PRAGMA user_version = 9');
+      legacy.exec(`
+        ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP INDEX messages_msgid; ALTER TABLE messages DROP COLUMN msgid;
+        DROP TABLE push_subscriptions; DROP TABLE server_settings; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 9;
+      `);
     } finally {
       legacy.close();
     }
@@ -534,10 +541,188 @@ test('v10 migration adds push storage whose subscriptions follow their session a
     try {
       expect(db.query('SELECT COUNT(*) AS count FROM push_subscriptions').get()).toEqual({ count: 0 });
       expect(db.query('SELECT value FROM server_settings').all()).toEqual([{ value: 'first' }]);
-      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 14 });
     } finally {
       db.close();
     }
+  } finally {
+    try {
+      store?.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('v11 migration keeps history and stores each msgid once per buffer', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingo-migration-'));
+  const path = join(directory, 'v10.sqlite');
+  let store: Store | undefined;
+  try {
+    store = new Store(path);
+    const alice = store.createUser('alice', 'scrypt:alice')!;
+    const network = store.createNetwork(alice.id, {
+      name: 'IRC', host: 'irc.example.test', port: 6697, tls: true,
+      nick: 'alice', username: 'alice', realname: 'Alice', saslAccount: '',
+      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
+    });
+    const room = store.getOrCreateBuffer(network.id, '#room', 'channel');
+    const other = store.getOrCreateBuffer(network.id, '#other', 'channel');
+    const line = (bufferId: number, text: string) => ({
+      networkId: network.id, bufferId, kind: 'privmsg' as const, nick: 'bob', text, time: 1,
+    });
+    const kept = store.appendMessage(line(room.id, 'kept'));
+    store.close();
+    store = undefined;
+    const legacy = new Database(path);
+    try {
+      legacy.exec('ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP INDEX messages_msgid; ALTER TABLE messages DROP COLUMN msgid; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 10');
+    } finally {
+      legacy.close();
+    }
+
+    store = new Store(path);
+    expect(store.getMessages(room.id).messages).toEqual([kept]);
+    const first = store.appendUniqueMessage(line(room.id, 'first copy'), 'abc');
+    expect(first).not.toBeNull();
+    expect(store.appendUniqueMessage(line(room.id, 'second copy'), 'abc')).toBeNull();
+    // msgids are scoped per buffer, and messages without one never conflict.
+    expect(store.appendUniqueMessage(line(other.id, 'elsewhere'), 'abc')).not.toBeNull();
+    expect(store.appendUniqueMessage(line(room.id, 'untagged'), null)).not.toBeNull();
+    expect(store.appendUniqueMessage(line(room.id, 'untagged'), null)).not.toBeNull();
+    expect(store.getMessages(room.id).messages.map(message => message.text))
+      .toEqual(['kept', 'first copy', 'untagged', 'untagged']);
+    expect(store.searchMessages('copy', {}).messages.map(message => message.id)).toEqual([first!.id]);
+  } finally {
+    try {
+      store?.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('v12 migration opts existing networks into backfill and replays skip identical stored lines', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingo-migration-'));
+  const path = join(directory, 'v11.sqlite');
+  let store: Store | undefined;
+  try {
+    store = new Store(path);
+    const alice = store.createUser('alice', 'scrypt:alice')!;
+    const input = {
+      name: 'IRC', host: 'irc.example.test', port: 6697, tls: true,
+      nick: 'alice', username: 'alice', realname: 'Alice', saslAccount: '',
+      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: false, joinDelaySeconds: 0, regainNick: false,
+    };
+    const network = store.createNetwork(alice.id, input);
+    const room = store.getOrCreateBuffer(network.id, '#room', 'channel');
+    const line = (text: string, time: number) => ({
+      networkId: network.id, bufferId: room.id, kind: 'privmsg' as const, nick: 'bob', text, time,
+    });
+    const kept = store.appendMessage(line('kept', 5));
+    store.close();
+    store = undefined;
+    const legacy = new Database(path);
+    try {
+      legacy.exec('ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 11');
+    } finally {
+      legacy.close();
+    }
+
+    store = new Store(path);
+    expect(store.getNetwork(network.id)).toEqual({ ...network, backfill: true });
+    expect(store.getMessages(room.id).messages).toEqual([kept]);
+    // A replayed copy without a msgid matches on buffer, time, nick, and text.
+    expect(store.appendUniqueMessage(line('kept', 5), null, true)).toBeNull();
+    expect(store.appendUniqueMessage(line('kept', 6), null, true)).not.toBeNull();
+    expect(store.appendUniqueMessage(line('kept', 5), null)).not.toBeNull();
+    expect(store.latestMessageTime(room.id)).toBe(6);
+    expect(store.updateNetwork(network.id, { ...input, backfill: false })).toMatchObject({ backfill: false });
+  } finally {
+    try {
+      store?.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('v13 migration adds connect options off for existing networks', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingo-migration-'));
+  const path = join(directory, 'v12.sqlite');
+  let store: Store | undefined;
+  try {
+    store = new Store(path);
+    const alice = store.createUser('alice', 'scrypt:alice')!;
+    const input = {
+      name: 'IRC', host: 'irc.example.test', port: 6697, tls: true,
+      nick: 'alice', username: 'alice', realname: 'Alice', saslAccount: 'alice',
+      autojoin: ['#room'], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: false,
+      joinDelaySeconds: 7, regainNick: true,
+    };
+    const network = store.createNetwork(alice.id, input);
+    expect(network).toMatchObject({ joinDelaySeconds: 7, regainNick: true });
+    store.close();
+    store = undefined;
+    const legacy = new Database(path);
+    try {
+      legacy.exec(`
+        ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick;
+        DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 12;
+      `);
+    } finally {
+      legacy.close();
+    }
+
+    store = new Store(path);
+    expect(store.getNetwork(network.id)).toEqual({ ...network, joinDelaySeconds: 0, regainNick: false });
+    expect(store.updateNetwork(network.id, { ...input, joinDelaySeconds: 30 }))
+      .toMatchObject({ joinDelaySeconds: 30, regainNick: true });
+    // The column CHECK backs the API's 0–30 validation.
+    expect(() => store!.updateNetwork(network.id, { ...input, joinDelaySeconds: 31 })).toThrow();
+  } finally {
+    try {
+      store?.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('v14 migration lets only the admin upload and upload rows follow their user', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingo-migration-'));
+  const path = join(directory, 'v13.sqlite');
+  let store: Store | undefined;
+  try {
+    store = new Store(path);
+    const alice = store.createUser('alice', 'scrypt:alice')!;
+    store.close();
+    store = undefined;
+    const legacy = new Database(path);
+    try {
+      legacy.exec(`
+        DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload;
+        PRAGMA user_version = 13;
+      `);
+    } finally {
+      legacy.close();
+    }
+
+    store = new Store(path);
+    expect(store.canUpload(1)).toBe(true);
+    expect(store.canUpload(alice.id)).toBe(false);
+    const upload = store.addUpload(alice.id, {
+      hash: 'abcdefgh', url: 'https://files.test/abcdefgh.png', filename: 'a.png', size: 3, expiresAt: 5000, createdAt: 1000,
+    });
+    expect(store.listUploads(alice.id, 4999)).toEqual({ uploads: [upload], hasMore: false });
+    // Expired uploads leave the list but still count toward the daily limits until pruned.
+    expect(store.listUploads(alice.id, 5000).uploads).toEqual([]);
+    expect(store.recentUploads(alice.id, 0)).toEqual([{ createdAt: 1000, size: 3 }]);
+    store.pruneUploads(5000, 1001);
+    expect(store.recentUploads(alice.id, 0)).toEqual([]);
+    store.addUpload(alice.id, { hash: 'ijklmnop', url: 'u', filename: 'b.png', size: 1, expiresAt: null, createdAt: 2000 });
+    store.removeUser(alice.id);
+    expect(store.recentUploads(alice.id, 0)).toEqual([]);
   } finally {
     try {
       store?.close();
@@ -555,7 +740,7 @@ test('read markers only advance for messages in their buffer and unread is owner
     const input = {
       name: 'IRC', host: 'irc.example.test', port: 6697, tls: true,
       nick: 'alice', username: 'alice', realname: 'Alice', saslAccount: '',
-      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
     };
     const network = store.createNetwork(alice.id, input);
     const otherNetwork = store.createNetwork(bob.id, { ...input, nick: 'bob' });
@@ -608,7 +793,7 @@ test('unread counts inspect only the most recent 1000 post-marker rows and cap a
     const network = store.createNetwork(owner.id, {
       name: 'IRC', host: 'irc.example.test', port: 6697, tls: true,
       nick: 'alice', username: 'alice', realname: 'Alice', saslAccount: '',
-      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
     });
     const channel = store.getOrCreateBuffer(network.id, '#room', 'channel');
     const windowed = store.getOrCreateBuffer(network.id, '#windowed', 'channel');
@@ -637,7 +822,7 @@ test('network quotas are per-user and nullable limits can be updated independent
     const input = {
       name: 'First', host: 'irc.example.test', port: 6697, tls: true,
       nick: 'alice', username: 'alice', realname: 'Alice', saslAccount: '',
-      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+      autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
     };
     store.setUserLimits(alice.id, { maxNetworks: 1, retentionDays: 3 });
     store.setUserLimits(bob.id, { maxNetworks: 0 });
@@ -673,7 +858,7 @@ test('history pruning applies each user’s effective retention in bounded batch
       const network = store.createNetwork(user.id, {
         name: `IRC ${index}`, host: 'irc.example.test', port: 6697, tls: true,
         nick: user.username, username: user.username, realname: user.username, saslAccount: '',
-        autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+        autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
       });
       return store.getOrCreateBuffer(network.id, '#chat', 'channel');
     });

@@ -204,6 +204,47 @@ button.message-nick:hover { text-decoration: underline; text-underline-offset: 3
 .conversation-bar > .icon { color: var(--accent); font-size: 15px; }
 .conversation-bar.is-warning > .icon { color: var(--warning); }
 
+/* Upload progress: a context bar above the composer */
+.conversation-bar > .upload-progress__track {
+  flex: 0 1 140px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border-strong);
+}
+.upload-progress__fill { display: block; height: 100%; background: var(--accent); transition: width .15s linear; }
+.upload-progress__text { display: flex; align-items: baseline; gap: 8px; }
+.upload-progress__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-progress__percent { flex: none; color: var(--text-faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* Shown while files are dragged over the conversation; it never takes pointer events, so drag tracking stays on the pane. */
+.drop-overlay {
+  position: absolute;
+  z-index: 25;
+  inset: 8px;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  pointer-events: none;
+}
+.drop-overlay__panel {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 20px 26px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow);
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+.drop-overlay__panel .icon { color: var(--accent); font-size: 28px; }
+.drop-overlay__panel strong { color: var(--text); font-size: 15px; font-weight: 600; }
+
 /* Composer */
 .composer {
   position: relative;
@@ -246,6 +287,51 @@ button.message-nick:hover { text-decoration: underline; text-underline-offset: 3
 }
 .composer__send:not(:disabled):hover { background: var(--accent-hover); }
 .composer__send:disabled { opacity: 1; background: var(--hover); color: var(--text-faint); }
+.composer__attach {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 17px;
+  transition: background .12s, color .12s;
+}
+.composer__attach:not(:disabled):hover { background: var(--hover); color: var(--text); }
+.composer .composer__expiry {
+  flex: none;
+  width: auto;
+  field-sizing: content;
+  max-width: 8.5em;
+  height: 28px;
+  padding: 0 4px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.composer .composer__expiry:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
+.composer .composer__expiry:disabled { cursor: not-allowed; opacity: .5; }
+
+/* Sits in the transcript's bottom padding, so it never shifts the layout. */
+.typing-indicator {
+  position: absolute;
+  bottom: calc(100% + 1px);
+  left: 14px;
+  max-width: calc(100% - 28px);
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
 
 .mention-menu {
   position: absolute;
@@ -408,6 +494,10 @@ button.mention-option:hover, .mention-option[aria-selected='true'] { background:
   .message-date-separator, .message-unread-divider, .message-connection-marker, .motd { padding-inline: 12px; }
   .conversation-bar { margin-inline: 10px; }
   .composer { margin: 0 10px 10px; }
+  .composer .composer__expiry { padding-inline: 2px; }
+  .composer__attach { width: 30px; }
+  .conversation-bar > .upload-progress__track { flex-basis: 56px; }
+  .drop-overlay { inset: 4px; }
   .conversation-edit-topic { display: none; }
 }
 @media (max-width: 430px) {

@@ -307,7 +307,7 @@ describe('session and origin authorization', () => {
       const network = store.createNetwork(adminId, {
         name: 'libera', host: 'irc.example.org', port: 6697, tls: true, nick: 'root', username: 'root',
         realname: 'Root', saslAccount: '', autojoin: [], commands: [], relayNicks: [], mentionAliases: [],
-        displayNames: {},
+        displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
       });
       const buffer = store.getOrCreateBuffer(network.id, '#secret', 'channel');
       store.appendMessage({ networkId: network.id, bufferId: buffer.id, kind: 'privmsg', nick: 'root', text: 'classified', time: 1 });
@@ -335,6 +335,8 @@ describe('session and origin authorization', () => {
       expect((await request(app, `/api/messages?bufferId=${buffer.id}`, { cookie: aliceCookie })).status).toBe(404);
       expect((await request(app, `/api/networks/${network.id}`, { method: 'DELETE', cookie: aliceCookie })).status).toBe(404);
       expect((await request(app, `/api/buffers/${buffer.id}/messages`, { method: 'DELETE', cookie: aliceCookie })).status).toBe(404);
+      expect((await request(app, `/api/buffers/${buffer.id}/export`, { cookie: aliceCookie })).status).toBe(404);
+      expect((await request(app, `/api/networks/${network.id}/export`, { cookie: aliceCookie })).status).toBe(404);
       expect(await (await request(app, '/api/search?q=classified', { cookie: aliceCookie })).json())
         .toEqual({ messages: [], hasMore: false });
       expect((await (await request(app, '/api/search?q=classified', { cookie: admin })).json()).messages).toHaveLength(1);
@@ -369,6 +371,78 @@ describe('session and origin authorization', () => {
     }
   }, 10_000);
 
+  test('streams complete, ordered, time-filtered history exports', async () => {
+    const store = new Store(':memory:');
+    const manager = new IrcManager(store, () => {});
+    try {
+      const app = createApp(store, manager, { setupToken: SETUP_TOKEN, now: () => Date.UTC(2026, 8, 23, 12) }).app;
+      const cookie = cookieFrom(await request(app, '/api/setup', { method: 'POST', body: SETUP }));
+      const network = store.createNetwork(store.listUsers()[0]!.id, {
+        name: 'libera', host: 'irc.example.org', port: 6697, tls: true, nick: 'root', username: 'root',
+        realname: 'Root', saslAccount: '', autojoin: [], commands: [], relayNicks: [], mentionAliases: [],
+        displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
+      });
+      const room = store.getOrCreateBuffer(network.id, '#room', 'channel');
+      const query = store.getOrCreateBuffer(network.id, 'bob', 'query');
+      const kinds = ['privmsg', 'action', 'notice', 'system'] as const;
+      const roomIds: number[] = [];
+      const allIds: number[] = [];
+      // More than two export pages, interleaved with another buffer so page boundaries skip foreign ids.
+      for (let index = 0; index < 2500; index += 1) {
+        const kind = kinds[index % kinds.length]!;
+        const message = store.appendMessage({
+          networkId: network.id, bufferId: room.id, kind, nick: kind === 'system' ? null : 'bob',
+          text: `line ${index} \x0304red\x03 \x02bold\x02`, time: Date.UTC(2026, 8, 1) + index * 1000,
+        });
+        roomIds.push(message.id);
+        allIds.push(message.id);
+        if (index % 7 === 0) {
+          allIds.push(store.appendMessage({
+            networkId: network.id, bufferId: query.id, kind: 'privmsg', nick: 'bob', text: `dm ${index}`, time: 1,
+          }).id);
+        }
+      }
+
+      const jsonl = await request(app, `/api/buffers/${room.id}/export?format=jsonl`, { cookie });
+      expect(jsonl.status).toBe(200);
+      expect(jsonl.headers.get('content-disposition')).toBe('attachment; filename="libera-room-2026-09-23.jsonl"');
+      const lines = (await jsonl.text()).trimEnd().split('\n').map(line => JSON.parse(line));
+      expect(lines.map(line => line.id)).toEqual(roomIds);
+      expect(lines[1]).toEqual({
+        id: roomIds[1], networkId: network.id, bufferId: room.id, kind: 'action', nick: 'bob',
+        text: 'line 1 \x0304red\x03 \x02bold\x02', time: Date.UTC(2026, 8, 1) + 1000,
+      });
+
+      // Both bounds are inclusive; plain text drops formatting codes.
+      const since = Date.UTC(2026, 8, 1) + 1000;
+      const until = Date.UTC(2026, 8, 1) + 1004 * 1000;
+      const text = await request(app, `/api/buffers/${room.id}/export?format=txt&since=${since}&until=${until}`, { cookie });
+      expect(text.headers.get('content-type')).toStartWith('text/plain');
+      const textLines = (await text.text()).trimEnd().split('\n');
+      expect(textLines).toHaveLength(1004);
+      expect(textLines.slice(0, 4)).toEqual([
+        '[2026-09-01T00:00:01Z] * bob line 1 red bold',
+        '[2026-09-01T00:00:02Z] -bob- line 2 red bold',
+        '[2026-09-01T00:00:03Z] -- line 3 red bold',
+        '[2026-09-01T00:00:04Z] <bob> line 4 red bold',
+      ]);
+      expect(textLines.at(-1)).toStartWith('[2026-09-01T00:16:44Z] <bob> line 1004 ');
+
+      const networkExport = await request(app, `/api/networks/${network.id}/export`, { cookie });
+      expect(networkExport.headers.get('content-disposition')).toBe('attachment; filename="libera-2026-09-23.jsonl"');
+      const networkLines = (await networkExport.text()).trimEnd().split('\n').map(line => JSON.parse(line));
+      expect(networkLines.map(line => line.id)).toEqual(allIds);
+      expect(networkLines[1]).toMatchObject({ bufferId: query.id, bufferName: 'bob', text: 'dm 0' });
+
+      expect((await request(app, `/api/networks/${network.id}/export?format=txt`, { cookie })).status).toBe(400);
+      expect((await request(app, `/api/buffers/${room.id}/export?format=csv`, { cookie })).status).toBe(400);
+      expect((await request(app, `/api/buffers/${room.id}/export?since=5&until=4`, { cookie })).status).toBe(400);
+    } finally {
+      manager.stop();
+      store.close();
+    }
+  }, 10_000);
+
   test('settings are user-scoped, reject foreign IDs atomically, and roundtrip through bootstrap', async () => {
     const store = new Store(':memory:');
     const manager = new IrcManager(store, () => {});
@@ -383,7 +457,7 @@ describe('session and origin authorization', () => {
       const input = {
         name: 'IRC', host: 'irc.example.test', port: 6697, tls: true,
         nick: 'nick', username: 'nick', realname: 'Nick', saslAccount: '',
-        autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+        autojoin: [], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
       };
       const ownNetwork = store.createNetwork(alice.id, input);
       const ownBuffer = store.getOrCreateBuffer(ownNetwork.id, '#own', 'channel');
@@ -505,7 +579,7 @@ describe('session and origin authorization', () => {
       const input = {
         name: 'own', host: '127.0.0.1', port: 6667, tls: false, nick: 'alice',
         username: 'alice', realname: 'Alice', saslAccount: '', autojoin: [], commands: [],
-        relayNicks: [], mentionAliases: [], displayNames: {},
+        relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
       };
       const network = store.createNetwork(alice.id, input);
       const buffer = store.getOrCreateBuffer(network.id, '#room', 'channel');
@@ -548,7 +622,7 @@ describe('session and origin authorization', () => {
       const network = store.createNetwork(users[0]!.id, {
         name: 'mock', host: '127.0.0.1', port: 6667, tls: false, nick: 'alice',
         username: 'alice', realname: 'Alice', saslAccount: '', autojoin: [], commands: [],
-        relayNicks: [], mentionAliases: [], displayNames: {},
+        relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
       });
       const buffer = store.getOrCreateBuffer(network.id, '#room', 'channel');
       const message = store.appendMessage({
@@ -606,7 +680,7 @@ describe('session and origin authorization', () => {
       const input = {
         name: 'one', host: '127.0.0.1', port: 6667, tls: false, nick: 'alice',
         username: 'alice', realname: 'Alice', saslAccount: '', autojoin: [], commands: [],
-        relayNicks: [], mentionAliases: [], displayNames: {},
+        relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
       };
       const patch = (body: unknown) => request(app, `/api/users/${alice.id}`, {
         method: 'PATCH', cookie: admin, body,
@@ -700,7 +774,7 @@ describe('session and origin authorization', () => {
       const input = {
         name: 'live', host: '127.0.0.1', port: address.port, tls: false, nick: 'alice',
         username: 'alice', realname: 'Alice', saslAccount: '', autojoin: [], commands: [],
-        relayNicks: [], mentionAliases: [], displayNames: {},
+        relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
       };
       const live = store.createNetwork(alice.id, input);
       const offline = store.createNetwork(alice.id, { ...input, name: 'offline' });

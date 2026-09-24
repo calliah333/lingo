@@ -1,8 +1,20 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ChangeEvent, type KeyboardEvent } from 'react';
-import type { ChannelListEntry, ChannelListPage, ChatBuffer, ChatMessage, MentionCandidate, Network } from '../shared/contracts';
+import {
+  useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState,
+  type ChangeEvent, type ClipboardEvent, type FormEvent, type KeyboardEvent, type Ref,
+} from 'react';
+import type {
+  ChannelListEntry, ChannelListPage, ChatBuffer, ChatMessage, MentionCandidate, Network, TypingState, UploadCapabilities,
+  UploadExpiry,
+} from '../shared/contracts';
 import { displayIdentity } from '../shared/identity';
+import { ApiError } from './api';
 import Icon from './Icon';
 import { recentChannels, recentMentions, rememberChannel, rememberMention, sessionStartedAt } from './sessionRecents';
+import { TYPING_INTERVAL_MS, typingText } from './typing';
+import { expiryLabels, formatBytes, postUpload, UploadCancelled } from './uploads';
+
+/** Lets App hand in files dropped on the conversation pane. */
+export type ComposerHandle = { upload(files: File[]): void };
 
 type MentionComposerProps = {
   buffer: ChatBuffer;
@@ -17,9 +29,23 @@ type MentionComposerProps = {
   knownChannels: string[];
   /** Changes while the network's channel list loads, so open suggestions refresh. */
   channelListUpdatedAt: number | null;
+  /** Synced opt-in: tell others while you compose a message here. */
+  sendTyping: boolean;
+  /** Display names of others typing in this buffer. */
+  typing: string[];
   onSend: (text: string) => Promise<void>;
   onError: (error: unknown) => void;
+  /** What this user may upload; the attach controls show only when `enabled`. `null` while unknown. */
+  uploads: UploadCapabilities | null;
+  /** This device's preferred expiry, used when the capabilities offer it. */
+  uploadExpiry: UploadExpiry | null;
+  onUploadExpiryChange: (expiry: UploadExpiry) => void;
+  /** An upload was rejected with 400/413, so the limits may have changed; fetch the capabilities again. */
+  onUploadLimitsChanged: () => void;
+  ref?: Ref<ComposerHandle>;
 };
+
+type UploadProgress = { name: string; percent: number; queued: number };
 
 type MentionContext = { kind: 'mention'; start: number; end: number; query: string };
 type CommandContext = { kind: 'command'; end: number; query: string };
@@ -83,7 +109,8 @@ function channelContext(value: string, caret: number): ChannelContext | null {
 }
 
 export default function MentionComposer({
-  buffer, network, messages, ownNames, disabled, autocomplete, knownChannels, channelListUpdatedAt, onSend, onError,
+  buffer, network, messages, ownNames, disabled, autocomplete, knownChannels, channelListUpdatedAt, sendTyping, typing,
+  onSend, onError, uploads, uploadExpiry, onUploadExpiryChange, onUploadLimitsChanged, ref,
 }: MentionComposerProps) {
   const [value, setValue] = useState('');
   const [caret, setCaret] = useState(0);
@@ -100,6 +127,21 @@ export default function MentionComposer({
   const sendingRef = useRef(false);
   const pendingCaret = useRef<number | null>(null);
   const listRequested = useRef(new Set<number>());
+  /** Per buffer: when we last sent a notification, whether it was `active`, and a notification held back by the throttle. */
+  const typingTargets = useRef(new Map<number, { at: number; active: boolean; timer?: number }>());
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  /** Files waiting behind the current upload; uploads run one at a time. */
+  const uploadQueue = useRef<File[]>([]);
+  const uploadXhr = useRef<XMLHttpRequest | null>(null);
+  const uploading = useRef(false);
+  /** Bumped by Cancel and buffer switches, so an upload finishing just then does not insert its link. */
+  const uploadGeneration = useRef(0);
+  const upload = uploads?.enabled ? uploads : null;
+  const expiry = upload && (uploadExpiry && upload.expiries.includes(uploadExpiry) ? uploadExpiry : upload.defaultExpiry);
+  // The queue outlives the render that started it; it reads the current limits and expiry from here.
+  const uploadState = useRef({ upload, expiry, disabled, onUploadLimitsChanged });
+  uploadState.current = { upload, expiry, disabled, onUploadLimitsChanged };
   const context = mentionContext(value, caret) ?? commandContext(value, caret) ?? channelContext(value, caret);
   const menuOpen = !!context && !dismissed && !disabled && autocomplete;
   const mentionOpen = menuOpen && context.kind === 'mention';
@@ -177,6 +219,8 @@ export default function MentionComposer({
 
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
+
+  useImperativeHandle(ref, () => ({ upload: uploadFiles }));
 
   useEffect(() => {
     function handleSlash() {
@@ -269,6 +313,11 @@ export default function MentionComposer({
     setCaret(0);
     setCandidates([]);
     setDismissed(false);
+    // Switching buffers discards the draft, which clears it for everyone watching us type; uploads meant for it stop.
+    return () => {
+      signalTyping(buffer.id, 'done');
+      cancelUploads();
+    };
   }, [buffer.id]);
 
   useEffect(() => {
@@ -290,6 +339,37 @@ export default function MentionComposer({
     setValue(event.currentTarget.value);
     setCaret(event.currentTarget.selectionStart ?? event.currentTarget.value.length);
     setDismissed(false);
+    noteTyping(event.currentTarget.value);
+  }
+
+  /** IRCv3 `+typing`: `active` while composing a message (not a slash command), `done` once when cleared unsent. */
+  function noteTyping(text: string) {
+    if (!sendTyping || buffer.kind === 'server') return;
+    const composing = !!text.trim() && (!text.startsWith('/') || /^\/(?:\/|me\s)/i.test(text));
+    signalTyping(buffer.id, composing ? 'active' : 'done');
+  }
+
+  /** Sends at most one notification per target every 3 s; a held-back change is sent when the window ends. */
+  function signalTyping(bufferId: number, state: Exclude<TypingState, 'paused'>) {
+    const targets = typingTargets.current;
+    const target = targets.get(bufferId) ?? { at: -Infinity, active: false };
+    targets.set(bufferId, target);
+    window.clearTimeout(target.timer);
+    target.timer = undefined;
+    if (state === 'done' && !target.active) return;
+    const post = () => {
+      target.at = Date.now();
+      target.active = state === 'active';
+      target.timer = undefined;
+      void fetch(`/api/buffers/${bufferId}/typing`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state }),
+      }).catch(() => { /* Typing notices are best effort. */ });
+    };
+    const wait = target.at + TYPING_INTERVAL_MS - Date.now();
+    // Continued typing refreshes `active` once the window ends.
+    if (wait <= 0) post();
+    else if (state === 'done' || !target.active) target.timer = window.setTimeout(post, wait);
   }
 
   function choose(candidate: MentionCandidate) {
@@ -327,6 +407,87 @@ export default function MentionComposer({
     inputRef.current?.focus();
   }
 
+  /** Checks sizes, then queues the files; oversized ones are reported and skipped. */
+  function uploadFiles(files: File[]) {
+    const { upload: limits, disabled: off } = uploadState.current;
+    if (!limits || off || !files.length) return;
+    const tooLarge = files.filter((file) => file.size > limits.maxBytes);
+    if (tooLarge.length) {
+      const names = tooLarge.map((file) => `${file.name || 'The pasted file'} (${formatBytes(file.size)})`).join(', ');
+      onErrorRef.current(new Error(`${names} ${tooLarge.length === 1 ? 'is' : 'are'} larger than the ${formatBytes(limits.maxBytes)} upload limit.`));
+    }
+    uploadQueue.current.push(...files.filter((file) => file.size <= limits.maxBytes));
+    if (!uploading.current) void drainUploads();
+    else setProgress((current) => current && { ...current, queued: uploadQueue.current.length });
+  }
+
+  async function drainUploads() {
+    uploading.current = true;
+    for (let file = uploadQueue.current.shift(); file; file = uploadQueue.current.shift()) {
+      const { expiry: chosen } = uploadState.current;
+      if (!chosen) break; // Uploads were turned off meanwhile.
+      const name = file.name || 'pasted file';
+      const xhr = new XMLHttpRequest();
+      const generation = uploadGeneration.current;
+      uploadXhr.current = xhr;
+      setProgress({ name, percent: 0, queued: uploadQueue.current.length });
+      try {
+        const record = await postUpload(file, chosen, xhr, (loaded, total) =>
+          setProgress({ name, percent: Math.floor((loaded / total) * 100), queued: uploadQueue.current.length }));
+        if (generation === uploadGeneration.current) insertLink(record.url);
+      } catch (error) {
+        if (error instanceof UploadCancelled || generation !== uploadGeneration.current) continue;
+        const status = error instanceof ApiError ? error.status : 0;
+        if (status === 400 || status === 413) uploadState.current.onUploadLimitsChanged();
+        onErrorRef.current(error);
+        // Too large or refused by teacup concerns this file only; anything else would fail the rest too.
+        if (status !== 413 && status !== 422) uploadQueue.current = [];
+      } finally {
+        uploadXhr.current = null;
+      }
+    }
+    uploadQueue.current = [];
+    uploading.current = false;
+    setProgress(null);
+  }
+
+  /** Cancel stops the current upload and drops the files queued behind it. */
+  function cancelUploads() {
+    uploadGeneration.current += 1;
+    uploadQueue.current = [];
+    uploadXhr.current?.abort();
+  }
+
+  /** Inserts the link at the caret, spaced from the text before it; the user sends it themselves. */
+  function insertLink(url: string) {
+    const input = inputRef.current;
+    if (!input) return;
+    const current = input.value;
+    const at = input.selectionEnd ?? current.length;
+    const before = current.slice(0, at);
+    const insertion = `${before && !/\s$/.test(before) ? ' ' : ''}${url} `;
+    const next = before + insertion + current.slice(at);
+    setValue(next);
+    setCaret(at + insertion.length);
+    pendingCaret.current = at + insertion.length;
+    noteTyping(next);
+    input.focus();
+  }
+
+  function handlePaste(event: ClipboardEvent<HTMLInputElement>) {
+    // Pasted screenshots and copied files upload; plain text pastes as usual.
+    if (!upload || !event.clipboardData.files.length) return;
+    event.preventDefault();
+    uploadFiles([...event.clipboardData.files]);
+  }
+
+  function handleFiles(event: ChangeEvent<HTMLInputElement>) {
+    const files = [...event.currentTarget.files ?? []];
+    // Clearing lets the same file be picked again.
+    event.currentTarget.value = '';
+    uploadFiles(files);
+  }
+
   /** Feeds session ranking: `/join` targets, the channel you talked in, and the people you @mentioned. */
   function rememberSent(text: string) {
     const join = /^\/join\s+(\S+)/i.exec(text);
@@ -359,9 +520,17 @@ export default function MentionComposer({
     if (disabled || sendingRef.current || !text) return;
     sendingRef.current = true;
     setSending(true);
+    const bufferId = buffer.id;
     try {
       await onSend(text);
       rememberSent(text);
+      // The message itself ends our typing state for everyone; `done` is only for unsent drafts.
+      const target = typingTargets.current.get(bufferId);
+      if (target) {
+        window.clearTimeout(target.timer);
+        target.timer = undefined;
+        target.active = false;
+      }
       setValue('');
       setCaret(0);
       setDismissed(false);
@@ -374,7 +543,8 @@ export default function MentionComposer({
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
-    if (!menuOpen) return;
+    // Alt+↑/↓ switch buffers (App.tsx) even while suggestions are open.
+    if (!menuOpen || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown'))) return;
     if (event.key === 'Escape') {
       event.preventDefault();
       setDismissed(true);
@@ -401,91 +571,119 @@ export default function MentionComposer({
     }
   }
 
-  return <form className={`composer${disabled ? ' is-disabled' : ''}`} onSubmit={submit}>
-    <label className="sr-only" htmlFor={`message-input-${buffer.id}`}>Message to {buffer.name}</label>
-    <input
-      id={`message-input-${buffer.id}`}
-      ref={inputRef}
-      type="text"
-      role="combobox"
-      aria-autocomplete={autocomplete ? 'list' : 'none'}
-      aria-expanded={menuOpen}
-      aria-controls={menuOpen ? listId : undefined}
-      aria-activedescendant={activeOptionId}
-      autoComplete="off"
-      value={value}
-      onChange={handleChange}
-      onClick={(event) => updateCaret(event.currentTarget)}
-      onKeyUp={(event) => updateCaret(event.currentTarget)}
-      onKeyDown={handleKeyDown}
-      placeholder={buffer.kind === 'server' ? 'Type a /command' : `Message ${buffer.name}`}
-      disabled={disabled || sending}
-    />
-    {menuOpen && <ul
-      id={listId}
-      className="mention-menu"
-      role="listbox"
-      aria-label={context.kind === 'command' ? 'Slash commands' : context.kind === 'channel' ? 'Channels' : 'Mention participants'}
-      aria-busy={(mentionOpen && loading) || (channelOpen && channelsLoading)}
-    >
-      {context.kind === 'channel' ? <>
-        {channelOptions.map((channel, index) => <li key={channel.name.toLowerCase()} role="presentation">
-          <button
-            id={`${listId}-${index}`}
-            className="mention-option channel-option"
-            type="button"
-            role="option"
-            aria-selected={index === activeIndex}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => chooseChannel(channel)}
-            title={channel.topic || undefined}
-          >
-            <strong>{channel.name}</strong>
-            {channel.users !== undefined && <span className="channel-option__users">{channel.users.toLocaleString()} users</span>}
-            {channel.topic && <span className="channel-option__topic">{channel.topic}</span>}
-          </button>
-        </li>)}
-        {!channelOptions.length && <li className="mention-option" role="option" aria-selected="false">
-          {channelsLoading ? 'Loading channels…' : 'No matching channels'}
-        </li>}
-      </> : context.kind === 'mention' ? <>
-        {filtered.map((candidate, index) => <li key={`${candidate.mention.toLocaleLowerCase()}-${index}`} role="presentation">
-          <button
-            id={`${listId}-${index}`}
-            className="mention-option"
-            type="button"
-            role="option"
-            aria-selected={index === activeIndex}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => choose(candidate)}
-          >
-            {candidate.name}{candidate.name === candidate.mention ? '' : ` (@${candidate.mention})`}
-          </button>
-        </li>)}
-        {!filtered.length && <li className="mention-option" role="option" aria-selected="false">
-          {loading ? 'Loading participants…' : 'No matching participants'}
-        </li>}
-      </> : <>
-        {matchingCommands.map((command, index) => <li key={command.name} role="presentation">
-          <button
-            id={`${listId}-${index}`}
-            className="mention-option"
-            type="button"
-            role="option"
-            aria-selected={index === activeIndex}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => chooseCommand(command)}
-          >
-            <code>{command.usage}</code><span className="mention-option__help">{command.help}</span>
-          </button>
-        </li>)}
-        {!matchingCommands.length && <li className="mention-option" role="option" aria-selected="false">No matching commands</li>}
+  return <>
+    {progress && <div className="conversation-bar upload-progress" role="status">
+      <Icon name="paperclip" />
+      <span className="upload-progress__text">
+        <span className="upload-progress__name">{progress.percent < 100 ? 'Uploading' : 'Finishing'} {progress.name}</span>
+        <span className="upload-progress__percent">{progress.percent}%{progress.queued ? ` · ${progress.queued} more` : ''}</span>
+      </span>
+      <span className="upload-progress__track" role="progressbar" aria-label={`Uploading ${progress.name}`}
+        aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}>
+        <span className="upload-progress__fill" style={{ width: `${progress.percent}%` }} />
+      </span>
+      <button className="button button-small" type="button" onClick={cancelUploads}>Cancel</button>
+    </div>}
+    <form className={`composer${disabled ? ' is-disabled' : ''}`} onSubmit={submit}>
+      <label className="sr-only" htmlFor={`message-input-${buffer.id}`}>Message to {buffer.name}</label>
+      <div className="typing-indicator" aria-live="polite">{typingText(typing)}</div>
+      <input
+        id={`message-input-${buffer.id}`}
+        ref={inputRef}
+        type="text"
+        role="combobox"
+        aria-autocomplete={autocomplete ? 'list' : 'none'}
+        aria-expanded={menuOpen}
+        aria-controls={menuOpen ? listId : undefined}
+        aria-activedescendant={activeOptionId}
+        autoComplete="off"
+        value={value}
+        onChange={handleChange}
+        onClick={(event) => updateCaret(event.currentTarget)}
+        onKeyUp={(event) => updateCaret(event.currentTarget)}
+        onKeyDown={handleKeyDown}
+        onPaste={handlePaste}
+        placeholder={buffer.kind === 'server' ? 'Type a /command' : `Message ${buffer.name}`}
+        disabled={disabled || sending}
+      />
+      {menuOpen && <ul
+        id={listId}
+        className="mention-menu"
+        role="listbox"
+        aria-label={context.kind === 'command' ? 'Slash commands' : context.kind === 'channel' ? 'Channels' : 'Mention participants'}
+        aria-busy={(mentionOpen && loading) || (channelOpen && channelsLoading)}
+      >
+        {context.kind === 'channel' ? <>
+          {channelOptions.map((channel, index) => <li key={channel.name.toLowerCase()} role="presentation">
+            <button
+              id={`${listId}-${index}`}
+              className="mention-option channel-option"
+              type="button"
+              role="option"
+              aria-selected={index === activeIndex}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => chooseChannel(channel)}
+              title={channel.topic || undefined}
+            >
+              <strong>{channel.name}</strong>
+              {channel.users !== undefined && <span className="channel-option__users">{channel.users.toLocaleString()} users</span>}
+              {channel.topic && <span className="channel-option__topic">{channel.topic}</span>}
+            </button>
+          </li>)}
+          {!channelOptions.length && <li className="mention-option" role="option" aria-selected="false">
+            {channelsLoading ? 'Loading channels…' : 'No matching channels'}
+          </li>}
+        </> : context.kind === 'mention' ? <>
+          {filtered.map((candidate, index) => <li key={`${candidate.mention.toLocaleLowerCase()}-${index}`} role="presentation">
+            <button
+              id={`${listId}-${index}`}
+              className="mention-option"
+              type="button"
+              role="option"
+              aria-selected={index === activeIndex}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => choose(candidate)}
+            >
+              {candidate.name}{candidate.name === candidate.mention ? '' : ` (@${candidate.mention})`}
+            </button>
+          </li>)}
+          {!filtered.length && <li className="mention-option" role="option" aria-selected="false">
+            {loading ? 'Loading participants…' : 'No matching participants'}
+          </li>}
+        </> : <>
+          {matchingCommands.map((command, index) => <li key={command.name} role="presentation">
+            <button
+              id={`${listId}-${index}`}
+              className="mention-option"
+              type="button"
+              role="option"
+              aria-selected={index === activeIndex}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => chooseCommand(command)}
+            >
+              <code>{command.usage}</code><span className="mention-option__help">{command.help}</span>
+            </button>
+          </li>)}
+          {!matchingCommands.length && <li className="mention-option" role="option" aria-selected="false">No matching commands</li>}
+        </>}
+      </ul>}
+      {upload && expiry && <>
+        <input ref={fileInputRef} className="composer__file" type="file" multiple hidden tabIndex={-1} onChange={handleFiles} />
+        <select className="composer__expiry" aria-label="Uploaded files expire after" title="Uploaded files expire after"
+          value={expiry} disabled={disabled} onChange={(event) => onUploadExpiryChange(event.currentTarget.value as UploadExpiry)}>
+          {upload.expiries.map((option) => <option key={option} value={option}>{expiryLabels[option]}</option>)}
+        </select>
+        <button className="composer__attach" type="button" disabled={disabled}
+          aria-label="Attach files" title={`Attach files (up to ${formatBytes(upload.maxBytes)} each)`}
+          onClick={() => fileInputRef.current?.click()}>
+          <Icon name="paperclip" />
+        </button>
       </>}
-    </ul>}
-    <button className="composer__send" type="submit" disabled={disabled || sending || !value.trim()}
-      aria-label={sending ? 'Sending…' : 'Send message'} title="Send (Enter)">
-      <Icon name="send" />
-    </button>
-  </form>;
+      <button className="composer__send" type="submit" disabled={disabled || sending || !value.trim()}
+        aria-label={sending ? 'Sending…' : 'Send message'} title="Send (Enter)">
+        <Icon name="send" />
+      </button>
+    </form>
+  </>;
 }
 

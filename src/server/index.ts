@@ -6,6 +6,7 @@ import { createApp } from './app.ts';
 import { IrcManager } from './irc.ts';
 import { PushNotifier, vapidKeys, webPushSender } from './push.ts';
 import { Store } from './store.ts';
+import { MULTIPART_OVERHEAD, TeacupClient, uploadConfig } from './uploads.ts';
 
 const host = process.env.LINGO_HOST ?? '127.0.0.1';
 const port = Number(process.env.LINGO_PORT ?? '3000');
@@ -30,7 +31,7 @@ if (publicOrigin !== undefined) {
     throw new Error('LINGO_PUBLIC_ORIGIN must be an exact HTTPS origin');
   }
 }
-
+const uploads = uploadConfig(process.env);
 
 const root = resolve(import.meta.dir, '../..');
 const store = new Store(process.env.LINGO_DB_PATH ?? resolve(root, 'local/lingo.sqlite'));
@@ -45,18 +46,25 @@ const service = createApp(store, manager, {
   setupToken,
   trustProxy: process.env.LINGO_TRUST_PROXY === '1',
   push,
+  uploads: uploads ? new TeacupClient(uploads) : undefined,
 });
 publish = service.publish;
 
 const dist = resolve(root, 'dist');
 service.app.all('/api', (c) => c.json({ error: 'Not found' }, 404));
 service.app.all('/api/*', (c) => c.json({ error: 'Not found' }, 404));
-service.app.use('/*', serveStatic({ root: dist }));
+service.app.use('/*', serveStatic({
+  root: dist,
+  // Vite fingerprints /assets/*; everything else (index.html, sw.js, manifest, icons) must revalidate so deploys take effect.
+  onFound: (path, c) => {
+    c.header('Cache-Control', path.startsWith(resolve(dist, 'assets') + '/') ? 'public, max-age=31536000, immutable' : 'no-cache');
+  },
+}));
 service.app.get('*', async (c) => {
   if (c.req.path.includes('.')) return c.notFound();
   const index = Bun.file(resolve(dist, 'index.html'));
   if (!await index.exists()) return c.text('Frontend not built', 404);
-  return new Response(index.stream(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return new Response(index.stream(), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' } });
 });
 
 const server = Bun.serve({
@@ -64,12 +72,16 @@ const server = Bun.serve({
   port,
   fetch: service.app.fetch,
   websocket: service.websocket,
+  // Upload bodies are read whole; nothing else Lingo accepts comes close to this size.
+  ...(uploads ? { maxRequestBodySize: uploads.maxBytes + MULTIPART_OVERHEAD } : {}),
 });
 
 let housekeepingJob: Promise<void> | null = null;
 function housekeeping(): Promise<void> {
   if (housekeepingJob) return housekeepingJob;
   store.pruneSessions(Date.now());
+  // Deleted and expired upload rows count toward the daily limits for a day.
+  store.pruneUploads(Date.now(), Date.now() - 86_400_000);
   const job = store.pruneHistory(Date.now(), globalRetentionDays);
   housekeepingJob = job;
   void job.finally(() => { housekeepingJob = null; }).catch(() => {});

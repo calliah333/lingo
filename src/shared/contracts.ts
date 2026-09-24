@@ -13,6 +13,12 @@ export interface NetworkInput {
   relayNicks: string[];
   mentionAliases: string[];
   displayNames: Record<string, string>;
+  /** Replays missed history with IRCv3 chathistory when the server offers it. */
+  backfill: boolean;
+  /** Seconds to wait after registration before autojoining, so services can identify first (0–30). */
+  joinDelaySeconds: number;
+  /** Sends `NickServ REGAIN <nick>` when registered under a fallback nick with SASL configured. */
+  regainNick: boolean;
 }
 
 export interface MentionCandidate {
@@ -48,6 +54,9 @@ export interface ChatMessage {
   isMotd?: true;
   highlight?: boolean;
 }
+
+/** One line of a network history export (JSONL); buffer exports write plain `ChatMessage` lines. */
+export type NetworkExportLine = ChatMessage & { bufferName: string };
 
 export interface ChannelUser {
   nick: string;
@@ -146,7 +155,8 @@ export interface PushSubscriptionInput {
 }
 
 export type ServerEvent =
-  | { type: 'message'; message: ChatMessage }
+  /** `replayed`: backfilled from chathistory; counts as unread but never notifies. */
+  | { type: 'message'; message: ChatMessage; replayed?: true }
   | { type: 'buffer'; buffer: ChatBuffer }
   | { type: 'buffer_removed'; bufferId: number }
   | { type: 'history_cleared'; bufferId: number }
@@ -156,7 +166,12 @@ export type ServerEvent =
   | { type: 'channel_state'; state: ChannelState }
   | { type: 'channel_list'; status: ChannelListStatus }
   | { type: 'ignores'; networkId: number; ignores: string[] }
-  | { type: 'settings'; userId: number; settings: SyncedSettings };
+  | { type: 'settings'; userId: number; settings: SyncedSettings }
+  /** Ephemeral IRCv3 `+typing` notice from `nick`; never stored. */
+  | { type: 'typing'; bufferId: number; nick: string; state: TypingState };
+
+/** IRCv3 `+typing` values; `POST /api/buffers/:id/typing` takes `{ state }`. */
+export type TypingState = 'active' | 'paused' | 'done';
 
 export interface AccountUser {
   id: number;
@@ -173,7 +188,36 @@ export type AdminUserSummary = AccountUser & {
   sessionCount: number;
   maxNetworks: number | null;
   retentionDays: number | null;
+  /** May upload files to teacup; the admin row starts with it on. `PATCH /api/users/:id { canUpload }`. */
+  canUpload: boolean;
 };
+
+/** Lifetimes Lingo offers for uploads; teacup's capabilities decide which are available. */
+export type UploadExpiry = '1h' | '1d' | '7d' | '30d' | 'permanent';
+
+/**
+ * `GET /api/uploads/capabilities` (always 200): what this user may upload right now.
+ * `maxBytes` is the smaller of Lingo's and teacup's per-file limits.
+ */
+export type UploadCapabilities =
+  | { enabled: true; maxBytes: number; expiries: UploadExpiry[]; defaultExpiry: UploadExpiry }
+  | { enabled: false; reason: 'not_configured' | 'not_permitted' | 'unavailable' };
+
+/** One of the user's uploads; `expiresAt` is null for permanent files. `POST /api/uploads` returns one (201). */
+export interface UploadRecord {
+  id: number;
+  url: string;
+  filename: string;
+  size: number;
+  expiresAt: number | null;
+  createdAt: number;
+}
+
+/** `GET /api/uploads?before=<id>&limit=<n>`: unexpired uploads, newest first. */
+export interface UploadPage {
+  uploads: UploadRecord[];
+  hasMore: boolean;
+}
 
 /** `GET /api/setup`: `required` until the admin account has been created on first login. */
 export interface SetupStatus {

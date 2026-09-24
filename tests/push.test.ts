@@ -171,7 +171,7 @@ test('mentions and private messages push only to an absent, unmuted owner, throt
     if (!address || typeof address === 'string') throw new Error('Expected ephemeral TCP port');
     const input = {
       host: '127.0.0.1', port: address.port, tls: false, username: 'u', realname: 'U', saslAccount: '',
-      autojoin: ['#room'], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+      autojoin: ['#room'], commands: [], relayNicks: [], mentionAliases: [], displayNames: {}, backfill: true, joinDelaySeconds: 0, regainNick: false,
     };
     const alice = store.createUser('alice', 'scrypt:alice')!;
     const bob = store.createUser('bob', 'scrypt:bob')!;
