@@ -14,7 +14,8 @@ import type {
   ServerEvent,
   WhoisInfo,
 } from '../shared/contracts.ts';
-import { displayIdentity } from '../shared/identity.ts';
+import { displayIdentity, mentionsAny } from '../shared/identity.ts';
+import type { PushNotifier } from './push.ts';
 import type { Store } from './store.ts';
 
 /** Bounds memory on networks with very large LIST replies. */
@@ -31,6 +32,7 @@ type Pending<T> = {
 
 type Runtime = {
   network: Network;
+  userId: number;
   client: Client;
   status: NetworkStatus;
   active: boolean;
@@ -82,11 +84,12 @@ export class IrcManager {
   private readonly knownBuffers = new Set<number>();
   private readonly ignores = new Map<number, string[]>();
   private started = false;
-  private browserPresent = false;
+  private presentUsers = new Set<number>();
 
   constructor(
     private readonly store: Store,
     private readonly publish: (event: ServerEvent) => void,
+    private readonly push?: PushNotifier,
   ) {}
 
   start(): void {
@@ -95,7 +98,10 @@ export class IrcManager {
     this.knownBuffers.clear();
     for (const buffer of this.store.listBuffers()) this.knownBuffers.add(buffer.id);
     for (const network of this.store.listNetworks()) {
-      if (!this.store.isNetworkDisconnected(network.id)) this.connect(network);
+      const userId = this.store.networkOwner(network.id);
+      if (userId !== null && !this.store.isUserDisabled(userId) && !this.store.isNetworkDisconnected(network.id)) {
+        this.connect(network);
+      }
     }
   }
 
@@ -106,12 +112,18 @@ export class IrcManager {
 
   connect(network: Network): void {
     const config = this.store.getNetworkConfig(network.id);
-    if (!config) throw new Error('Network not found');
+    const userId = this.store.networkOwner(network.id);
+    if (!config || userId === null) throw new Error('Network not found');
+    if (this.store.isUserDisabled(userId)) {
+      this.disconnect(network.id);
+      return;
+    }
     if (this.connections.has(network.id)) this.disconnect(network.id);
 
     const client = new Client();
     const runtime: Runtime = {
       network,
+      userId,
       client,
       status: { state: 'connecting', nick: network.nick },
       active: true,
@@ -347,14 +359,20 @@ export class IrcManager {
   }
 
   update(network: Network): void {
-    if (this.store.isNetworkDisconnected(network.id)) this.disconnect(network.id);
-    else this.connect(network);
+    const userId = this.store.networkOwner(network.id);
+    if (this.store.isNetworkDisconnected(network.id) || userId === null || this.store.isUserDisabled(userId)) {
+      this.disconnect(network.id);
+    } else {
+      this.connect(network);
+    }
   }
 
   /** Persists the user's choice so restarts and settings edits keep the network offline. */
   setConnected(networkId: number, connected: boolean): void {
     const network = this.store.getNetwork(networkId);
     if (!network) throw new Error('Network not found');
+    const userId = this.store.networkOwner(networkId);
+    if (connected && userId !== null && this.store.isUserDisabled(userId)) return;
     this.store.setNetworkDisconnected(networkId, !connected);
     if (connected) this.connect(network);
     else this.disconnect(networkId);
@@ -491,26 +509,33 @@ export class IrcManager {
     this.publishChannelList(runtime);
   }
 
-  status(): Record<number, NetworkStatus> {
-    return Object.fromEntries(this.store.listNetworks().map(network => [
+  status(userId?: number): Record<number, NetworkStatus> {
+    return Object.fromEntries(this.store.listNetworks(userId).map(network => [
       network.id, { ...(this.statuses.get(network.id) ?? { state: 'disconnected', nick: network.nick }) },
     ]));
   }
-  setBrowserPresence(present: boolean): void {
-    if (this.browserPresent === present) return;
-    this.browserPresent = present;
-    for (const runtime of this.connections.values()) this.applyAway(runtime);
+
+  /** Users with an open browser are marked present on IRC; everyone else is AWAY. */
+  setBrowserPresence(users: ReadonlySet<number>): void {
+    const changed = new Set([...users].filter(id => !this.presentUsers.has(id)));
+    for (const id of this.presentUsers) if (!users.has(id)) changed.add(id);
+    if (!changed.size) return;
+    this.presentUsers = new Set(users);
+    for (const runtime of this.connections.values()) {
+      if (changed.has(runtime.userId)) this.applyAway(runtime);
+    }
   }
 
-  updateAwayMessage(): void {
-    if (!this.browserPresent) {
-      for (const runtime of this.connections.values()) this.applyAway(runtime);
+  updateAwayMessage(userId: number): void {
+    if (this.presentUsers.has(userId)) return;
+    for (const runtime of this.connections.values()) {
+      if (runtime.userId === userId) this.applyAway(runtime);
     }
   }
 
   private applyAway(runtime: Runtime): void {
     if (!runtime.registered || !runtime.active) return;
-    const message = this.browserPresent ? '' : this.store.getAwayMessage();
+    const message = this.presentUsers.has(runtime.userId) ? '' : this.store.getAwayMessage(runtime.userId);
     runtime.client.raw(message ? `AWAY :${message}` : 'AWAY');
   }
 
@@ -759,7 +784,11 @@ export class IrcManager {
     if (kind === 'privmsg') runtime.client.say(buffer.name, text);
     else if (kind === 'notice') runtime.client.notice(buffer.name, text);
     else runtime.client.action(buffer.name, text);
-    if (record) this.message(buffer, kind, runtime.status.nick, text, Date.now());
+    if (record) {
+      const message = this.message(buffer, kind, runtime.status.nick, text, Date.now());
+      const lastReadId = this.store.markRead(buffer.id, message.id);
+      if (lastReadId !== null) this.publish({ type: 'read', bufferId: buffer.id, lastReadId });
+    }
   }
 
   private onRegistered(runtime: Runtime): void {
@@ -813,8 +842,32 @@ export class IrcManager {
     const buffer = name
       ? this.ensureBuffer(runtime.network.id, name, isChannel(event.target) ? 'channel' : 'query')
       : this.serverBuffer(runtime.network.id);
+    const network = this.store.getNetwork(runtime.network.id) ?? runtime.network;
+    const identity = displayIdentity({ nick: event.nick || null, text: event.message },
+      network.relayNicks, network.displayNames);
+    const sender = identity.mentionTarget;
+    const ownNames = [runtime.status.nick, network.nick, ...network.mentionAliases].filter(Boolean);
+    const inbound = !fromNetwork && !!sender && !ownNames.some(own => own.toLowerCase() === sender.toLowerCase());
+    const highlight = inbound && (mentionsAny(identity.text, ownNames) ||
+      this.store.getSettingsState(runtime.userId).settings.highlights.some(phrase =>
+        identity.text.toLowerCase().includes(phrase.toLowerCase())));
     this.message(buffer, kind, event.nick || null, event.message, eventTime(event),
-      fromNetwork ? { fromNetwork: true } : {});
+      { ...(fromNetwork ? { fromNetwork: true } : {}), ...(highlight ? { highlight: true } : {}) });
+    if (inbound && (highlight || buffer.kind === 'query')) {
+      this.pushNotify(runtime.userId, buffer, `${identity.nick ?? sender} · ${buffer.name}`, identity.text, highlight);
+    }
+  }
+
+  /** Web Push for mentions and private messages, only while the user has no open browser. */
+  private pushNotify(userId: number, buffer: ChatBuffer, title: string, text: string, highlight: boolean): void {
+    if (!this.push || this.presentUsers.has(userId)) return;
+    const { settings } = this.store.getSettingsState(userId);
+    if (settings.mutedBuffers.includes(buffer.id) || settings.mutedNetworks.includes(buffer.networkId)) return;
+    this.push.notify(userId, {
+      bufferId: buffer.id,
+      title,
+      body: settings.pushIncludesText ? text : highlight ? 'New mention' : 'New private message',
+    });
   }
 
   private ensureBuffer(networkId: number, name: string, kind: ChatBuffer['kind']): ChatBuffer {
@@ -844,12 +897,13 @@ export class IrcManager {
     nick: string | null,
     text: string,
     time: number,
-    metadata: Pick<ChatMessage, 'fromNetwork' | 'connectionEvent' | 'isMotd'> = {},
-  ): void {
+    metadata: Pick<ChatMessage, 'fromNetwork' | 'connectionEvent' | 'isMotd' | 'highlight'> = {},
+  ): ChatMessage {
     const message = this.store.appendMessage({
       networkId: buffer.networkId, bufferId: buffer.id, kind, nick, text, time, ...metadata,
     });
     this.publish({ type: 'message', message });
+    return message;
   }
 
   private system(buffer: ChatBuffer, text: string, time: number, fromNetwork = false): void {
@@ -864,6 +918,10 @@ export class IrcManager {
 
   private dial(runtime: Runtime, config = this.store.getNetworkConfig(runtime.network.id)): void {
     if (!runtime.active || !config) return;
+    if (this.store.isUserDisabled(runtime.userId)) {
+      this.disconnect(runtime.network.id);
+      return;
+    }
     this.clearChannels(runtime);
     runtime.joined.clear();
     this.setStatus(runtime, runtime.retryCount ? 'reconnecting' : 'connecting');

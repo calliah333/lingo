@@ -2,12 +2,16 @@ import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { Database } from 'bun:sqlite';
 import type {
+  AccountUser,
+  AdminUserSummary,
+  BufferUnread,
   ChatBuffer,
   ChatMessage,
   MentionCandidate,
   Network,
   NetworkConfig,
   NetworkInput,
+  SyncedSettings,
 } from '../shared/contracts.ts';
 import { displayIdentity } from '../shared/identity.ts';
 
@@ -47,7 +51,20 @@ type MessageRow = {
   from_network: number;
   connection_event: ChatMessage['connectionEvent'] | null;
   is_motd: number;
+  highlight: number;
 };
+
+/** A browser push subscription: its endpoint URL and the keys that encrypt payloads for it. */
+export type PushTarget = { endpoint: string; p256dh: string; auth: string };
+
+type SettingsRow = { data: string };
+
+function defaultSettings(): SyncedSettings {
+  return {
+    highlights: [], mutedBuffers: [], mutedNetworks: [], hiddenBuffers: [],
+    collapsedNetworks: [], pushIncludesText: false, sendTyping: false,
+  };
+}
 
 function networkFromRow(row: NetworkRow): Network {
   return {
@@ -68,6 +85,12 @@ function networkFromRow(row: NetworkRow): Network {
   };
 }
 
+type UserRow = { id: number; username: string; is_admin: number; created_at: number };
+
+function userFromRow(row: UserRow): AccountUser {
+  return { id: row.id, username: row.username, isAdmin: row.is_admin === 1, createdAt: row.created_at };
+}
+
 function bufferFromRow(row: BufferRow): ChatBuffer {
   return { id: row.id, networkId: row.network_id, name: row.name, kind: row.kind };
 }
@@ -84,6 +107,7 @@ function messageFromRow(row: MessageRow): ChatMessage {
     ...(row.from_network ? { fromNetwork: true } : {}),
     ...(row.connection_event ? { connectionEvent: row.connection_event } : {}),
     ...(row.is_motd ? { isMotd: true as const } : {}),
+    ...(row.highlight ? { highlight: true } : {}),
   };
 }
 
@@ -92,8 +116,17 @@ function pageSize(limit: number | undefined): number {
   return Math.max(1, Math.trunc(limit));
 }
 
+/** A user's network quota prevented a new network from being created. */
+export class NetworkLimitReached extends Error {
+  constructor() {
+    super('Network limit reached');
+    this.name = 'NetworkLimitReached';
+  }
+}
+
 export class Store {
   private readonly db: Database;
+  private readonly settingsCache = new Map<number, { settings: SyncedSettings; configured: boolean }>();
 
   constructor(path: string) {
     if (path !== ':memory:') {
@@ -113,27 +146,178 @@ export class Store {
       throw new Error('Could not read database schema version');
     }
     const version = versionRow.user_version;
-    if (version > 4) throw new Error(`Unsupported database schema version ${version}`);
-    if (version === 4) return;
+    if (version > 10) throw new Error(`Unsupported database schema version ${version}`);
+    if (version === 10) return;
 
-    this.db.exec('BEGIN IMMEDIATE');
+    // Rebuilding tables that other tables reference requires foreign keys off outside the
+    // transaction (https://sqlite.org/lang_altertable.html#otheralter); integrity is rechecked below.
+    this.db.exec('PRAGMA foreign_keys = OFF');
     try {
-      if (version < 3) this.migrateToV3(version);
-      this.db.exec(`
-        ALTER TABLE networks ADD COLUMN disconnected INTEGER NOT NULL DEFAULT 0;
-        CREATE TABLE ignores (
-          network_id INTEGER NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
-          nick TEXT NOT NULL,
-          nick_key TEXT NOT NULL,
-          PRIMARY KEY (network_id, nick_key)
-        );
-      `);
-      this.db.exec('PRAGMA user_version = 4');
-      this.db.exec('COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        if (version < 3) this.migrateToV3(version);
+        if (version < 4) {
+          this.db.exec(`
+            ALTER TABLE networks ADD COLUMN disconnected INTEGER NOT NULL DEFAULT 0;
+            CREATE TABLE ignores (
+              network_id INTEGER NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
+              nick TEXT NOT NULL,
+              nick_key TEXT NOT NULL,
+              PRIMARY KEY (network_id, nick_key)
+            );
+          `);
+        }
+        if (version < 5) this.migrateToV5();
+        if (version < 6) this.migrateToV6();
+        if (version < 7) this.migrateToV7();
+        if (version < 8) this.migrateToV8();
+        if (version < 9) this.migrateToV9();
+        this.migrateToV10();
+        if (this.db.query('PRAGMA foreign_key_check').all().length) {
+          throw new Error('Database migration left dangling references');
+        }
+        this.db.exec('PRAGMA user_version = 10');
+        this.db.exec('COMMIT');
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    } finally {
+      this.db.exec('PRAGMA foreign_keys = ON');
     }
+  }
+
+  /**
+   * Introduces user accounts. The single legacy account becomes the admin (username `admin`)
+   * and owns all existing networks. Without a stored password hash the admin stays unclaimed
+   * until first-login setup, and legacy sessions are dropped.
+   */
+  private migrateToV5(): void {
+    this.db.exec(`
+      CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        password_hash TEXT,
+        is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1)),
+        away_message TEXT NOT NULL DEFAULT 'Away',
+        created_at INTEGER NOT NULL,
+        CHECK (is_admin = 1 OR password_hash IS NOT NULL)
+      );
+      CREATE UNIQUE INDEX users_single_admin ON users(is_admin) WHERE is_admin = 1;
+    `);
+    this.db.query(`
+      INSERT INTO users (id, username, password_hash, is_admin, away_message, created_at)
+      SELECT 1, 'admin', password_hash, 1, away_message, ? FROM account_settings WHERE id = 1
+    `).run(Date.now());
+    this.db.exec(`
+      CREATE TABLE networks_v5 (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL COLLATE NOCASE,
+        host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        tls INTEGER NOT NULL,
+        nick TEXT NOT NULL,
+        username TEXT NOT NULL,
+        realname TEXT NOT NULL,
+        sasl_account TEXT NOT NULL,
+        sasl_password TEXT NOT NULL,
+        autojoin TEXT NOT NULL,
+        commands TEXT NOT NULL,
+        relay_nicks TEXT NOT NULL DEFAULT '[]',
+        mention_aliases TEXT NOT NULL DEFAULT '[]',
+        display_names TEXT NOT NULL DEFAULT '{}',
+        disconnected INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(user_id, name)
+      );
+      INSERT INTO networks_v5 (id, user_id, name, host, port, tls, nick, username, realname,
+                               sasl_account, sasl_password, autojoin, commands, relay_nicks,
+                               mention_aliases, display_names, disconnected)
+        SELECT id, 1, name, host, port, tls, nick, username, realname, sasl_account, sasl_password,
+               autojoin, commands, relay_nicks, mention_aliases, display_names, disconnected
+        FROM networks;
+      DROP TABLE networks;
+      ALTER TABLE networks_v5 RENAME TO networks;
+
+      CREATE TABLE sessions_v5 (
+        token_hash TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO sessions_v5 (token_hash, user_id, expires_at, created_at)
+        SELECT token_hash, 1, expires_at, created_at FROM sessions
+        WHERE (SELECT password_hash FROM users WHERE id = 1) IS NOT NULL;
+      DROP TABLE sessions;
+      ALTER TABLE sessions_v5 RENAME TO sessions;
+      CREATE INDEX sessions_expiration ON sessions(expires_at);
+      CREATE INDEX sessions_user ON sessions(user_id);
+
+      DROP TABLE account_settings;
+    `);
+  }
+
+  private migrateToV6(): void {
+    this.db.exec(`
+      ALTER TABLE users ADD COLUMN last_login_at INTEGER;
+      ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0, 1));
+    `);
+  }
+
+  private migrateToV7(): void {
+    this.db.exec(`
+      ALTER TABLE users ADD COLUMN max_networks INTEGER CHECK (max_networks >= 0);
+      ALTER TABLE users ADD COLUMN retention_days INTEGER CHECK (retention_days BETWEEN 1 AND 3650);
+      CREATE INDEX messages_retention ON messages(network_id, time);
+    `);
+  }
+
+  private migrateToV8(): void {
+    this.db.exec(`
+      CREATE TABLE user_settings (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        data TEXT NOT NULL DEFAULT '{}'
+      );
+    `);
+  }
+
+  private migrateToV9(): void {
+    this.db.exec(`
+      ALTER TABLE messages ADD COLUMN highlight INTEGER NOT NULL DEFAULT 0;
+      CREATE TABLE read_markers (
+        buffer_id INTEGER PRIMARY KEY REFERENCES buffers(id) ON DELETE CASCADE,
+        last_read_id INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO read_markers (buffer_id, last_read_id)
+        SELECT b.id, COALESCE(MAX(m.id), 0) FROM buffers AS b
+        LEFT JOIN messages AS m ON m.buffer_id = b.id GROUP BY b.id;
+    `);
+  }
+
+  /**
+   * Server-wide key/value settings (the VAPID key pair) and Web Push subscriptions. Each
+   * subscription belongs to the session that registered it, so logging out or revoking
+   * a session stops pushes to that device.
+   */
+  private migrateToV10(): void {
+    this.db.exec(`
+      CREATE TABLE server_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE TABLE push_subscriptions (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_success_at INTEGER
+      );
+      CREATE INDEX push_subscriptions_user ON push_subscriptions(user_id);
+      CREATE INDEX push_subscriptions_session ON push_subscriptions(session_hash);
+    `);
   }
 
   private migrateToV3(version: number): void {
@@ -223,18 +407,28 @@ export class Store {
     this.db.close();
   }
 
-  createNetwork(input: NetworkInput): Network {
-    const result = this.db.query(`
-      INSERT INTO networks (name, host, port, tls, nick, username, realname,
+  createNetwork(userId: number, input: NetworkInput): Network {
+    // The capacity check and insert are one write statement: competing creates cannot both
+    // observe the last free slot before either inserts its network.
+    const row = this.db.query(`
+      INSERT INTO networks (user_id, name, host, port, tls, nick, username, realname,
                             sasl_account, sasl_password, autojoin, commands, relay_nicks,
                             mention_aliases, display_names)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(input.name, input.host, input.port, Number(input.tls), input.nick,
+      SELECT u.id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      FROM users AS u WHERE u.id = ?
+        AND (u.max_networks IS NULL OR
+             (SELECT COUNT(*) FROM networks AS n WHERE n.user_id = u.id) < u.max_networks)
+      RETURNING id
+    `).get(input.name, input.host, input.port, Number(input.tls), input.nick,
       input.username, input.realname, input.saslAccount, input.saslPassword ?? '',
       JSON.stringify(input.autojoin), JSON.stringify(input.commands),
       JSON.stringify(input.relayNicks), JSON.stringify(input.mentionAliases),
-      JSON.stringify(input.displayNames));
-    return this.getNetwork(Number(result.lastInsertRowid))!;
+      JSON.stringify(input.displayNames), userId) as { id: number } | null;
+    if (!row) {
+      if (!this.getUser(userId)) throw new Error('User not found');
+      throw new NetworkLimitReached();
+    }
+    return this.getNetwork(row.id)!;
   }
 
   updateNetwork(id: number, input: NetworkInput): Network | null {
@@ -258,8 +452,22 @@ export class Store {
     this.db.query('DELETE FROM networks WHERE id = ?').run(id);
   }
 
-  listNetworks(): Network[] {
-    return (this.db.query('SELECT * FROM networks ORDER BY id').all() as NetworkRow[]).map(networkFromRow);
+  /** All networks, or only those owned by `userId`. */
+  listNetworks(userId?: number): Network[] {
+    return (this.db.query('SELECT * FROM networks WHERE ?1 IS NULL OR user_id = ?1 ORDER BY id')
+      .all(userId ?? null) as NetworkRow[]).map(networkFromRow);
+  }
+
+  networkOwner(networkId: number): number | null {
+    const row = this.db.query('SELECT user_id FROM networks WHERE id = ?').get(networkId) as { user_id: number } | null;
+    return row?.user_id ?? null;
+  }
+
+  bufferOwner(bufferId: number): number | null {
+    const row = this.db.query(`
+      SELECT n.user_id FROM buffers AS b JOIN networks AS n ON n.id = b.network_id WHERE b.id = ?
+    `).get(bufferId) as { user_id: number } | null;
+    return row?.user_id ?? null;
   }
 
   getNetwork(id: number): Network | null {
@@ -286,10 +494,12 @@ export class Store {
       .all(networkId) as Array<{ nick: string }>).map(row => row.nick);
   }
 
-  allIgnores(): Record<number, string[]> {
+  allIgnores(userId: number): Record<number, string[]> {
     const ignores: Record<number, string[]> = {};
-    for (const row of this.db.query('SELECT network_id, nick FROM ignores ORDER BY nick_key')
-      .all() as Array<{ network_id: number; nick: string }>) {
+    for (const row of this.db.query(`
+      SELECT i.network_id, i.nick FROM ignores AS i JOIN networks AS n ON n.id = i.network_id
+      WHERE n.user_id = ? ORDER BY i.nick_key
+    `).all(userId) as Array<{ network_id: number; nick: string }>) {
       (ignores[row.network_id] ??= []).push(row.nick);
     }
     return ignores;
@@ -324,9 +534,12 @@ export class Store {
     return row ? bufferFromRow(row) : null;
   }
 
-  listBuffers(): ChatBuffer[] {
-    return (this.db.query('SELECT id, network_id, name, kind FROM buffers ORDER BY id').all() as BufferRow[])
-      .map(bufferFromRow);
+  /** All buffers, or only those on networks owned by `userId`. */
+  listBuffers(userId?: number): ChatBuffer[] {
+    return (this.db.query(`
+      SELECT b.id, b.network_id, b.name, b.kind FROM buffers AS b JOIN networks AS n ON n.id = b.network_id
+      WHERE ?1 IS NULL OR n.user_id = ?1 ORDER BY b.id
+    `).all(userId ?? null) as BufferRow[]).map(bufferFromRow);
   }
 
   removeBuffer(id: number): void {
@@ -337,13 +550,63 @@ export class Store {
     this.db.query('DELETE FROM messages WHERE buffer_id = ?').run(bufferId);
   }
 
+  /** All owned buffers, including buffers with no unread messages or marker yet. */
+  getUnread(userId: number): Record<number, BufferUnread> {
+    const unread: Record<number, BufferUnread> = {};
+    const buffers = this.db.query(`
+      SELECT b.id, b.kind, COALESCE(r.last_read_id, 0) AS last_read_id,
+             n.nick, n.mention_aliases, n.relay_nicks
+      FROM buffers AS b JOIN networks AS n ON n.id = b.network_id
+      LEFT JOIN read_markers AS r ON r.buffer_id = b.id
+      WHERE n.user_id = ? ORDER BY b.id
+    `).all(userId) as Array<{
+      id: number; kind: ChatBuffer['kind']; last_read_id: number;
+      nick: string; mention_aliases: string; relay_nicks: string;
+    }>;
+    const recent = this.db.query(`
+      SELECT kind, nick, text, from_network, highlight FROM messages
+      WHERE buffer_id = ? AND id > ? ORDER BY id DESC LIMIT 1000
+    `);
+    for (const buffer of buffers) {
+      let messages = 0;
+      let mentions = 0;
+      const ownNames = [buffer.nick, ...(JSON.parse(buffer.mention_aliases) as string[])]
+        .map(name => name.toLowerCase());
+      const relayNicks = JSON.parse(buffer.relay_nicks) as string[];
+      const rows = recent.all(buffer.id, buffer.last_read_id) as Array<
+        Pick<MessageRow, 'kind' | 'nick' | 'text' | 'from_network' | 'highlight'>
+      >;
+      for (const row of rows) {
+        const sender = row.nick && !row.from_network && row.kind !== 'system'
+          ? displayIdentity(row, relayNicks).mentionTarget : null;
+        if (sender && ownNames.includes(sender.toLowerCase())) continue;
+        messages = Math.min(999, messages + 1);
+        if (sender && (row.highlight || buffer.kind === 'query')) mentions = Math.min(999, mentions + 1);
+      }
+      unread[buffer.id] = { messages, mentions, lastReadId: buffer.last_read_id };
+    }
+    return unread;
+  }
+
+  /** Returns the current marker for a valid message in this buffer, or null for an invalid pair. */
+  markRead(bufferId: number, messageId: number): number | null {
+    const row = this.db.query(`
+      INSERT INTO read_markers (buffer_id, last_read_id)
+      SELECT buffer_id, id FROM messages WHERE id = ? AND buffer_id = ?
+      ON CONFLICT(buffer_id) DO UPDATE SET last_read_id = MAX(last_read_id, excluded.last_read_id)
+      RETURNING last_read_id
+    `).get(messageId, bufferId) as { last_read_id: number } | null;
+    return row?.last_read_id ?? null;
+  }
+
   appendMessage(input: Omit<ChatMessage, 'id'>): ChatMessage {
     const result = this.db.query(`
       INSERT INTO messages (network_id, buffer_id, kind, nick, text, time,
-                            from_network, connection_event, is_motd)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            from_network, connection_event, is_motd, highlight)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(input.networkId, input.bufferId, input.kind, input.nick, input.text, input.time,
-      Number(input.fromNetwork === true), input.connectionEvent ?? null, Number(input.isMotd === true));
+      Number(input.fromNetwork === true), input.connectionEvent ?? null, Number(input.isMotd === true),
+      Number(input.highlight === true));
     return { id: Number(result.lastInsertRowid), ...input };
   }
 
@@ -391,7 +654,9 @@ export class Store {
 
   searchMessages(
     query: string,
-    filters: { networkId?: number; bufferId?: number; before?: number; limit?: number; since?: number; until?: number },
+    filters: {
+      userId?: number; networkId?: number; bufferId?: number; before?: number; limit?: number; since?: number; until?: number;
+    },
   ): { messages: ChatMessage[]; hasMore: boolean } {
     // SQLite's FTS5 parser treats an embedded NUL as the end of the query string.
     const text = query.replaceAll('\0', ' ').trim();
@@ -402,66 +667,261 @@ export class Store {
     const rows = this.db.query(`
       SELECT m.* FROM messages_fts JOIN messages AS m ON m.id = messages_fts.rowid
       WHERE messages_fts MATCH ? AND m.network_id = COALESCE(?, m.network_id)
+        AND (? IS NULL OR m.network_id IN (SELECT id FROM networks WHERE user_id = ?))
         AND m.buffer_id = COALESCE(?, m.buffer_id) AND m.id < ?
         AND (? IS NULL OR m.time >= ?) AND (? IS NULL OR m.time <= ?)
       ORDER BY m.id DESC LIMIT ?
-    `).all(literal, filters.networkId ?? null, filters.bufferId ?? null,
+    `).all(literal, filters.networkId ?? null, filters.userId ?? null, filters.userId ?? null, filters.bufferId ?? null,
       filters.before ?? Number.MAX_SAFE_INTEGER, filters.since ?? null, filters.since ?? null,
       filters.until ?? null, filters.until ?? null, size + 1) as MessageRow[];
     return { messages: rows.slice(0, size).map(messageFromRow), hasMore: rows.length > size };
   }
 
-  createSession(tokenHash: string, expiresAt: number, createdAt = Date.now()): void {
-    this.db.query(`
-      INSERT INTO sessions (token_hash, expires_at, created_at) VALUES (?, ?, ?)
-      ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at,
-        created_at = excluded.created_at
-    `).run(tokenHash, expiresAt, createdAt);
-  }
-
-  listSessions(now: number): Array<{ id: string; createdAt: number; expiresAt: number }> {
-    return (this.db.query(`
-      SELECT token_hash, created_at, expires_at FROM sessions
-      WHERE expires_at > ? ORDER BY created_at DESC, token_hash
-    `).all(now) as Array<{ token_hash: string; created_at: number; expires_at: number }>)
-      .map(row => ({ id: row.token_hash, createdAt: row.created_at, expiresAt: row.expires_at }));
-  }
-
-  hasSession(tokenHash: string, now: number): boolean {
-    return this.db.query('SELECT 1 FROM sessions WHERE token_hash = ? AND expires_at > ?')
-      .get(tokenHash, now) !== null;
-  }
-
-  deleteSession(tokenHash: string): void {
-    this.db.query('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
-  }
-
-  revokeOtherSessions(currentHash: string, passwordHash: string): void {
+  createSession(tokenHash: string, userId: number, expiresAt: number, createdAt = Date.now()): void {
     this.db.transaction(() => {
-      this.db.query('UPDATE account_settings SET password_hash = ? WHERE id = 1').run(passwordHash);
-      this.db.query('DELETE FROM sessions WHERE token_hash != ?').run(currentHash);
+      this.db.query(`
+        INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(token_hash) DO UPDATE SET user_id = excluded.user_id, expires_at = excluded.expires_at,
+          created_at = excluded.created_at
+      `).run(tokenHash, userId, expiresAt, createdAt);
+      this.db.query('UPDATE users SET last_login_at = ? WHERE id = ?').run(createdAt, userId);
     })();
   }
 
-  getPasswordHash(): string | null {
-    const row = this.db.query('SELECT password_hash FROM account_settings WHERE id = 1')
-      .get() as { password_hash: string | null } | null;
-    if (!row) throw new Error('Account settings missing');
-    return row.password_hash;
+  listSessions(userId: number, now: number): Array<{ id: string; createdAt: number; expiresAt: number }> {
+    return (this.db.query(`
+      SELECT token_hash, created_at, expires_at FROM sessions
+      WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC, token_hash
+    `).all(userId, now) as Array<{ token_hash: string; created_at: number; expires_at: number }>)
+      .map(row => ({ id: row.token_hash, createdAt: row.created_at, expiresAt: row.expires_at }));
   }
 
-  getAwayMessage(): string {
-    const row = this.db.query('SELECT away_message FROM account_settings WHERE id = 1')
-      .get() as { away_message: string } | null;
-    if (!row) throw new Error('Account settings missing');
+  /** The account behind an unexpired session, or null. */
+  sessionUser(tokenHash: string, now: number): AccountUser | null {
+    const row = this.db.query(`
+      SELECT u.id, u.username, u.is_admin, u.created_at FROM sessions AS s JOIN users AS u ON u.id = s.user_id
+      WHERE s.token_hash = ? AND s.expires_at > ?
+    `).get(tokenHash, now) as UserRow | null;
+    return row ? userFromRow(row) : null;
+  }
+
+  deleteSession(tokenHash: string, userId: number): void {
+    this.db.query('DELETE FROM sessions WHERE token_hash = ? AND user_id = ?').run(tokenHash, userId);
+  }
+
+  /** Sets a password and revokes the user's sessions except `keepSession`. */
+  setPassword(userId: number, passwordHash: string, keepSession: string | null): void {
+    this.db.transaction(() => {
+      this.db.query('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, userId);
+      this.db.query('DELETE FROM sessions WHERE user_id = ? AND token_hash IS NOT ?').run(userId, keepSession);
+    })();
+  }
+
+  /** True until the admin account has been claimed on first login. */
+  setupRequired(): boolean {
+    return this.db.query('SELECT 1 FROM users WHERE is_admin = 1 AND password_hash IS NOT NULL').get() === null;
+  }
+
+  /** Claims the unclaimed admin account; null when setup already happened. */
+  claimAdmin(username: string, passwordHash: string): AccountUser | null {
+    const row = this.db.query(`
+      UPDATE users SET username = ?, password_hash = ?, created_at = ?
+      WHERE is_admin = 1 AND password_hash IS NULL RETURNING id, username, is_admin, created_at
+    `).get(username, passwordHash, Date.now()) as UserRow | null;
+    return row ? userFromRow(row) : null;
+  }
+
+  /** Creates a non-admin user; null when the username is taken. */
+  createUser(username: string, passwordHash: string): AccountUser | null {
+    const row = this.db.query(`
+      INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, 0, ?)
+      ON CONFLICT(username) DO NOTHING RETURNING id, username, is_admin, created_at
+    `).get(username, passwordHash, Date.now()) as UserRow | null;
+    return row ? userFromRow(row) : null;
+  }
+
+  listUsers(): AccountUser[] {
+    return (this.db.query('SELECT id, username, is_admin, created_at FROM users ORDER BY id').all() as UserRow[])
+      .map(userFromRow);
+  }
+
+  listAdminUsers(now: number): Array<Omit<AdminUserSummary, 'connectedCount'>> {
+    const rows = this.db.query(`
+      SELECT u.id, u.username, u.is_admin, u.created_at, u.disabled, u.last_login_at,
+        u.max_networks, u.retention_days,
+        (SELECT COUNT(*) FROM networks AS n WHERE n.user_id = u.id) AS network_count,
+        (SELECT COUNT(*) FROM sessions AS s WHERE s.user_id = u.id AND s.expires_at > ?) AS session_count
+      FROM users AS u ORDER BY u.id
+    `).all(now) as Array<UserRow & {
+      disabled: number; last_login_at: number | null; network_count: number; session_count: number;
+      max_networks: number | null; retention_days: number | null;
+    }>;
+    return rows.map(row => ({
+      ...userFromRow(row),
+      disabled: row.disabled === 1,
+      lastLoginAt: row.last_login_at,
+      networkCount: row.network_count,
+      sessionCount: row.session_count,
+      maxNetworks: row.max_networks,
+      retentionDays: row.retention_days,
+    }));
+  }
+
+  /** Omitted limits stay unchanged; null clears a user-specific limit. */
+  setUserLimits(userId: number, limits: { maxNetworks?: number | null; retentionDays?: number | null }): void {
+    this.db.query(`
+      UPDATE users SET
+        max_networks = CASE WHEN ? THEN ? ELSE max_networks END,
+        retention_days = CASE WHEN ? THEN ? ELSE retention_days END
+      WHERE id = ?
+    `).run(Number(limits.maxNetworks !== undefined), limits.maxNetworks ?? null,
+      Number(limits.retentionDays !== undefined), limits.retentionDays ?? null, userId);
+  }
+
+  isUserDisabled(userId: number): boolean {
+    const row = this.db.query('SELECT disabled FROM users WHERE id = ?').get(userId) as { disabled: number } | null;
+    return row?.disabled === 1;
+  }
+
+  /** Disabling revokes every session in the same transaction as the account change. */
+  setUserDisabled(userId: number, disabled: boolean): void {
+    this.db.transaction(() => {
+      this.db.query('UPDATE users SET disabled = ? WHERE id = ?').run(Number(disabled), userId);
+      if (disabled) this.db.query('DELETE FROM sessions WHERE user_id = ?').run(userId);
+    })();
+  }
+
+  getUser(id: number): AccountUser | null {
+    const row = this.db.query('SELECT id, username, is_admin, created_at FROM users WHERE id = ?').get(id) as UserRow | null;
+    return row ? userFromRow(row) : null;
+  }
+
+  /** Login lookup; `passwordHash` is null for the unclaimed admin. */
+  getCredentials(username: string): { user: AccountUser; passwordHash: string | null } | null {
+    const row = this.db.query(`
+      SELECT id, username, is_admin, created_at, password_hash FROM users WHERE username = ?
+    `).get(username) as (UserRow & { password_hash: string | null }) | null;
+    return row ? { user: userFromRow(row), passwordHash: row.password_hash } : null;
+  }
+
+  getPasswordHash(userId: number): string | null {
+    const row = this.db.query('SELECT password_hash FROM users WHERE id = ?').get(userId) as
+      { password_hash: string | null } | null;
+    return row?.password_hash ?? null;
+  }
+
+  /** Deletes a user together with their sessions, networks, buffers, and history. */
+  removeUser(id: number): void {
+    this.db.query('DELETE FROM users WHERE id = ?').run(id);
+    this.settingsCache.delete(id);
+  }
+
+  getAwayMessage(userId: number): string {
+    const row = this.db.query('SELECT away_message FROM users WHERE id = ?').get(userId) as { away_message: string } | null;
+    if (!row) throw new Error('User not found');
     return row.away_message;
   }
 
-  setAwayMessage(message: string): void {
-    this.db.query('UPDATE account_settings SET away_message = ? WHERE id = 1').run(message);
+  setAwayMessage(userId: number, message: string): void {
+    this.db.query('UPDATE users SET away_message = ? WHERE id = ?').run(message, userId);
+  }
+
+  /** A missing row means this user has not yet imported legacy browser settings. */
+  getSettingsState(userId: number): { settings: SyncedSettings; configured: boolean } {
+    const cached = this.settingsCache.get(userId);
+    if (cached) return cached;
+    const row = this.db.query('SELECT data FROM user_settings WHERE user_id = ?').get(userId) as SettingsRow | null;
+    const state = {
+      settings: row ? { ...defaultSettings(), ...JSON.parse(row.data) as Partial<SyncedSettings> } : defaultSettings(),
+      configured: row !== null,
+    };
+    this.settingsCache.set(userId, state);
+    return state;
+  }
+
+  patchSettings(userId: number, patch: Partial<SyncedSettings>): SyncedSettings {
+    const settings = { ...this.getSettingsState(userId).settings, ...patch };
+    this.db.query(`
+      INSERT INTO user_settings (user_id, data) VALUES (?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET data = excluded.data
+    `).run(userId, JSON.stringify(settings));
+    this.settingsCache.delete(userId);
+    return this.getSettingsState(userId).settings;
   }
 
   pruneSessions(now: number): void {
     this.db.query('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+  }
+
+  /** Returns the value stored under `key`, storing `create()` first when there is none. */
+  serverSetting(key: string, create: () => string): string {
+    const select = this.db.query('SELECT value FROM server_settings WHERE key = ?');
+    const existing = select.get(key) as { value: string } | null;
+    if (existing) return existing.value;
+    this.db.query('INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
+      .run(key, create());
+    return (select.get(key) as { value: string }).value;
+  }
+
+  /**
+   * Registers or refreshes a device's push subscription under the session that sent it; an
+   * endpoint moves to the newest session that registers it. False when the user already has
+   * `limit` other subscriptions.
+   */
+  savePushSubscription(userId: number, sessionHash: string, subscription: PushTarget, limit: number, now: number): boolean {
+    return this.db.transaction(() => {
+      const { count } = this.db.query(`
+        SELECT COUNT(*) AS count FROM push_subscriptions WHERE user_id = ? AND endpoint != ?
+      `).get(userId, subscription.endpoint) as { count: number };
+      if (count >= limit) return false;
+      this.db.query(`
+        INSERT INTO push_subscriptions (user_id, session_hash, endpoint, p256dh, auth, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, session_hash = excluded.session_hash,
+          p256dh = excluded.p256dh, auth = excluded.auth, created_at = excluded.created_at, last_success_at = NULL
+      `).run(userId, sessionHash, subscription.endpoint, subscription.p256dh, subscription.auth, now);
+      return true;
+    })();
+  }
+
+  deletePushSubscription(userId: number, endpoint: string): void {
+    this.db.query('DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?').run(userId, endpoint);
+  }
+
+  listPushSubscriptions(userId: number): Array<PushTarget & { id: number }> {
+    return this.db.query(`
+      SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ? ORDER BY id
+    `).all(userId) as Array<PushTarget & { id: number }>;
+  }
+
+  markPushDelivered(id: number, now: number): void {
+    this.db.query('UPDATE push_subscriptions SET last_success_at = ? WHERE id = ?').run(now, id);
+  }
+
+  /** Drops a subscription the push service reported as gone (404/410). */
+  removePushSubscription(id: number): void {
+    this.db.query('DELETE FROM push_subscriptions WHERE id = ?').run(id);
+  }
+
+  /** Deletes expired history in bounded writes, letting the event loop run between batches. */
+  async pruneHistory(now: number, globalRetentionDays: number | null): Promise<void> {
+    const users = this.db.query('SELECT id, retention_days FROM users WHERE retention_days IS NOT NULL OR ? IS NOT NULL')
+      .all(globalRetentionDays) as Array<{ id: number; retention_days: number | null }>;
+    const expired = this.db.query(`
+      DELETE FROM messages WHERE id IN (
+        SELECT m.id FROM networks AS n JOIN messages AS m ON m.network_id = n.id
+        WHERE n.user_id = ? AND m.time < ? LIMIT 5000
+      )
+    `);
+    for (const user of users) {
+      const retentionDays = user.retention_days ?? globalRetentionDays;
+      if (retentionDays === null) continue;
+      const cutoff = now - retentionDays * 86_400_000;
+      while (true) {
+        const { changes } = expired.run(user.id, cutoff);
+        if (changes < 5000) break;
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+      }
+    }
   }
 }

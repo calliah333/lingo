@@ -71,6 +71,8 @@ test('part preserves indexed channel history and prevents rejoin on restart', as
           if (!delivered) {
             delivered = true;
             socket.write(`:alice!user@mock PRIVMSG ${channel} :${messageText}\r\n`);
+            socket.write(`:bob!user@mock PRIVMSG ${channel} :tester, are you here?\r\n`);
+            socket.write(`:carol!user@mock PRIVMSG ${channel} :the magic phrase is here\r\n`);
           }
         }
         if (!connection.welcomed && connection.nick && connection.hasUser && connection.capEnded) {
@@ -92,21 +94,30 @@ test('part preserves indexed channel history and prevents rejoin on restart', as
     server.off('error', listening.reject);
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('Expected ephemeral TCP port');
-    const network = store.createNetwork({
+    const network = store.createNetwork(store.createUser('tester', 'unused')!.id, {
       name: 'mock', host: '127.0.0.1', port: address.port, tls: false,
       nick: 'tester', username: 'tester', realname: 'Test User',
       saslAccount: '', autojoin: [channel], commands: [],
       relayNicks: [], mentionAliases: [], displayNames: {},
     });
+    store.patchSettings(store.networkOwner(network.id)!, { highlights: ['magic phrase'] });
     manager.start();
     await waitFor(updates, () => connections[0]?.lines.includes(`JOIN ${channel}`) ?? false, 'initial autojoin');
     await waitFor(updates, () => store.searchMessages(messageText, { networkId: network.id }).messages
       .some(message => message.text === messageText), 'incoming message to be indexed');
+    await waitFor(updates, () => store.getMessages(store.getOrCreateBuffer(network.id, channel, 'channel').id)
+      .messages.some(message => message.text === 'the magic phrase is here'), 'highlight phrase delivery');
 
     const buffer = store.getOrCreateBuffer(network.id, channel, 'channel');
     const original = store.searchMessages(messageText, { bufferId: buffer.id }).messages
       .find(message => message.text === messageText);
     expect(original).toMatchObject({ bufferId: buffer.id, networkId: network.id, nick: 'alice', kind: 'privmsg' });
+    const highlighted = store.getMessages(buffer.id).messages.filter(message => message.highlight);
+    expect(highlighted.map(message => message.text)).toEqual([
+      'tester, are you here?', 'the magic phrase is here',
+    ]);
+    expect(store.getUnread(store.networkOwner(network.id)!)[buffer.id])
+      .toMatchObject({ messages: 4, mentions: 2 });
 
     manager.part(buffer.id);
     await waitFor(updates, () => connections[0]?.lines.some(line => line === `PART ${channel}`) ?? false, 'PART command');
@@ -192,7 +203,8 @@ test('tracks away presence and persists server-origin and connection events', as
     server.off('error', listening.reject);
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('Expected ephemeral TCP port');
-    const network = store.createNetwork({
+    const userId = store.createUser('tester', 'unused')!.id;
+    const network = store.createNetwork(userId, {
       name: 'presence', host: '127.0.0.1', port: address.port, tls: false,
       nick: 'tester', username: 'tester', realname: 'Test User',
       saslAccount: '', autojoin: [], commands: [],
@@ -213,10 +225,10 @@ test('tracks away presence and persists server-origin and connection events', as
       message.text === 'Connected' && message.connectionEvent === 'connected'),
     'connected marker to be retained');
 
-    manager.setBrowserPresence(true);
+    manager.setBrowserPresence(new Set([userId]));
     await waitFor(updates, () => connections[0]?.lines.filter(line => line === 'AWAY').length === 1,
       'AWAY clear when browser is present');
-    manager.setBrowserPresence(false);
+    manager.setBrowserPresence(new Set());
     await waitFor(updates, () => connections[0]?.lines.filter(line => line === 'AWAY :Away').length === 2,
       'AWAY reapplied when browser is absent');
 
@@ -303,7 +315,7 @@ test('ranks LIST results, drops ignored senders, answers WHOIS, and keeps user d
     server.off('error', listening.reject);
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('Expected ephemeral TCP port');
-    const network = store.createNetwork({
+    const network = store.createNetwork(store.createUser('tester', 'unused')!.id, {
       name: 'actions', host: '127.0.0.1', port: address.port, tls: false,
       nick: 'tester', username: 'tester', realname: 'Test User',
       saslAccount: '', autojoin: [], commands: [],

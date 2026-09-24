@@ -1,12 +1,17 @@
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
 import { Hono, type Context } from 'hono';
-import { upgradeWebSocket, websocket } from 'hono/bun';
+import { getConnInfo, upgradeWebSocket, websocket } from 'hono/bun';
 import { getCookie, setCookie } from 'hono/cookie';
 import type { WSContext } from 'hono/ws';
 import { z } from 'zod';
-import type { Bootstrap, MentionCandidate, ServerEvent } from '../shared/contracts.ts';
+import type {
+  AccountUser, Bootstrap, ChatBuffer, MentionCandidate, PushKey, ServerEvent, SetupStatus,
+} from '../shared/contracts.ts';
 import type { IrcManager } from './irc.ts';
-import type { Store } from './store.ts';
+import { RateLimiter } from './limits.ts';
+import type { PushNotifier } from './push.ts';
+import { NetworkLimitReached, type Store } from './store.ts';
 
 const COOKIE = 'lingo_session';
 const SESSION_AGE_SECONDS = 30 * 24 * 60 * 60;
@@ -33,11 +38,20 @@ const networkInput = z.strictObject({
   displayNames: z.record(required(64), required(64))
     .refine(names => Object.keys(names).length <= 100, 'Too many display names').default({}),
 });
-const loginInput = z.strictObject({ password: z.string().max(1024) });
-const passwordInput = z.strictObject({
-  currentPassword: z.string().max(1024),
-  newPassword: z.string().min(8).max(1024),
+const newPassword = z.string().min(8).max(1024);
+const loginInput = z.strictObject({ username: z.string().max(64), password: z.string().max(1024) });
+const accountInput = z.strictObject({
+  username: z.string().min(1).max(32).regex(/^[A-Za-z0-9_.-]+$/, 'Invalid username'),
+  password: newPassword,
 });
+const setupInput = accountInput.extend({ token: z.string().optional() });
+const passwordInput = z.strictObject({ currentPassword: z.string().max(1024), newPassword });
+const resetPasswordInput = z.strictObject({ password: newPassword });
+const userUpdateInput = z.strictObject({
+  disabled: z.boolean().optional(),
+  maxNetworks: z.number().int().min(0).nullable().optional(),
+  retentionDays: z.number().int().min(1).max(3650).nullable().optional(),
+}).refine(value => Object.values(value).some(field => field !== undefined));
 const awayInput = z.strictObject({
   message: line(300).refine(value => Buffer.byteLength(value, 'utf8') <= 300, 'Message too long'),
 });
@@ -52,33 +66,62 @@ const batchBufferInput = z.strictObject({
       'Duplicate channels'),
 });
 const topicInput = z.strictObject({ topic: line(390) });
+const readInput = z.strictObject({ messageId: z.number().int().positive().safe() });
 const nickInput = z.strictObject({ nick: required(64).regex(/^[^\s,:]+$/, 'Invalid nickname') });
 const queryInput = z.strictObject({ networkId: z.number().int().positive(), nick: nickInput.shape.nick });
 const channelListInput = z.strictObject({ mask: required(100).regex(/^[^\s,:]+$/, 'Invalid mask').optional() });
+const settingsInput = z.strictObject({
+  highlights: z.array(required(100)).max(100),
+  mutedBuffers: z.array(z.number().int().positive().safe()).max(1000),
+  mutedNetworks: z.array(z.number().int().positive().safe()).max(1000),
+  hiddenBuffers: z.array(z.number().int().positive().safe()).max(1000),
+  collapsedNetworks: z.array(z.number().int().positive().safe()).max(1000),
+  pushIncludesText: z.boolean(),
+  sendTyping: z.boolean(),
+}).partial();
+const base64UrlBytes = (bytes: number) => z.string().max(128).regex(/^[A-Za-z0-9_-]+={0,2}$/)
+  .refine(value => Buffer.from(value, 'base64url').length === bytes, 'Invalid key');
+/** Push services are public HTTPS hosts; refusing loopback and IP literals keeps the sender off local services. */
+const pushEndpoint = z.string().max(2048).refine((value) => {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && !url.username && !url.password && host !== 'localhost' &&
+      !host.endsWith('.localhost') && !host.startsWith('[') && !/^[\d.]+$/.test(host);
+  } catch {
+    return false;
+  }
+}, 'Invalid push endpoint');
+const pushSubscriptionInput = z.object({
+  endpoint: pushEndpoint,
+  keys: z.object({ p256dh: base64UrlBytes(65), auth: base64UrlBytes(16) }),
+});
+const pushEndpointInput = z.strictObject({ endpoint: pushEndpoint });
+const PUSH_SUBSCRIPTION_LIMIT = 10;
 
 const sendInput = z.strictObject({
   bufferId: z.number().int().positive(),
   text: line(4096).refine((text) => text.trim().length > 0, 'Message cannot be empty'),
 });
 
+const scryptAsync = promisify(scrypt) as (password: string, salt: Buffer, length: number) => Promise<Buffer>;
+
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function passwordHash(password: string): string {
+async function hashPassword(password: string): Promise<string> {
   const salt = randomBytes(32);
-  return `scrypt:${salt.toString('hex')}:${scryptSync(password, salt, 64).toString('hex')}`;
+  return `scrypt:${salt.toString('hex')}:${(await scryptAsync(password, salt, 64)).toString('hex')}`;
 }
 
-function verifyPassword(candidate: string, savedHash: string | null, legacyDigest: Buffer): boolean {
-  if (!savedHash) {
-    return timingSafeEqual(createHash('sha256').update(candidate).digest(), legacyDigest);
-  }
+async function verifyPassword(candidate: string, savedHash: string): Promise<boolean> {
   const parts = /^scrypt:([0-9a-f]{64}):([0-9a-f]{128})$/.exec(savedHash);
   if (!parts) throw new Error('Invalid stored password hash');
-  const actual = scryptSync(candidate, Buffer.from(parts[1]!, 'hex'), 64);
+  const actual = await scryptAsync(candidate, Buffer.from(parts[1]!, 'hex'), 64);
   return timingSafeEqual(actual, Buffer.from(parts[2]!, 'hex'));
 }
+
 function integer(value: string | undefined, cap?: number): number | undefined {
   if (value === undefined) return undefined;
   if (!ID_PATTERN.test(value)) throw new BadRequest();
@@ -145,41 +188,120 @@ function normalizedNetworkInput(input: z.output<typeof networkInput>): z.output<
   };
 }
 
-export function createApp(store: Store, manager: IrcManager, password: string, publicOrigin?: string) {
-  if (!password) throw new Error('LINGO_PASSWORD must be set');
-  const passwordDigest = createHash('sha256').update(password).digest();
-  const clients = new Map<unknown, { ws: WSContext; tokenHash: string }>();
-  const app = new Hono();
+/** Hono context variables set by the session middleware for authenticated routes. */
+export type AppEnv = { Variables: { user: AccountUser; session: string } };
+type Client = { ws: WSContext; tokenHash: string; userId: number };
 
+/** Routes reachable without a session: sign-in and first-login admin setup. */
+const PUBLIC_ROUTES = new Set(['POST /api/login', 'GET /api/setup', 'POST /api/setup']);
 
-  function sessionHash(c: Context): string | null {
+export function createApp(
+  store: Store,
+  manager: IrcManager,
+  options: {
+    publicOrigin?: string; setupToken?: string; trustProxy?: boolean; now?: () => number; push?: PushNotifier;
+  } = {},
+) {
+  const clients = new Map<unknown, Client>();
+  const app = new Hono<AppEnv>();
+  // Unknown usernames are checked against this hash so response time does not reveal which accounts exist.
+  const unknownUserHash = hashPassword(randomBytes(32).toString('hex'));
+  const loginUsers = new RateLimiter(10, 15 * 60_000);
+  const loginIps = new RateLimiter(30, 15 * 60_000);
+  const setupIps = new RateLimiter(10, 15 * 60_000);
+  const passwordUsers = new RateLimiter(10, 15 * 60_000);
+  const now = options.now ?? Date.now;
+
+  function clientIp(c: Context): string {
+    if (options.trustProxy) {
+      const forwarded = c.req.header('x-forwarded-for')?.split(',').at(-1)?.trim();
+      if (forwarded) return `ip:${forwarded}`;
+    }
+    try {
+      return `ip:${getConnInfo(c).remote.address || 'unknown'}`;
+    } catch {
+      return 'ip:unknown'; // app.request has no Bun server connection info.
+    }
+  }
+
+  function limited(c: Context, checks: Array<{ allowed: boolean; retryAfterMs: number }>): Response | null {
+    const wait = Math.max(0, ...checks.filter(result => !result.allowed).map(result => result.retryAfterMs));
+    if (!wait) return null;
+    c.header('Retry-After', String(Math.ceil(wait / 1000)));
+    return c.json({ error: 'Too many attempts, try again later' }, 429);
+  }
+
+  function currentSession(c: Context): { hash: string; user: AccountUser } | null {
     const token = getCookie(c, COOKIE);
     if (!token || !TOKEN_PATTERN.test(token)) return null;
-    const digest = hashToken(token);
-    return store.hasSession(digest, Date.now()) ? digest : null;
-  }
-  function updatePresence(): void {
-    manager.setBrowserPresence(clients.size > 0);
+    const hash = hashToken(token);
+    const user = store.sessionUser(hash, Date.now());
+    return user ? { hash, user } : null;
   }
 
-  function closeSessionClients(digest: string, reason: string): void {
+  function updatePresence(): void {
+    manager.setBrowserPresence(new Set([...clients.values()].map(client => client.userId)));
+  }
+
+  function closeClients(matches: (client: Client) => boolean, reason: string): void {
     for (const [key, client] of clients) {
-      if (client.tokenHash !== digest) continue;
+      if (!matches(client)) continue;
       if (client.ws.readyState < 2) client.ws.close(1008, reason);
       clients.delete(key);
     }
     updatePresence();
   }
 
+  function secureCookie(c: Context): boolean {
+    return new URL(options.publicOrigin ?? c.req.url).protocol === 'https:';
+  }
 
-  function publish(event: ServerEvent): void {
+  function startSession(c: Context, userId: number): void {
+    const previous = currentSession(c);
+    if (previous) {
+      store.deleteSession(previous.hash, previous.user.id);
+      closeClients(client => client.tokenHash === previous.hash, 'Session replaced');
+    }
+    const token = randomBytes(32).toString('base64url');
+    const createdAt = Date.now();
+    store.createSession(hashToken(token), userId, createdAt + SESSION_AGE_SECONDS * 1000, createdAt);
+    setCookie(c, COOKIE, token, {
+      httpOnly: true,
+      sameSite: 'Strict',
+      secure: secureCookie(c),
+      path: '/',
+      maxAge: SESSION_AGE_SECONDS,
+    });
+  }
+
+  function eventOwner(event: ServerEvent): number | null {
+    switch (event.type) {
+      case 'message': return store.networkOwner(event.message.networkId);
+      case 'buffer': return store.networkOwner(event.buffer.networkId);
+      case 'buffer_removed':
+      case 'read': return store.bufferOwner(event.bufferId);
+      case 'history_cleared': return store.bufferOwner(event.bufferId);
+      case 'network':
+      case 'network_removed':
+      case 'ignores': return store.networkOwner(event.networkId);
+      case 'channel_state': return store.bufferOwner(event.state.bufferId);
+      case 'channel_list': return store.networkOwner(event.status.networkId);
+      case 'settings': return event.userId;
+    }
+  }
+
+  /** Sends an event to its owner's browsers; removal events pass `userId` since the row is already gone. */
+  function publish(event: ServerEvent, userId?: number): void {
     if (clients.size === 0) return;
+    const owner = userId ?? eventOwner(event);
+    if (owner === null) return;
     const message = JSON.stringify(event);
     const valid = new Map<string, boolean>();
     for (const [key, client] of clients) {
+      if (client.userId !== owner) continue;
       let active = valid.get(client.tokenHash);
       if (active === undefined) {
-        active = store.hasSession(client.tokenHash, Date.now());
+        active = store.sessionUser(client.tokenHash, Date.now())?.id === owner;
         valid.set(client.tokenHash, active);
       }
       if (!active || client.ws.readyState !== 1) {
@@ -196,6 +318,21 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
     updatePresence();
   }
 
+  function adminUsers() {
+    return store.listAdminUsers(Date.now()).map(user => ({
+      ...user,
+      connectedCount: Object.values(manager.status(user.id)).filter(status => status.state === 'connected').length,
+    }));
+  }
+
+  function ownsNetwork(c: Context<AppEnv>, networkId: number): boolean {
+    return store.networkOwner(networkId) === c.get('user').id;
+  }
+
+  function ownedBuffer(c: Context<AppEnv>, bufferId: number): ChatBuffer | null {
+    return store.bufferOwner(bufferId) === c.get('user').id ? store.getBuffer(bufferId) : null;
+  }
+
   app.onError((error, c) => {
     if (error instanceof BadRequest) return c.json({ error: 'Invalid request' }, 400);
     // A duplicate network name is an input conflict, not an internal failure.
@@ -208,56 +345,81 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
 
   app.use('/api/*', async (c, next) => {
     if ((c.req.method !== 'GET' && c.req.method !== 'HEAD') || c.req.path === '/api/events') {
-      if (!sameOrigin(c, publicOrigin)) return c.json({ error: 'Forbidden origin' }, 403);
+      if (!sameOrigin(c, options.publicOrigin)) return c.json({ error: 'Forbidden origin' }, 403);
     }
-    if (!(c.req.path === '/api/login' && c.req.method === 'POST') && !sessionHash(c)) {
-      return c.json({ error: 'Unauthorized' }, 401);
+    if (!PUBLIC_ROUTES.has(`${c.req.method} ${c.req.path}`)) {
+      const session = currentSession(c);
+      if (!session) return c.json({ error: 'Unauthorized' }, 401);
+      if ((c.req.path === '/api/users' || c.req.path.startsWith('/api/users/')) && !session.user.isAdmin) {
+        return c.json({ error: 'Forbidden' }, 403);
+      }
+      c.set('user', session.user);
+      c.set('session', session.hash);
     }
     await next();
   });
 
+  app.get('/api/setup', (c) => c.json({ required: store.setupRequired() } satisfies SetupStatus));
+
+  app.post('/api/setup', async (c) => {
+    const { username, password, token } = await jsonBody(c, setupInput);
+    if (!store.setupRequired()) return c.json({ error: 'Setup already completed' }, 409);
+    const ip = clientIp(c);
+    const time = now();
+    const blocked = limited(c, [setupIps.check(ip, time)]);
+    if (blocked) return blocked;
+    setupIps.fail(ip, time);
+    const supplied = createHash('sha256').update(token ?? '').digest();
+    const expected = createHash('sha256').update(options.setupToken ?? '').digest();
+    if (!options.setupToken || !timingSafeEqual(supplied, expected)) {
+      return c.json({ error: 'Invalid setup token' }, 403);
+    }
+    const user = store.claimAdmin(username, await hashPassword(password));
+    if (!user) return c.json({ error: 'Setup already completed' }, 409);
+    startSession(c, user.id);
+    return c.json({ ok: true });
+  });
+
   app.post('/api/login', async (c) => {
-    const { password: candidate } = await jsonBody(c, loginInput);
-    if (!verifyPassword(candidate, store.getPasswordHash(), passwordDigest)) {
-      return c.json({ error: 'Invalid password' }, 401);
+    const { username, password } = await jsonBody(c, loginInput);
+    if (store.setupRequired()) return c.json({ error: 'Setup required' }, 409);
+    const userKey = `user:${username.toLowerCase()}`;
+    const ip = clientIp(c);
+    const time = now();
+    const blocked = limited(c, [loginUsers.check(userKey, time), loginIps.check(ip, time)]);
+    if (blocked) return blocked;
+    const credentials = store.getCredentials(username);
+    const valid = await verifyPassword(password, credentials?.passwordHash ?? await unknownUserHash);
+    if (!credentials?.passwordHash || !valid) {
+      loginUsers.fail(userKey, time);
+      loginIps.fail(ip, time);
+      return c.json({ error: 'Invalid username or password' }, 401);
     }
-    const oldToken = getCookie(c, COOKIE);
-    if (oldToken && TOKEN_PATTERN.test(oldToken)) {
-      const previous = hashToken(oldToken);
-      store.deleteSession(previous);
-      closeSessionClients(previous, 'Session replaced');
-    }
-    const token = randomBytes(32).toString('base64url');
-    const createdAt = Date.now();
-    store.createSession(hashToken(token), createdAt + SESSION_AGE_SECONDS * 1000, createdAt);
-    setCookie(c, COOKIE, token, {
-      httpOnly: true,
-      sameSite: 'Strict',
-      secure: publicOrigin ? new URL(publicOrigin).protocol === 'https:' : new URL(c.req.url).protocol === 'https:',
-      path: '/',
-      maxAge: SESSION_AGE_SECONDS,
-    });
+    loginUsers.reset(userKey);
+    if (store.isUserDisabled(credentials.user.id)) return c.json({ error: 'Account disabled' }, 403);
+    startSession(c, credentials.user.id);
     return c.json({ ok: true });
   });
 
   app.post('/api/logout', (c) => {
-    const digest = sessionHash(c)!;
-    store.deleteSession(digest);
-    closeSessionClients(digest, 'Logged out');
+    const session = c.get('session');
+    store.deleteSession(session, c.get('user').id);
+    closeClients(client => client.tokenHash === session, 'Logged out');
     setCookie(c, COOKIE, '', {
       httpOnly: true,
       sameSite: 'Strict',
-      secure: publicOrigin ? new URL(publicOrigin).protocol === 'https:' : new URL(c.req.url).protocol === 'https:',
+      secure: secureCookie(c),
       path: '/',
       maxAge: 0,
       expires: new Date(0),
     });
     return c.json({ ok: true });
   });
+
   app.get('/api/account/sessions', (c) => {
-    const current = sessionHash(c)!;
+    const current = c.get('session');
     return c.json({
-      sessions: store.listSessions(Date.now()).map(session => ({
+      sessions: store.listSessions(c.get('user').id, Date.now()).map(session => ({
         ...session, current: session.id === current,
       })),
     });
@@ -266,44 +428,165 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
   app.delete('/api/account/sessions/:id', (c) => {
     const id = c.req.param('id');
     if (!SESSION_ID_PATTERN.test(id)) throw new BadRequest();
-    store.deleteSession(id);
-    closeSessionClients(id, 'Session revoked');
+    const userId = c.get('user').id;
+    store.deleteSession(id, userId);
+    closeClients(client => client.tokenHash === id && client.userId === userId, 'Session revoked');
     return c.json({ ok: true });
   });
 
   app.post('/api/account/password', async (c) => {
-    const { currentPassword, newPassword } = await jsonBody(c, passwordInput);
-    if (!verifyPassword(currentPassword, store.getPasswordHash(), passwordDigest)) {
+    const { currentPassword, newPassword: password } = await jsonBody(c, passwordInput);
+    const userId = c.get('user').id;
+    const key = `uid:${userId}`;
+    const time = now();
+    const blocked = limited(c, [passwordUsers.check(key, time)]);
+    if (blocked) return blocked;
+    const saved = store.getPasswordHash(userId);
+    if (!saved || !await verifyPassword(currentPassword, saved)) {
+      passwordUsers.fail(key, time);
       return c.json({ error: 'Invalid password' }, 401);
     }
-    const current = sessionHash(c)!;
-    store.revokeOtherSessions(current, passwordHash(newPassword));
-    for (const client of new Set([...clients.values()].map(value => value.tokenHash))) {
-      if (client !== current) closeSessionClients(client, 'Password changed');
-    }
+    passwordUsers.reset(key);
+    const current = c.get('session');
+    store.setPassword(userId, await hashPassword(password), current);
+    closeClients(client => client.userId === userId && client.tokenHash !== current, 'Password changed');
     return c.json({ ok: true });
   });
 
-  app.get('/api/settings/away', (c) => c.json({ message: store.getAwayMessage() }));
+  app.get('/api/users', (c) => c.json({ users: adminUsers() }));
+
+  app.post('/api/users', async (c) => {
+    const { username, password } = await jsonBody(c, accountInput);
+    const user = store.createUser(username, await hashPassword(password));
+    if (!user) return c.json({ error: 'Username already exists' }, 409);
+    return c.json(user, 201);
+  });
+
+  app.patch('/api/users/:id', async (c) => {
+    const id = integer(c.req.param('id'))!;
+    const { disabled, maxNetworks, retentionDays } = await jsonBody(c, userUpdateInput);
+    const target = store.getUser(id);
+    if (!target) return c.json({ error: 'User not found' }, 404);
+    if (disabled !== undefined && target.isAdmin) return c.json({ error: 'Cannot disable admin account' }, 400);
+    if (maxNetworks !== undefined || retentionDays !== undefined) {
+      store.setUserLimits(id, { maxNetworks, retentionDays });
+    }
+    if (disabled !== undefined && store.isUserDisabled(id) !== disabled) {
+      store.setUserDisabled(id, disabled);
+      if (disabled) {
+        closeClients(client => client.userId === id, 'Account disabled');
+        for (const network of store.listNetworks(id)) manager.disconnect(network.id);
+      } else {
+        for (const network of store.listNetworks(id)) {
+          if (!store.isNetworkDisconnected(network.id)) manager.connect(network);
+        }
+      }
+    }
+    return c.json(adminUsers().find(user => user.id === id)!);
+  });
+
+  app.post('/api/users/:id/password', async (c) => {
+    const id = integer(c.req.param('id'))!;
+    const { password } = await jsonBody(c, resetPasswordInput);
+    const target = store.getUser(id);
+    if (!target || target.isAdmin) return c.json({ error: 'User not found' }, 404);
+    store.setPassword(id, await hashPassword(password), null);
+    closeClients(client => client.userId === id, 'Password reset');
+    return c.json({ ok: true });
+  });
+
+  app.delete('/api/users/:id', (c) => {
+    const id = integer(c.req.param('id'))!;
+    const target = store.getUser(id);
+    if (!target || target.isAdmin) return c.json({ error: 'User not found' }, 404);
+    closeClients(client => client.userId === id, 'Account deleted');
+    for (const network of store.listNetworks(id)) {
+      manager.disconnect(network.id);
+      manager.forgetNetwork(network.id);
+    }
+    for (const buffer of store.listBuffers(id)) manager.forgetBuffer(buffer.id);
+    store.removeUser(id);
+    return c.json({ ok: true });
+  });
+
+  app.get('/api/settings/away', (c) => c.json({ message: store.getAwayMessage(c.get('user').id) }));
 
   app.patch('/api/settings/away', async (c) => {
     const { message } = await jsonBody(c, awayInput);
-    store.setAwayMessage(message);
-    manager.updateAwayMessage();
+    const userId = c.get('user').id;
+    store.setAwayMessage(userId, message);
+    manager.updateAwayMessage(userId);
     return c.json({ message });
   });
 
+  app.get('/api/settings', (c) => c.json(store.getSettingsState(c.get('user').id).settings));
 
-  app.get('/api/bootstrap', (c) => c.json({
-    networks: store.listNetworks(),
-    buffers: store.listBuffers(),
-    statuses: manager.status(),
-    ignores: store.allIgnores(),
-  } satisfies Bootstrap));
+  app.patch('/api/settings', async (c) => {
+    const patch = await jsonBody(c, settingsInput);
+    const userId = c.get('user').id;
+    for (const id of [...(patch.mutedNetworks ?? []), ...(patch.collapsedNetworks ?? [])]) {
+      if (store.networkOwner(id) !== userId) return c.json({ error: 'Network not found' }, 404);
+    }
+    for (const id of [...(patch.mutedBuffers ?? []), ...(patch.hiddenBuffers ?? [])]) {
+      if (store.bufferOwner(id) !== userId) return c.json({ error: 'Buffer not found' }, 404);
+    }
+    const settings = store.patchSettings(userId, patch);
+    publish({ type: 'settings', userId, settings });
+    return c.json(settings);
+  });
+
+  app.get('/api/push/key', (c) => {
+    if (!options.push) return c.json({ error: 'Push is not available' }, 503);
+    return c.json({ publicKey: options.push.publicKey } satisfies PushKey);
+  });
+
+  app.post('/api/push/subscriptions', async (c) => {
+    const { endpoint, keys } = await jsonBody(c, pushSubscriptionInput);
+    if (!options.push) return c.json({ error: 'Push is not available' }, 503);
+    const saved = store.savePushSubscription(c.get('user').id, c.get('session'),
+      { endpoint, p256dh: keys.p256dh, auth: keys.auth }, PUSH_SUBSCRIPTION_LIMIT, Date.now());
+    if (!saved) return c.json({ error: 'Too many push devices; disable push on another device first' }, 409);
+    return c.json({ ok: true }, 201);
+  });
+
+  app.delete('/api/push/subscriptions', async (c) => {
+    const { endpoint } = await jsonBody(c, pushEndpointInput);
+    store.deletePushSubscription(c.get('user').id, endpoint);
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/push/test', async (c) => {
+    if (!options.push) return c.json({ error: 'Push is not available' }, 503);
+    const delivered = await options.push.deliver(c.get('user').id,
+      { bufferId: null, title: 'Lingo', body: 'Test notification' });
+    if (!delivered) return c.json({ error: 'No device accepted the notification' }, 502);
+    return c.json({ delivered });
+  });
+
+  app.get('/api/bootstrap', (c) => {
+    const user = c.get('user');
+    const { settings, configured } = store.getSettingsState(user.id);
+    return c.json({
+      user,
+      settings,
+      settingsConfigured: configured,
+      networks: store.listNetworks(user.id),
+      buffers: store.listBuffers(user.id),
+      statuses: manager.status(user.id),
+      ignores: store.allIgnores(user.id),
+      unread: store.getUnread(user.id),
+    } satisfies Bootstrap);
+  });
 
   app.post('/api/networks', async (c) => {
     const input = normalizedNetworkInput(await jsonBody(c, networkInput));
-    const network = store.createNetwork(input);
+    let network;
+    try {
+      network = store.createNetwork(c.get('user').id, input);
+    } catch (error) {
+      if (error instanceof NetworkLimitReached) return c.json({ error: 'Network limit reached' }, 409);
+      throw error;
+    }
     manager.connect(network);
     return c.json(network, 201);
   });
@@ -311,6 +594,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
   app.patch('/api/networks/:id', async (c) => {
     const id = integer(c.req.param('id'))!;
     const input = normalizedNetworkInput(await jsonBody(c, networkInput));
+    if (!ownsNetwork(c, id)) return c.json({ error: 'Network not found' }, 404);
     const existing = store.getNetworkConfig(id);
     const network = store.updateNetwork(id, input);
     if (!network) return c.json({ error: 'Network not found' }, 404);
@@ -332,25 +616,25 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
     if (reconnect) {
       manager.update(network);
     } else {
-      publish({ type: 'network', networkId: id, status: manager.status()[id] });
+      publish({ type: 'network', networkId: id, status: manager.status(c.get('user').id)[id]! });
     }
     return c.json(network);
   });
 
   app.delete('/api/networks/:id', (c) => {
     const id = integer(c.req.param('id'))!;
-    if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+    if (!ownsNetwork(c, id)) return c.json({ error: 'Network not found' }, 404);
     manager.disconnect(id);
     manager.forgetNetwork(id);
     store.removeNetwork(id);
-    publish({ type: 'network_removed', networkId: id });
+    publish({ type: 'network_removed', networkId: id }, c.get('user').id);
     return c.json({ ok: true });
   });
 
   for (const [action, connected] of [['connect', true], ['disconnect', false]] as const) {
     app.post(`/api/networks/:id/${action}`, (c) => {
       const id = integer(c.req.param('id'))!;
-      if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+      if (!ownsNetwork(c, id)) return c.json({ error: 'Network not found' }, 404);
       manager.setConnected(id, connected);
       return c.json({ ok: true });
     });
@@ -358,7 +642,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
 
   app.get('/api/networks/:id/channels', (c) => {
     const id = integer(c.req.param('id'))!;
-    if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+    if (!ownsNetwork(c, id)) return c.json({ error: 'Network not found' }, 404);
     const query = c.req.query('q') ?? '';
     if (query.length > 100) throw new BadRequest();
     const limit = integer(c.req.query('limit'), 1000) ?? 200;
@@ -368,7 +652,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
   app.post('/api/networks/:id/channels/refresh', async (c) => {
     const id = integer(c.req.param('id'))!;
     const { mask } = await jsonBody(c, channelListInput);
-    if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+    if (!ownsNetwork(c, id)) return c.json({ error: 'Network not found' }, 404);
     try {
       manager.requestChannelList(id, mask);
     } catch (error) {
@@ -380,7 +664,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
   app.post('/api/networks/:id/whois', async (c) => {
     const id = integer(c.req.param('id'))!;
     const { nick } = await jsonBody(c, nickInput);
-    if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+    if (!ownsNetwork(c, id)) return c.json({ error: 'Network not found' }, 404);
     try {
       return c.json(await manager.whois(id, nick));
     } catch (error) {
@@ -392,14 +676,14 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
     app[method]('/api/networks/:id/ignores', async (c) => {
       const id = integer(c.req.param('id'))!;
       const { nick } = await jsonBody(c, nickInput);
-      if (!store.getNetwork(id)) return c.json({ error: 'Network not found' }, 404);
+      if (!ownsNetwork(c, id)) return c.json({ error: 'Network not found' }, 404);
       return c.json({ ignores: manager.setIgnored(id, nick, ignored) });
     });
   }
 
   app.post('/api/buffers/query', async (c) => {
     const { networkId, nick } = await jsonBody(c, queryInput);
-    if (!store.getNetwork(networkId)) return c.json({ error: 'Network not found' }, 404);
+    if (!ownsNetwork(c, networkId)) return c.json({ error: 'Network not found' }, 404);
     try {
       return c.json(manager.openQuery(networkId, nick), 201);
     } catch (error) {
@@ -409,7 +693,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
 
   app.post('/api/buffers/:id/bans', async (c) => {
     const id = integer(c.req.param('id'))!;
-    const buffer = store.getBuffer(id);
+    const buffer = ownedBuffer(c, id);
     if (!buffer || buffer.kind !== 'channel') return c.json({ error: 'Channel not found' }, 404);
     try {
       return c.json({ bans: await manager.banList(id) });
@@ -420,7 +704,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
 
   app.delete('/api/buffers/:id/messages', (c) => {
     const id = integer(c.req.param('id'))!;
-    if (!store.getBuffer(id)) return c.json({ error: 'Buffer not found' }, 404);
+    if (!ownedBuffer(c, id)) return c.json({ error: 'Buffer not found' }, 404);
     store.clearMessages(id);
     publish({ type: 'history_cleared', bufferId: id });
     return c.json({ ok: true });
@@ -428,7 +712,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
 
   app.post('/api/buffers', async (c) => {
     const { networkId, name } = await jsonBody(c, bufferInput);
-    if (!store.getNetwork(networkId)) return c.json({ error: 'Network not found' }, 404);
+    if (!ownsNetwork(c, networkId)) return c.json({ error: 'Network not found' }, 404);
     try {
       manager.join(networkId, name);
     } catch (error) {
@@ -438,7 +722,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
   });
   app.post('/api/buffers/batch', async (c) => {
     const { networkId, names } = await jsonBody(c, batchBufferInput);
-    if (!store.getNetwork(networkId)) return c.json({ error: 'Network not found' }, 404);
+    if (!ownsNetwork(c, networkId)) return c.json({ error: 'Network not found' }, 404);
     try {
       return c.json({ buffers: manager.joinMany(networkId, names) }, 201);
     } catch (error) {
@@ -448,7 +732,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
 
   app.get('/api/buffers/:id/channel', (c) => {
     const id = integer(c.req.param('id'))!;
-    const buffer = store.getBuffer(id);
+    const buffer = ownedBuffer(c, id);
     if (!buffer || buffer.kind !== 'channel') return c.json({ error: 'Channel not found' }, 404);
     return c.json(manager.channelState(id));
   });
@@ -456,7 +740,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
   app.patch('/api/buffers/:id/topic', async (c) => {
     const id = integer(c.req.param('id'))!;
     const { topic } = await jsonBody(c, topicInput);
-    const buffer = store.getBuffer(id);
+    const buffer = ownedBuffer(c, id);
     if (!buffer || buffer.kind !== 'channel') return c.json({ error: 'Channel not found' }, 404);
     try {
       manager.setTopic(id, topic);
@@ -469,7 +753,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
 
   app.get('/api/buffers/:id/participants', (c) => {
     const id = integer(c.req.param('id'))!;
-    const buffer = store.getBuffer(id);
+    const buffer = ownedBuffer(c, id);
     if (!buffer) return c.json({ error: 'Buffer not found' }, 404);
     const seen = new Set<string>();
     const participants: MentionCandidate[] = [];
@@ -487,7 +771,7 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
 
   app.delete('/api/buffers/:id', (c) => {
     const id = integer(c.req.param('id'))!;
-    const buffer = store.getBuffer(id);
+    const buffer = ownedBuffer(c, id);
     if (!buffer) return c.json({ error: 'Buffer not found' }, 404);
     if (buffer.kind === 'channel') {
       try {
@@ -498,14 +782,14 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
     } else {
       manager.forgetBuffer(id);
       store.removeBuffer(id);
-      publish({ type: 'buffer_removed', bufferId: id });
+      publish({ type: 'buffer_removed', bufferId: id }, c.get('user').id);
     }
     return c.json({ ok: true });
   });
 
   app.post('/api/send', async (c) => {
     const { bufferId, text } = await jsonBody(c, sendInput);
-    if (!store.getBuffer(bufferId)) return c.json({ error: 'Buffer not found' }, 404);
+    if (!ownedBuffer(c, bufferId)) return c.json({ error: 'Buffer not found' }, 404);
     try {
       manager.send(bufferId, text);
     } catch (error) {
@@ -514,10 +798,20 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
     return c.json({ ok: true });
   });
 
+  app.put('/api/buffers/:id/read', async (c) => {
+    const id = integer(c.req.param('id'))!;
+    const { messageId } = await jsonBody(c, readInput);
+    if (!ownedBuffer(c, id)) return c.json({ error: 'Buffer not found' }, 404);
+    const lastReadId = store.markRead(id, messageId);
+    if (lastReadId === null) return c.json({ error: 'Message not found' }, 404);
+    publish({ type: 'read', bufferId: id, lastReadId });
+    return c.json({ bufferId: id, lastReadId });
+  });
+
   app.get('/api/messages', (c) => {
     const bufferId = integer(c.req.query('bufferId'));
     if (bufferId === undefined) throw new BadRequest();
-    if (!store.getBuffer(bufferId)) return c.json({ error: 'Buffer not found' }, 404);
+    if (!ownedBuffer(c, bufferId)) return c.json({ error: 'Buffer not found' }, 404);
     const before = integer(c.req.query('before'));
     const limit = integer(c.req.query('limit'), 100);
     return c.json(store.getMessages(bufferId, before, limit));
@@ -533,27 +827,28 @@ export function createApp(store: Store, manager: IrcManager, password: string, p
     const since = timestamp(c.req.query('since'));
     const until = timestamp(c.req.query('until'));
     if (since !== undefined && until !== undefined && since > until) throw new BadRequest();
-    if (networkId !== undefined && !store.getNetwork(networkId)) {
+    if (networkId !== undefined && !ownsNetwork(c, networkId)) {
       return c.json({ error: 'Network not found' }, 404);
     }
-    if (bufferId !== undefined && !store.getBuffer(bufferId)) {
+    if (bufferId !== undefined && !ownedBuffer(c, bufferId)) {
       return c.json({ error: 'Buffer not found' }, 404);
     }
-    return c.json(store.searchMessages(query, { networkId, bufferId, before, limit, since, until }));
+    return c.json(store.searchMessages(query, { userId: c.get('user').id, networkId, bufferId, before, limit, since, until }));
   });
 
   app.get('/api/events', (c) => {
     if (c.req.header('upgrade')?.toLowerCase() !== 'websocket') {
       return c.json({ error: 'WebSocket upgrade required' }, 400);
     }
-    const tokenHash = sessionHash(c)!;
+    const tokenHash = c.get('session');
+    const userId = c.get('user').id;
     return upgradeWebSocket(c, {
       onOpen(_event, ws) {
-        if (!store.hasSession(tokenHash, Date.now())) {
+        if (store.sessionUser(tokenHash, Date.now())?.id !== userId) {
           ws.close(1008, 'Session expired');
           return;
         }
-        clients.set(ws.raw, { ws, tokenHash });
+        clients.set(ws.raw, { ws, tokenHash, userId });
         updatePresence();
       },
       onClose(_event, ws) {

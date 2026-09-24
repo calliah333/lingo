@@ -17,7 +17,6 @@ export type AppPreferences = {
   sidebarCollapsed: boolean;
   browserNotifications: boolean;
   notificationSound: boolean;
-  highlights: string[];
 };
 
 export const fontFamilies = {
@@ -56,7 +55,6 @@ const defaults: AppPreferences = {
   sidebarCollapsed: false,
   browserNotifications: false,
   notificationSound: false,
-  highlights: [],
 };
 
 function isTheme(value: unknown): value is Theme {
@@ -67,6 +65,31 @@ function isFontFamily(value: unknown): value is FontFamily {
   return typeof value === 'string' && Object.hasOwn(fontFamilies, value);
 }
 
+/** Legacy account choices are read only during the first server-settings bootstrap. */
+export function legacyHighlights(): string[] | null {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(storageKey) ?? 'null');
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored) || !Object.hasOwn(stored, 'highlights')) return null;
+    const value = (stored as Record<string, unknown>).highlights;
+    if (!Array.isArray(value)) return null;
+    return [...new Set(value.filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim()).filter((item) => item.length > 0 && item.length <= 100 && !/[\r\n]/.test(item)))].slice(0, 100);
+  } catch {
+    return null;
+  }
+}
+
+export function clearLegacyHighlights(): void {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(storageKey) ?? 'null');
+    if (stored && typeof stored === 'object' && !Array.isArray(stored) && Object.hasOwn(stored, 'highlights')) {
+      const next = { ...stored as Record<string, unknown> };
+      delete next.highlights;
+      localStorage.setItem(storageKey, JSON.stringify(next));
+    }
+  } catch { /* Browser storage may be unavailable. */ }
+}
+
 export function loadPreferences(): AppPreferences {
   let stored: unknown;
   let legacyTheme: unknown;
@@ -74,11 +97,10 @@ export function loadPreferences(): AppPreferences {
     stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null');
     legacyTheme = localStorage.getItem('lingo-theme');
   } catch {
-    return { ...defaults, highlights: [] };
+    return { ...defaults };
   }
   const value = stored && typeof stored === 'object' && !Array.isArray(stored)
     ? stored as Record<string, unknown> : {};
-  const highlights = Array.isArray(value.highlights) ? value.highlights : [];
   return {
     showMotd: typeof value.showMotd === 'boolean' ? value.showMotd : defaults.showMotd,
     showSeconds: typeof value.showSeconds === 'boolean' ? value.showSeconds : defaults.showSeconds,
@@ -98,14 +120,17 @@ export function loadPreferences(): AppPreferences {
     sidebarCollapsed: typeof value.sidebarCollapsed === 'boolean' ? value.sidebarCollapsed : defaults.sidebarCollapsed,
     browserNotifications: typeof value.browserNotifications === 'boolean' ? value.browserNotifications : defaults.browserNotifications,
     notificationSound: typeof value.notificationSound === 'boolean' ? value.notificationSound : defaults.notificationSound,
-    highlights: [...new Set(highlights.filter((item): item is string => typeof item === 'string')
-      .map((item) => item.trim()).filter(Boolean))],
   };
 }
 
 export function savePreferences(preferences: AppPreferences): void {
   try {
-    localStorage.setItem(storageKey, JSON.stringify(preferences));
+    // Preserve unsent legacy highlights until the first account bootstrap migrates them.
+    let stored: unknown;
+    try { stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null'); } catch { stored = null; }
+    const legacy = stored && typeof stored === 'object' && !Array.isArray(stored)
+      && Object.hasOwn(stored, 'highlights') ? { highlights: (stored as Record<string, unknown>).highlights } : {};
+    localStorage.setItem(storageKey, JSON.stringify({ ...preferences, ...legacy }));
     localStorage.setItem('lingo-theme', preferences.theme);
   } catch { /* Browser storage may be unavailable. */ }
 }

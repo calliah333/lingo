@@ -17,17 +17,22 @@ type TranscriptProps = {
   olderPending: boolean;
   error: string;
   jumpId: number | null;
+  /** Draw "New messages" before the first message after this id; null for no divider. */
+  dividerAfter: number | null;
+  onBottomChange: (bufferId: number, atBottom: boolean) => void;
   onLoadOlder: () => Promise<void>;
   onRetry: () => void;
   onRename: (mentionTarget: string, displayName: string) => void;
   /** Opens user actions for the IRC nick behind a message (the relayed nick for bridged users). */
   onNickMenu: (nick: string, x: number, y: number) => void;
   preferences: AppPreferences;
+  highlights: string[];
   theme: Theme;
 };
 
 type TranscriptRow =
   | { type: 'date'; key: string; date: Date }
+  | { type: 'unread'; key: string }
   | { type: 'message'; key: string; message: ChatMessage };
 
 type Anchor = { id: number; top: number };
@@ -52,11 +57,14 @@ export default function Transcript({
   olderPending,
   error,
   jumpId,
+  dividerAfter,
+  onBottomChange,
   onLoadOlder,
   onRetry,
   onRename,
   onNickMenu,
   preferences,
+  highlights: highlightPhrases,
   theme,
 }: TranscriptProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -76,8 +84,8 @@ export default function Transcript({
   const displayNames = network.displayNames ?? {};
   const ownNamesKey = ownNames.join('\u0000');
   const normalizedOwnNames = useMemo(() => ownNames.filter(Boolean), [ownNamesKey]);
-  const highlightsKey = preferences.highlights.join('\u0000');
-  const highlights = useMemo(() => preferences.highlights.map((phrase) => phrase.trim().toLowerCase()).filter(Boolean), [highlightsKey]);
+  const highlightsKey = highlightPhrases.join('\u0000');
+  const highlights = useMemo(() => highlightPhrases.map((phrase) => phrase.trim().toLowerCase()).filter(Boolean), [highlightsKey]);
   const timeFormatter = useMemo(() => new Intl.DateTimeFormat(undefined, {
     hour: 'numeric', minute: '2-digit', ...(preferences.showSeconds ? { second: '2-digit' } : {}),
     hour12: preferences.twelveHour,
@@ -85,6 +93,7 @@ export default function Transcript({
   const dateFormatter = useMemo(() => new Intl.DateTimeFormat(undefined, { dateStyle: 'full' }), []);
   const rows = useMemo(() => {
     const result: TranscriptRow[] = [];
+    let divided = false;
     let previousDay: string | null = null;
     for (const message of messages) {
       if (message.isMotd && !preferences.showMotd) continue;
@@ -95,17 +104,26 @@ export default function Transcript({
         result.push({ type: 'date', key: `date:${message.id}`, date: new Date(message.time) });
         previousDay = day;
       }
+      if (!divided && dividerAfter !== null && message.id > dividerAfter) {
+        result.push({ type: 'unread', key: `unread:${message.id}` });
+        divided = true;
+      }
       result.push({ type: 'message', key: `message:${message.id}`, message });
     }
     return result;
-  }, [messages, preferences.showMotd, preferences.statusMessages]);
+  }, [messages, preferences.showMotd, preferences.statusMessages, dividerAfter]);
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: (index) => rows[index]?.type === 'date' ? 32 : rows[index]?.message.connectionEvent ? 30 : 26,
+    estimateSize: (index) => {
+      const row = rows[index];
+      return row?.type === 'date' ? 32 : row?.type === 'unread' ? 30
+        : row?.type === 'message' && row.message.connectionEvent ? 30 : 26;
+    },
     getItemKey: (index) => rows[index]?.key ?? index,
     overscan: 12,
   });
+  const totalSize = virtualizer.getTotalSize();
   const virtualItems = virtualizer.getVirtualItems();
   currentBufferIdRef.current = buffer.id;
 
@@ -181,6 +199,15 @@ export default function Transcript({
       atBottomRef.current = false;
       return;
     }
+    if (!scrollReadyRef.current && jumpId === null && dividerAfter !== null && messages.length > 0) {
+      const firstUnread = rows.findIndex((row) => row.type === 'unread');
+      if (firstUnread !== -1) {
+        atBottomRef.current = false;
+        scrollReadyRef.current = true;
+        virtualizer.scrollToIndex(firstUnread, { align: 'start' });
+        return;
+      }
+    }
 
     const appended = !changedBuffer && oldMessages.length > 0 && messages.length > oldMessages.length
       && oldMessages.every((message, index) => messages[index]?.id === message.id);
@@ -194,7 +221,7 @@ export default function Transcript({
     } else if (!atBottomRef.current && (previous.hasMore !== hasMore || previous.rows !== rows) && anchorRef.current) {
       restoreAnchor(anchorRef.current);
     }
-  }, [buffer.id, messages, rows, hasMore, jumpId, virtualizer]);
+  }, [buffer.id, messages, rows, hasMore, jumpId, dividerAfter, virtualizer]);
 
   useLayoutEffect(() => {
     const element = scrollRef.current;
@@ -258,6 +285,16 @@ export default function Transcript({
     if (scrollReadyRef.current && element && element.scrollHeight <= element.clientHeight + 1
       && element.scrollTop <= 180) requestOlder();
   }, [buffer.id, messages, hasMore, loading, olderPending, error, rows]);
+  useLayoutEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      const element = scrollRef.current;
+      if (!element) return;
+      const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+      atBottomRef.current = atBottom;
+      onBottomChange(buffer.id, !loading && jumpId === null && messages.length > 0 && atBottom);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [buffer.id, messages, loading, jumpId, totalSize, onBottomChange]);
   return (
     <div
       className={['message-scroll', preferences.showSeconds ? 'message-time-seconds' : '', preferences.twelveHour ? 'message-time-twelve-hour' : ''].filter(Boolean).join(' ')}
@@ -267,6 +304,9 @@ export default function Transcript({
       aria-live="polite"
       onScroll={() => {
         captureAnchor();
+        const element = scrollRef.current;
+        if (element) onBottomChange(buffer.id, !loading && jumpId === null && messages.length > 0
+          && element.scrollHeight - element.scrollTop - element.clientHeight < 48);
         if (suppressTopScrollRef.current) {
           suppressTopScrollRef.current = false;
           return;
@@ -293,7 +333,7 @@ export default function Transcript({
       </div>
       {loading && messages.length === 0 ? <div className="muted" role="status" style={{ padding: '12px 24px' }}>Loading messages…</div> : null}
       {!loading && !error && messages.length === 0 ? <div className="muted" style={{ padding: '12px 24px' }}>No messages yet.</div> : null}
-      <ul className="message-list" style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative' }}>
+      <ul className="message-list" style={{ height: `${totalSize}px`, position: 'relative' }}>
         {virtualItems.map((virtualRow) => {
           const row = rows[virtualRow.index];
           if (!row) return null;
@@ -311,6 +351,10 @@ export default function Transcript({
                 {dateFormatter.format(row.date)}
               </time>
             </li>
+          );
+          if (row.type === 'unread') return (
+            <li className="message-unread-divider" key={virtualRow.key} data-index={virtualRow.index}
+              ref={virtualizer.measureElement} style={rowStyle}><span>New messages</span></li>
           );
           const message = row.message;
           const identity = displayIdentity(message, relayNicks, displayNames);

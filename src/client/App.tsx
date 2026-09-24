@@ -3,9 +3,10 @@ import {
   type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent,
 } from 'react';
 import type {
-  Bootstrap, ChannelListStatus, ChannelState, ChatBuffer, ChatMessage, Network, NetworkInput, NetworkStatus, ServerEvent,
+  AccountUser, Bootstrap, BufferUnread, ChannelListStatus, ChannelState, ChatBuffer, ChatMessage, Network, NetworkInput,
+  NetworkStatus, ServerEvent, SetupStatus, SyncedSettings,
 } from '../shared/contracts';
-import { displayIdentity, mentionsAny } from '../shared/identity';
+import { displayIdentity } from '../shared/identity';
 import { api, ApiError, errorText, json } from './api';
 import ChannelListPanel from './ChannelListPanel';
 import ContextMenu, { type MenuItem } from './ContextMenu';
@@ -14,8 +15,10 @@ import MentionComposer from './MentionComposer';
 import GlobalSettings from './GlobalSettings';
 import NetworkSettings from './NetworkSettings';
 import {
-  applyAppearance, clampSidebarWidth, loadPreferences, maxSidebarWidth, minSidebarWidth, savePreferences, type AppPreferences,
+  applyAppearance, clampSidebarWidth, clearLegacyHighlights, legacyHighlights, loadPreferences, maxSidebarWidth,
+  minSidebarWidth, savePreferences, type AppPreferences,
 } from './preferences';
+import { forgetPush, pushSupported, registerServiceWorker, syncPush } from './push';
 import SearchPanel from './SearchPanel';
 import Transcript from './Transcript';
 import ThemePicker from './ThemePicker';
@@ -80,6 +83,17 @@ function isJoined(network: Network | undefined, channel: string): boolean {
 /** Matches the stylesheet breakpoint where the networks sidebar becomes a drawer. */
 const drawerLayout = '(max-width: 640px)';
 
+const defaultSyncedSettings: SyncedSettings = {
+  highlights: [], mutedBuffers: [], mutedNetworks: [], hiddenBuffers: [], collapsedNetworks: [],
+  pushIncludesText: false, sendTyping: false,
+};
+const legacyIdKeys = {
+  mutedBuffers: 'lingo-muted-buffers',
+  mutedNetworks: 'lingo-muted-networks',
+  hiddenBuffers: 'lingo-hidden-buffers',
+  collapsedNetworks: 'lingo-collapsed-networks',
+} as const;
+
 function savedIds(key: string): number[] {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(key) ?? '[]');
@@ -89,9 +103,48 @@ function savedIds(key: string): number[] {
   }
 }
 
+function legacySettings(): Partial<SyncedSettings> {
+  const patch: Partial<SyncedSettings> = {};
+  for (const [field, key] of Object.entries(legacyIdKeys) as [keyof typeof legacyIdKeys, string][]) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === null) continue;
+      const value: unknown = JSON.parse(raw);
+      if (Array.isArray(value)) patch[field] = [...new Set(value.filter((id): id is number =>
+        Number.isSafeInteger(id) && id > 0))].slice(0, 1000);
+    } catch { /* Ignore invalid legacy values. */ }
+  }
+  const highlights = legacyHighlights();
+  if (highlights !== null) patch.highlights = highlights;
+  return patch;
+}
+
+function clearLegacySettings(): void {
+  try {
+    for (const key of Object.values(legacyIdKeys)) localStorage.removeItem(key);
+    localStorage.removeItem('lingo-legacy-settings-owner');
+  } catch { /* Browser storage may be unavailable. */ }
+  clearLegacyHighlights();
+}
+
+const launchUrl = new URL(window.location.href);
+const initialSetupToken = launchUrl.searchParams.get('setup') ?? '';
+// Push notification clicks open `/?buffer=<id>` when no Lingo window is open.
+const launchBuffer = /^[1-9]\d*$/.test(launchUrl.searchParams.get('buffer') ?? '')
+  ? Number(launchUrl.searchParams.get('buffer')) : null;
+if (launchUrl.searchParams.has('setup') || launchUrl.searchParams.has('buffer')) {
+  launchUrl.searchParams.delete('setup');
+  launchUrl.searchParams.delete('buffer');
+  window.history.replaceState(window.history.state, '', `${launchUrl.pathname}${launchUrl.search}${launchUrl.hash}`);
+}
+
 export default function App() {
-  const [auth, setAuth] = useState<'checking' | 'login' | 'ready' | 'unavailable'>('checking');
+  const [auth, setAuth] = useState<'checking' | 'setup' | 'login' | 'ready' | 'unavailable'>('checking');
+  const [user, setUser] = useState<AccountUser | null>(null);
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [setupToken, setSetupToken] = useState(initialSetupToken);
   const [loginPending, setLoginPending] = useState(false);
   const [loginError, setLoginError] = useState('');
   const [networks, setNetworks] = useState<Network[]>([]);
@@ -109,12 +162,9 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [drawerSidebar, setDrawerSidebar] = useState(() => window.matchMedia(drawerLayout).matches);
   const [joinNetworkId, setJoinNetworkId] = useState<number | null>(null);
-  const [collapsedNetworks, setCollapsedNetworks] = useState<number[]>(() => savedIds('lingo-collapsed-networks'));
-  const [hiddenBuffers, setHiddenBuffers] = useState<number[]>(() => savedIds('lingo-hidden-buffers'));
+  const [syncedSettings, setSyncedSettings] = useState<SyncedSettings>(defaultSyncedSettings);
   const [menu, setMenu] = useState<MenuTarget | null>(null);
   const [dialog, setDialog] = useState<DialogTarget | null>(null);
-  const [mutedBuffers, setMutedBuffers] = useState<number[]>(() => savedIds('lingo-muted-buffers'));
-  const [mutedNetworks, setMutedNetworks] = useState<number[]>(() => savedIds('lingo-muted-networks'));
   const [ignores, setIgnores] = useState<Record<number, string[]>>({});
   const [channelListTabs, setChannelListTabs] = useState<number[]>(() => savedIds('lingo-channel-lists'));
   const [channelListView, setChannelListView] = useState<number | null>(null);
@@ -131,9 +181,9 @@ export default function App() {
   const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences);
   const [renameTarget, setRenameTarget] = useState<{ networkId: number; nick: string } | null>(null);
   const [renameValue, setRenameValue] = useState('');
-  const [unread, setUnread] = useState<Record<number, number>>({});
-  const [mentionUnread, setMentionUnread] = useState<Record<number, number>>({});
+  const [unread, setUnread] = useState<Record<number, BufferUnread>>({});
   const [jump, setJump] = useState<Jump | null>(null);
+  const [divider, setDivider] = useState<{ bufferId: number; after: number } | null>(null);
   const [reloadSerial, setReloadSerial] = useState(0);
 
   const selectedRef = useRef(selectedId);
@@ -142,18 +192,33 @@ export default function App() {
   viewRef.current = view;
   const jumpRef = useRef(jump);
   jumpRef.current = jump;
+  const unreadRef = useRef(unread);
+  const recentMessages = useRef(new Map<number, { bufferId: number; mention: boolean }>());
+  const readBottomRef = useRef<{ bufferId: number; atBottom: boolean } | null>(null);
+  const readVisibleRef = useRef(false);
+  const readPending = useRef<{ bufferId: number; messageId: number } | null>(null);
+  const readTimer = useRef<number | null>(null);
+  const readInFlight = useRef(false);
+  const lastReadSentAt = useRef(0);
+  const readGeneration = useRef(0);
   const buffersRef = useRef(buffers);
   buffersRef.current = buffers;
   const networksRef = useRef(networks);
   networksRef.current = networks;
   const statusesRef = useRef(statuses);
   statusesRef.current = statuses;
-  const hiddenBuffersRef = useRef(hiddenBuffers);
-  hiddenBuffersRef.current = hiddenBuffers;
+  const settingsRef = useRef<SyncedSettings>(syncedSettings);
+  const serverSettingsRef = useRef<SyncedSettings>(defaultSyncedSettings);
+  const pendingSettings = useRef<{ patch: Partial<SyncedSettings>; settle: (success: boolean) => void }[]>([]);
+  const settingsSaving = useRef(false);
+  const settingsGeneration = useRef(0);
+  const settingsEventRevision = useRef(0);
+  const settingsRevision = useRef(0);
+  const migrationAttempted = useRef(new Set<number>());
+  const userRef = useRef<AccountUser | null>(null);
   const preferencesRef = useRef(preferences);
   preferencesRef.current = preferences;
-  const mutedRef = useRef({ buffers: mutedBuffers, networks: mutedNetworks });
-  mutedRef.current = { buffers: mutedBuffers, networks: mutedNetworks };
+  settingsRef.current = syncedSettings;
   const pendingTopicEdit = useRef<number | null>(null);
   const overlayOpen = useRef(false);
   overlayOpen.current = menu !== null || dialog !== null;
@@ -176,16 +241,129 @@ export default function App() {
     && isJoined(networks.find((network) => network.id === activeBuffer.networkId), activeBuffer.name);
   const channelConnected = activeBuffer?.kind === 'channel'
     && statuses[activeBuffer.networkId]?.state === 'connected';
+  readVisibleRef.current = auth === 'ready' && settingsTarget === null && !searchOpen
+    && !globalSettingsOpen && channelListView === null && jump === null;
+  const updateUnread = useCallback((update: (current: Record<number, BufferUnread>) => Record<number, BufferUnread>) => {
+    const next = update(unreadRef.current);
+    if (next !== unreadRef.current) {
+      unreadRef.current = next;
+      setUnread(next);
+    }
+  }, []);
+  const knownUnread = useCallback((bufferId: number, marker: number) => {
+    let messages = 0;
+    let mentions = 0;
+    for (const [id, entry] of recentMessages.current) {
+      if (entry.bufferId === bufferId && id > marker) {
+        messages++;
+        if (entry.mention) mentions++;
+      }
+    }
+    return { messages, mentions, lastReadId: marker };
+  }, []);
+  const advanceRead = useCallback((bufferId: number, marker: number) => {
+    const previous = unreadRef.current[bufferId]?.lastReadId ?? 0;
+    if (marker <= previous) return false;
+    updateUnread((current) => ({ ...current, [bufferId]: knownUnread(bufferId, marker) }));
+    return true;
+  }, [knownUnread, updateUnread]);
+  const clearReadTimer = useCallback(() => {
+    if (readTimer.current !== null) window.clearTimeout(readTimer.current);
+    readTimer.current = null;
+  }, []);
+  const resetSyncedSettings = useCallback(() => {
+    settingsGeneration.current++;
+    settingsRevision.current++;
+    settingsEventRevision.current++;
+    userRef.current = null;
+    for (const entry of pendingSettings.current) entry.settle(false);
+    pendingSettings.current = [];
+    serverSettingsRef.current = defaultSyncedSettings;
+    readGeneration.current++;
+    clearReadTimer();
+    readPending.current = null;
+    readBottomRef.current = null;
+    readInFlight.current = false;
+    recentMessages.current.clear();
+    unreadRef.current = {};
+    setUnread({});
+    settingsRef.current = defaultSyncedSettings;
+    setSyncedSettings(defaultSyncedSettings);
+  }, [clearReadTimer]);
+  const applyServerSettings = useCallback((settings: SyncedSettings) => {
+    serverSettingsRef.current = settings;
+    const next = { ...settings };
+    for (const entry of pendingSettings.current) Object.assign(next, entry.patch);
+    settingsRef.current = next;
+    setSyncedSettings(next);
+  }, []);
   const sessionExpired = useCallback(() => {
+    bootstrapRequest.current++;
+    resetSyncedSettings();
     setAuth('login');
+    setUser(null);
+    setPassword('');
     setLoginError('Your session expired. Sign in again.');
     setDialog(null);
     setMenu(null);
-  }, []);
+  }, [resetSyncedSettings]);
   const fail = useCallback((error: unknown) => {
     if (error instanceof ApiError && error.status === 401) sessionExpired();
     else setNotice(errorText(error));
   }, [sessionExpired]);
+
+  const saveSettings = useCallback(async (generation: number) => {
+    if (settingsSaving.current) return;
+    settingsSaving.current = true;
+    try {
+      while (generation === settingsGeneration.current && pendingSettings.current.length) {
+        const entry = pendingSettings.current[0];
+        const eventRevision = settingsEventRevision.current;
+        try {
+          const result = await api<SyncedSettings>('/api/settings', json('PATCH', entry.patch));
+          if (generation !== settingsGeneration.current) return;
+          pendingSettings.current.shift();
+          if (settingsEventRevision.current === eventRevision) {
+            settingsRevision.current++;
+            applyServerSettings(result);
+          } else applyServerSettings(serverSettingsRef.current);
+          entry.settle(true);
+        } catch (error) {
+          if (generation !== settingsGeneration.current) return;
+          pendingSettings.current.shift();
+          applyServerSettings(serverSettingsRef.current);
+          entry.settle(false);
+          fail(error);
+        }
+      }
+    } finally {
+      settingsSaving.current = false;
+      // An old account's request may finish after a new account has queued an edit.
+      if (pendingSettings.current.length && generation !== settingsGeneration.current) {
+        void saveSettings(settingsGeneration.current);
+      }
+    }
+  }, [applyServerSettings, fail]);
+
+  const updateSettings = useCallback((patch: Partial<SyncedSettings>): Promise<boolean> => {
+    if (!userRef.current) return Promise.resolve(false);
+    return new Promise<boolean>((settle) => {
+      pendingSettings.current.push({ patch, settle });
+      settingsRevision.current++;
+      applyServerSettings(serverSettingsRef.current);
+      void saveSettings(settingsGeneration.current);
+    });
+  }, [applyServerSettings, saveSettings]);
+  function removeSettingId(field: 'hiddenBuffers' | 'collapsedNetworks', id: number) {
+    const current = settingsRef.current[field];
+    if (current.includes(id)) updateSettings({ [field]: current.filter((item) => item !== id) });
+  }
+
+  function toggleSettingId(field: 'mutedBuffers' | 'mutedNetworks' | 'collapsedNetworks', id: number) {
+    const current = settingsRef.current[field];
+    updateSettings({ [field]: current.includes(id) ? current.filter((item) => item !== id) : [...current, id] });
+  }
+
 
   function openMenu(event: ReactMouseEvent<HTMLElement>, subject: MenuSubject) {
     event.preventDefault();
@@ -242,8 +420,75 @@ export default function App() {
 
   const refreshBootstrap = useCallback(async (signal?: AbortSignal) => {
     const request = ++bootstrapRequest.current;
+    const settingsAtStart = settingsRevision.current;
+    const accountAtStart = settingsGeneration.current;
     const data = await api<Bootstrap>('/api/bootstrap', { signal });
-    if (signal?.aborted || request !== bootstrapRequest.current) return data;
+    if (signal?.aborted || request !== bootstrapRequest.current || accountAtStart !== settingsGeneration.current) return data;
+    if (userRef.current && userRef.current.id !== data.user.id) resetSyncedSettings();
+    userRef.current = data.user;
+    if (settingsAtStart === settingsRevision.current || serverSettingsRef.current === defaultSyncedSettings) {
+      applyServerSettings(data.settings);
+      if (!data.settingsConfigured && !migrationAttempted.current.has(data.user.id)) {
+        migrationAttempted.current.add(data.user.id);
+        const userId = data.user.id;
+        const generation = settingsGeneration.current;
+        void (async () => {
+          const recheckRevision = settingsRevision.current;
+          const migrate = async () => {
+            // Recheck under the cross-tab lock: another tab may have migrated after our bootstrap.
+            const fresh = await api<Bootstrap>('/api/bootstrap');
+            if (generation !== settingsGeneration.current || userRef.current?.id !== userId) return;
+            if (fresh.settingsConfigured) {
+              if (recheckRevision === settingsRevision.current) applyServerSettings(fresh.settings);
+              return;
+            }
+            let owner: string | null = null;
+            try { owner = localStorage.getItem('lingo-legacy-settings-owner'); } catch { /* Storage may be disabled. */ }
+            if (owner !== null && owner !== String(userId)) return;
+            const legacy = legacySettings();
+            for (const field of ['mutedBuffers', 'hiddenBuffers'] as const) {
+              if (legacy[field]) legacy[field] = legacy[field].filter((id) => fresh.buffers.some((buffer) => buffer.id === id));
+            }
+            for (const field of ['mutedNetworks', 'collapsedNetworks'] as const) {
+              if (legacy[field]) legacy[field] = legacy[field].filter((id) => fresh.networks.some((network) => network.id === id));
+            }
+            if (!Object.keys(legacy).length) {
+              if (owner === null || owner === String(userId)) clearLegacySettings();
+              return;
+            }
+            try { localStorage.setItem('lingo-legacy-settings-owner', String(userId)); } catch { /* Storage may be disabled. */ }
+            if (await updateSettings(legacy) && generation === settingsGeneration.current) clearLegacySettings();
+          };
+          try {
+            if (navigator.locks) await navigator.locks.request(`lingo-settings-migration-${userId}`, migrate);
+            else await migrate();
+          } catch (error) {
+            if (generation === settingsGeneration.current) fail(error);
+          }
+        })();
+      }
+    }
+    setUser(data.user);
+    updateUnread((current) => {
+      const next: Record<number, BufferUnread> = {};
+      for (const buffer of data.buffers) {
+        const snapshot = data.unread[buffer.id] ?? { messages: 0, mentions: 0, lastReadId: 0 };
+        const previous = current[buffer.id];
+        if (previous && previous.lastReadId > snapshot.lastReadId) {
+          next[buffer.id] = previous;
+          continue;
+        }
+        const known = knownUnread(buffer.id, snapshot.lastReadId);
+        next[buffer.id] = {
+          lastReadId: snapshot.lastReadId,
+          messages: Math.max(snapshot.messages, known.messages,
+            previous?.lastReadId === snapshot.lastReadId ? previous.messages : 0),
+          mentions: Math.max(snapshot.mentions, known.mentions,
+            previous?.lastReadId === snapshot.lastReadId ? previous.mentions : 0),
+        };
+      }
+      return next;
+    });
     setNetworks((current) => data.networks.map((network) => {
       const previous = current.find((item) => item.id === network.id);
       return previous && JSON.stringify(previous) === JSON.stringify(network) ? previous : network;
@@ -252,22 +497,106 @@ export default function App() {
     setStatuses(data.statuses);
     setIgnores(data.ignores);
     setSelectedId((current) => {
-      if (current !== null && data.buffers.some((buffer) => buffer.id === current && !hiddenBuffersRef.current.includes(buffer.id))) return current;
+      if (current !== null && data.buffers.some((buffer) => buffer.id === current && !settingsRef.current.hiddenBuffers.includes(buffer.id))) return current;
       return (data.buffers.find((buffer) => buffer.kind === 'server')
-        ?? data.buffers.find((buffer) => !hiddenBuffersRef.current.includes(buffer.id)))?.id ?? null;
+        ?? data.buffers.find((buffer) => !settingsRef.current.hiddenBuffers.includes(buffer.id)))?.id ?? null;
     });
     return data;
-  }, []);
+  }, [applyServerSettings, fail, knownUnread, resetSyncedSettings, updateSettings, updateUnread]);
+  const sendRead = useCallback(() => {
+    readTimer.current = null;
+    const pending = readPending.current;
+    if (!pending || readInFlight.current) return;
+    const snapshot = viewRef.current;
+    if (!readVisibleRef.current || document.visibilityState !== 'visible'
+      || selectedRef.current !== pending.bufferId || snapshot.bufferId !== pending.bufferId
+      || snapshot.loading || jumpRef.current || !readBottomRef.current?.atBottom
+      || readBottomRef.current.bufferId !== pending.bufferId) {
+      readPending.current = null;
+      return;
+    }
+    const messageId = Math.min(pending.messageId, snapshot.messages.at(-1)?.id ?? 0);
+    readPending.current = null;
+    if (messageId <= (unreadRef.current[pending.bufferId]?.lastReadId ?? 0)) return;
+    const accountId = userRef.current?.id;
+    const generationAtSend = readGeneration.current;
+    readInFlight.current = true;
+    lastReadSentAt.current = Date.now();
+    void api<{ lastReadId: number }>(`/api/buffers/${pending.bufferId}/read`, json('PUT', { messageId }))
+      .then((result) => {
+        if (generationAtSend !== readGeneration.current || accountId !== userRef.current?.id) return;
+        if (advanceRead(pending.bufferId, result.lastReadId)) {
+          void refreshBootstrap().catch(fail);
+        }
+      }).catch((error: unknown) => {
+        if (generationAtSend === readGeneration.current) fail(error);
+      }).finally(() => {
+        if (generationAtSend !== readGeneration.current) return;
+        readInFlight.current = false;
+        if (readPending.current) {
+          readTimer.current = window.setTimeout(sendRead, Math.max(0, 1000 - (Date.now() - lastReadSentAt.current)));
+        }
+      });
+  }, [advanceRead, fail, refreshBootstrap]);
+  const requestRead = useCallback(() => {
+    const bufferId = selectedRef.current;
+    const snapshot = viewRef.current;
+    if (bufferId === null || !readVisibleRef.current || document.visibilityState !== 'visible'
+      || snapshot.bufferId !== bufferId || snapshot.loading || jumpRef.current
+      || readBottomRef.current?.bufferId !== bufferId || !readBottomRef.current.atBottom) return;
+    const messageId = snapshot.messages.at(-1)?.id;
+    if (messageId === undefined || messageId <= (unreadRef.current[bufferId]?.lastReadId ?? 0)) return;
+    const pending = readPending.current;
+    readPending.current = { bufferId, messageId: pending?.bufferId === bufferId ? Math.max(messageId, pending.messageId) : messageId };
+    if (readTimer.current === null && !readInFlight.current) {
+      readTimer.current = window.setTimeout(sendRead, Math.max(0, 1000 - (Date.now() - lastReadSentAt.current)));
+    }
+  }, [sendRead]);
+  const onTranscriptBottom = useCallback((bufferId: number, atBottom: boolean) => {
+    readBottomRef.current = { bufferId, atBottom };
+    if (atBottom) requestRead();
+    else if (readPending.current?.bufferId === bufferId) readPending.current = null;
+  }, [requestRead]);
+  const selectedUnread = selectedId === null ? undefined : unread[selectedId];
+  // The divider stays where the buffer's marker was when unread lines first appeared during
+  // this visit, so reading them (which advances the marker) does not remove it.
+  useEffect(() => {
+    setDivider((current) => {
+      if (selectedId === null) return null;
+      if (current?.bufferId === selectedId) return current;
+      return selectedUnread?.messages ? { bufferId: selectedId, after: selectedUnread.lastReadId } : null;
+    });
+  }, [selectedId, selectedUnread]);
+
+  /** Bootstraps the session; when signed out, asks the server whether the admin account still needs to be created. */
+  const openSession = useCallback(async (signal?: AbortSignal) => {
+    try {
+      await refreshBootstrap(signal);
+      if (!signal?.aborted) setAuth('ready');
+      return;
+    } catch (error) {
+      if (signal?.aborted) return;
+      if (!(error instanceof ApiError && error.status === 401)) {
+        setLoginError(errorText(error));
+        setAuth('unavailable');
+        return;
+      }
+    }
+    try {
+      const status = await api<SetupStatus>('/api/setup', { signal });
+      if (!signal?.aborted) setAuth(status.required ? 'setup' : 'login');
+    } catch (error) {
+      if (signal?.aborted) return;
+      setLoginError(errorText(error));
+      setAuth('unavailable');
+    }
+  }, [refreshBootstrap]);
 
   useEffect(() => {
     const controller = new AbortController();
-    void refreshBootstrap(controller.signal).then(() => setAuth('ready')).catch((error: unknown) => {
-      if (controller.signal.aborted) return;
-      setAuth(error instanceof ApiError && error.status === 401 ? 'login' : 'unavailable');
-      if (!(error instanceof ApiError && error.status === 401)) setLoginError(errorText(error));
-    });
+    void openSession(controller.signal);
     return () => controller.abort();
-  }, [refreshBootstrap]);
+  }, [openSession]);
   useEffect(() => {
     applyAppearance(preferences);
     savePreferences(preferences);
@@ -283,26 +612,55 @@ export default function App() {
   }, []);
   useEffect(() => {
     try {
-      localStorage.setItem('lingo-collapsed-networks', JSON.stringify(collapsedNetworks));
-      localStorage.setItem('lingo-hidden-buffers', JSON.stringify(hiddenBuffers));
-      localStorage.setItem('lingo-muted-buffers', JSON.stringify(mutedBuffers));
-      localStorage.setItem('lingo-muted-networks', JSON.stringify(mutedNetworks));
       localStorage.setItem('lingo-channel-lists', JSON.stringify(channelListTabs));
     } catch { /* Storage may be disabled. */ }
-  }, [collapsedNetworks, hiddenBuffers, mutedBuffers, mutedNetworks, channelListTabs]);
+  }, [channelListTabs]);
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!password || loginPending) return;
+    const name = username.trim();
+    if (!name || !password || loginPending) return;
     setLoginPending(true);
     setLoginError('');
     try {
-      await api<unknown>('/api/login', json('POST', { password }));
+      await api<unknown>('/api/login', json('POST', { username: name, password }));
       await refreshBootstrap();
       setPassword('');
       setAuth('ready');
     } catch (error) {
-      setLoginError(errorText(error));
+      if (error instanceof ApiError && error.status === 409) {
+        setPassword('');
+        setAuth('setup');
+      } else setLoginError(errorText(error));
+    } finally {
+      setLoginPending(false);
+    }
+  }
+
+  async function setup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = username.trim();
+    if (!name || !password || loginPending) return;
+    setLoginError('');
+    if (password !== confirmPassword) {
+      setLoginError('Passwords do not match.');
+      return;
+    }
+    setLoginPending(true);
+    try {
+      await api<unknown>('/api/setup', json('POST', { username: name, password, token: setupToken }));
+      await refreshBootstrap();
+      setPassword('');
+      setConfirmPassword('');
+      setSetupToken('');
+      setAuth('ready');
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        setPassword('');
+        setConfirmPassword('');
+        setAuth('login');
+        setLoginError('The admin account already exists. Sign in instead.');
+      } else setLoginError(errorText(error));
     } finally {
       setLoginPending(false);
     }
@@ -311,14 +669,25 @@ export default function App() {
   async function logout() {
     try {
       await api<unknown>('/api/logout', { method: 'POST' });
+      void forgetPush().catch(() => {});
+      bootstrapRequest.current++;
+      resetSyncedSettings();
       setAuth('login');
+      setUser(null);
+      setUsername('');
+      setPassword('');
+      setLoginError('');
       setNetworks([]);
       setBuffers([]);
+      setStatuses({});
+      setIgnores({});
       setSelectedId(null);
       setView({ bufferId: null, messages: [], hasMore: false, loading: false, error: '' });
       setSettingsTarget(null);
       setGlobalSettingsOpen(false);
       setSearchOpen(false);
+      setDialog(null);
+      setMenu(null);
       setNotice('');
     } catch (error) {
       fail(error);
@@ -430,7 +799,10 @@ export default function App() {
           const order = receivedMessageOrder.current;
           const slot = receivedMessageCursor.current % 2000;
           const expired = order[slot];
-          if (expired !== undefined) receivedMessageIds.current.delete(expired);
+          if (expired !== undefined) {
+            receivedMessageIds.current.delete(expired);
+            recentMessages.current.delete(expired);
+          }
           order[slot] = event.message.id;
           receivedMessageIds.current.add(event.message.id);
           receivedMessageCursor.current++;
@@ -450,31 +822,31 @@ export default function App() {
             });
           }
           const buffer = buffersRef.current.find((item) => item.id === event.message.bufferId);
-          if (buffer?.kind === 'query' && hiddenBuffersRef.current.includes(buffer.id)) {
-            hiddenBuffersRef.current = hiddenBuffersRef.current.filter((id) => id !== buffer.id);
-            setHiddenBuffers(hiddenBuffersRef.current);
-          }
-          const network = buffer && networksRef.current.find((item) => item.id === buffer.networkId);
+          if (buffer?.kind === 'query') removeSettingId('hiddenBuffers', buffer.id);
+          const network = networksRef.current.find((item) => item.id === event.message.networkId);
           const identity = network && event.message.nick
             ? displayIdentity(event.message, network.relayNicks, network.displayNames) : null;
           const ownNames = network
             ? [...new Set([statusesRef.current[network.id]?.nick, network.nick, ...network.mentionAliases].filter(Boolean))] as string[]
             : [];
           const sender = identity?.mentionTarget ?? event.message.nick;
-          const inbound = !!identity && !!sender && (event.message.kind === 'privmsg'
-            || event.message.kind === 'action' || event.message.kind === 'notice')
-            && !ownNames.some((name) => name.toLowerCase() === sender.toLowerCase());
-          const highlight = inbound && identity !== null && (mentionsAny(identity.text, ownNames)
-            || preferencesRef.current.highlights.some((phrase) => identity.text.toLowerCase().includes(phrase.toLowerCase())));
-          const muted = mutedRef.current.buffers.includes(event.message.bufferId)
-            || (!!buffer && mutedRef.current.networks.includes(buffer.networkId));
-          if (!muted && (selectedRef.current !== event.message.bufferId || jumpRef.current)) {
-            setUnread((current) => ({ ...current, [event.message.bufferId]: (current[event.message.bufferId] ?? 0) + 1 }));
-            if (highlight || inbound && buffer?.kind === 'query') {
-              setMentionUnread((current) => ({ ...current, [event.message.bufferId]: (current[event.message.bufferId] ?? 0) + 1 }));
-            }
+          const own = !!sender && ownNames.some((name) => name.toLowerCase() === sender.toLowerCase());
+          const inbound = !own && !!sender && !event.message.fromNetwork
+            && (event.message.kind === 'privmsg' || event.message.kind === 'action' || event.message.kind === 'notice');
+          const highlight = inbound && (event.message.highlight === true || buffer?.kind === 'query');
+          if (!own) {
+            recentMessages.current.set(event.message.id, { bufferId: event.message.bufferId, mention: highlight });
+            updateUnread((current) => {
+              const previous = current[event.message.bufferId] ?? { messages: 0, mentions: 0, lastReadId: 0 };
+              if (event.message.id <= previous.lastReadId) return current;
+              return { ...current, [event.message.bufferId]: {
+                ...previous, messages: previous.messages + 1, mentions: previous.mentions + Number(highlight),
+              } };
+            });
           }
-          if (!muted && identity && inbound && (highlight || buffer?.kind === 'query')) {
+          const muted = settingsRef.current.mutedBuffers.includes(event.message.bufferId)
+            || (!!buffer && settingsRef.current.mutedNetworks.includes(buffer.networkId));
+          if (!muted && identity && highlight) {
             const settings = preferencesRef.current;
             if (settings.browserNotifications && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
               try {
@@ -513,17 +885,13 @@ export default function App() {
           if (!buffer) {
             void refreshBootstrap(controller.signal).then((data) => {
               if (controller.signal.aborted || !data.buffers.some((item) => item.id === event.message.bufferId && item.kind === 'query')) return;
-              hiddenBuffersRef.current = hiddenBuffersRef.current.filter((id) => id !== event.message.bufferId);
-              setHiddenBuffers(hiddenBuffersRef.current);
+              removeSettingId('hiddenBuffers', event.message.bufferId);
             }).catch((error: unknown) => { if (!controller.signal.aborted) fail(error); });
           }
           break;
         }
         case 'buffer':
-          if (event.buffer.kind === 'query' && hiddenBuffersRef.current.includes(event.buffer.id)) {
-            hiddenBuffersRef.current = hiddenBuffersRef.current.filter((id) => id !== event.buffer.id);
-            setHiddenBuffers(hiddenBuffersRef.current);
-          }
+          if (event.buffer.kind === 'query') removeSettingId('hiddenBuffers', event.buffer.id);
           setBuffers((current) => current.some((buffer) => buffer.id === event.buffer.id)
             ? current.map((buffer) => buffer.id === event.buffer.id ? event.buffer : buffer)
             : [...current, event.buffer]);
@@ -532,8 +900,10 @@ export default function App() {
           const remaining = buffersRef.current.filter((buffer) => buffer.id !== event.bufferId);
           setBuffers(remaining);
           setSelectedId((selected) => selected === event.bufferId ? (remaining[0]?.id ?? null) : selected);
-          setUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
-          setMentionUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
+          updateUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
+          for (const [id, entry] of recentMessages.current) {
+            if (entry.bufferId === event.bufferId) recentMessages.current.delete(id);
+          }
           break;
         }
         case 'network':
@@ -550,6 +920,15 @@ export default function App() {
           setStatuses((current) => { const next = { ...current }; delete next[event.networkId]; return next; });
           setChannelListTabs((current) => current.filter((id) => id !== event.networkId));
           setChannelListView((current) => current === event.networkId ? null : current);
+          const removed = new Set(buffersRef.current.filter((buffer) => buffer.networkId === event.networkId).map((buffer) => buffer.id));
+          updateUnread((current) => {
+            const next = { ...current };
+            for (const id of removed) delete next[id];
+            return next;
+          });
+          for (const [id, entry] of recentMessages.current) {
+            if (removed.has(entry.bufferId)) recentMessages.current.delete(id);
+          }
           break;
         }
         case 'channel_state':
@@ -561,14 +940,30 @@ export default function App() {
         case 'history_cleared':
           setView((current) => current.bufferId === event.bufferId ? { ...current, messages: [], hasMore: false } : current);
           setJump((current) => current?.bufferId === event.bufferId ? null : current);
-          setUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
-          setMentionUnread((current) => { const next = { ...current }; delete next[event.bufferId]; return next; });
+          updateUnread((current) => ({ ...current,
+            [event.bufferId]: { messages: 0, mentions: 0, lastReadId: current[event.bufferId]?.lastReadId ?? 0 },
+          }));
+          for (const [id, entry] of recentMessages.current) {
+            if (entry.bufferId === event.bufferId) recentMessages.current.delete(id);
+          }
+          void refreshBootstrap(controller.signal).catch((error: unknown) => { if (!controller.signal.aborted) fail(error); });
+          break;
+        case 'read':
+          if (advanceRead(event.bufferId, event.lastReadId)) {
+            void refreshBootstrap(controller.signal).catch((error: unknown) => { if (!controller.signal.aborted) fail(error); });
+          }
           break;
         case 'channel_list':
           setChannelLists((current) => ({ ...current, [event.status.networkId]: event.status }));
           break;
         case 'ignores':
           setIgnores((current) => ({ ...current, [event.networkId]: event.ignores }));
+          break;
+        case 'settings':
+          if (event.userId !== userRef.current?.id) break;
+          settingsRevision.current++;
+          settingsEventRevision.current++;
+          applyServerSettings(event.settings);
           break;
       }
     }
@@ -609,7 +1004,7 @@ export default function App() {
       messageQueue.current = [];
       socket?.close();
     };
-  }, [auth, fail, refreshBootstrap]);
+  }, [auth, advanceRead, applyServerSettings, fail, refreshBootstrap, updateUnread]);
 
   useEffect(() => {
     if (auth !== 'ready') return;
@@ -617,14 +1012,8 @@ export default function App() {
     const controller = new AbortController();
     const currentGeneration = ++generation.current;
     setOlderPending(false);
-    setUnread((current) => {
-      if (bufferId === null || !current[bufferId]) return current;
-      const next = { ...current }; delete next[bufferId]; return next;
-    });
-    setMentionUnread((current) => {
-      if (bufferId === null || !current[bufferId]) return current;
-      const next = { ...current }; delete next[bufferId]; return next;
-    });
+    readBottomRef.current = null;
+    readPending.current = null;
     setView({ bufferId, messages: [], hasMore: false, loading: bufferId !== null, error: '' });
     if (bufferId !== null) {
       const before = jump?.bufferId === bufferId ? jump.messageId + 1 : undefined;
@@ -641,6 +1030,26 @@ export default function App() {
     }
     return () => controller.abort();
   }, [auth, selectedId, jump, reloadSerial, fail]);
+  useEffect(() => {
+    requestRead();
+  }, [auth, selectedId, view, settingsTarget, searchOpen, globalSettingsOpen, channelListView, jump, requestRead]);
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') requestRead();
+      else {
+        clearReadTimer();
+        readPending.current = null;
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      clearReadTimer();
+      readPending.current = null;
+      readGeneration.current++;
+      readInFlight.current = false;
+    };
+  }, [clearReadTimer, requestRead]);
   useEffect(() => {
     const controller = new AbortController();
     const version = ++channelStateVersion.current;
@@ -674,8 +1083,7 @@ export default function App() {
   }, [channelDetails]);
 
   function selectBuffer(id: number) {
-    hiddenBuffersRef.current = hiddenBuffersRef.current.filter((bufferId) => bufferId !== id);
-    setHiddenBuffers(hiddenBuffersRef.current);
+    removeSettingId('hiddenBuffers', id);
     setMenu(null);
     setChannelListView(null);
     setJump(null);
@@ -686,10 +1094,33 @@ export default function App() {
     setGlobalSettingsOpen(false);
     setSidebarOpen(false);
     setNotice('');
-    setUnread((current) => { const next = { ...current }; delete next[id]; return next; });
-    setMentionUnread((current) => { const next = { ...current }; delete next[id]; return next; });
+    readBottomRef.current = null;
+    readPending.current = null;
     document.querySelector<HTMLInputElement>('.composer input')?.focus();
   }
+  const selectBufferRef = useRef(selectBuffer);
+  selectBufferRef.current = selectBuffer;
+  const requestedBuffer = useRef(launchBuffer);
+  useEffect(() => {
+    if (auth !== 'ready' || requestedBuffer.current === null) return;
+    const id = requestedBuffer.current;
+    requestedBuffer.current = null;
+    if (buffers.some((buffer) => buffer.id === id)) selectBufferRef.current(id);
+  }, [auth, buffers]);
+  useEffect(() => {
+    if (auth !== 'ready' || !pushSupported()) return;
+    void registerServiceWorker().then(() => syncPush())
+      .catch(() => setNotice('Could not renew push notifications on this device.'));
+    const openBuffer = (event: MessageEvent) => {
+      const data: unknown = event.data;
+      if (!data || typeof data !== 'object' || !('type' in data) || data.type !== 'open-buffer' ||
+        !('bufferId' in data) || typeof data.bufferId !== 'number') return;
+      const id = data.bufferId;
+      if (buffersRef.current.some((buffer) => buffer.id === id)) selectBufferRef.current(id);
+    };
+    navigator.serviceWorker.addEventListener('message', openBuffer);
+    return () => navigator.serviceWorker.removeEventListener('message', openBuffer);
+  }, [auth]);
 
   async function loadOlder() {
     if (olderRequest.current || view.bufferId !== selectedId || selectedId === null || view.loading || !view.hasMore) return;
@@ -801,9 +1232,10 @@ export default function App() {
         }
         return updated;
       });
-      hiddenBuffersRef.current = hiddenBuffersRef.current.filter((id) => !joined.some((buffer) => buffer.id === id));
-      setHiddenBuffers(hiddenBuffersRef.current);
-      setCollapsedNetworks((current) => current.filter((id) => id !== networkId));
+      const joinedIds = joined.map((buffer) => buffer.id);
+      const stillHidden = settingsRef.current.hiddenBuffers.filter((id) => !joinedIds.includes(id));
+      if (stillHidden.length !== settingsRef.current.hiddenBuffers.length) updateSettings({ hiddenBuffers: stillHidden });
+      removeSettingId('collapsedNetworks', networkId);
       await refreshBootstrap();
       setJoinName('');
       setJoinNetworkId(null);
@@ -852,12 +1284,13 @@ export default function App() {
       if (buffer.kind === 'channel' && isJoined(networks.find((item) => item.id === buffer.networkId), buffer.name)) {
         await api<unknown>(`/api/buffers/${buffer.id}`, { method: 'DELETE' });
       }
-      hiddenBuffersRef.current = [...new Set([...hiddenBuffersRef.current, buffer.id])];
-      setHiddenBuffers(hiddenBuffersRef.current);
+      if (!settingsRef.current.hiddenBuffers.includes(buffer.id)) {
+        updateSettings({ hiddenBuffers: [...settingsRef.current.hiddenBuffers, buffer.id] });
+      }
       if (selectedRef.current === buffer.id) {
         setJump(null);
         setSelectedId((buffers.find((item) => item.networkId === buffer.networkId && item.kind === 'server')
-          ?? buffers.find((item) => item.id !== buffer.id && !hiddenBuffersRef.current.includes(item.id)))?.id ?? null);
+          ?? buffers.find((item) => item.id !== buffer.id && !settingsRef.current.hiddenBuffers.includes(item.id)))?.id ?? null);
       }
       if (buffer.kind === 'channel') await refreshBootstrap();
     } catch (error) {
@@ -893,7 +1326,7 @@ export default function App() {
 
   function openChannelList(networkId: number, refresh: boolean) {
     setChannelListTabs((current) => current.includes(networkId) ? current : [...current, networkId]);
-    setCollapsedNetworks((current) => current.filter((id) => id !== networkId));
+    removeSettingId('collapsedNetworks', networkId);
     setChannelListView(networkId);
     setSearchOpen(false);
     setSettingsTarget(null);
@@ -948,7 +1381,7 @@ export default function App() {
     try {
       const buffer = await api<ChatBuffer>('/api/buffers/query', json('POST', { networkId, nick }));
       setBuffers((current) => current.some((item) => item.id === buffer.id) ? current : [...current, buffer]);
-      setCollapsedNetworks((current) => current.filter((id) => id !== networkId));
+      removeSettingId('collapsedNetworks', networkId);
       selectBuffer(buffer.id);
     } catch (error) {
       fail(error);
@@ -966,10 +1399,6 @@ export default function App() {
     }
   }
 
-  function toggleId(setter: typeof setMutedBuffers, id: number) {
-    setter((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
-  }
-
   function menuItems(target: MenuTarget): { label: string; items: MenuItem[] } | null {
     if (target.kind === 'network') {
       const network = networks.find((item) => item.id === target.networkId);
@@ -982,7 +1411,7 @@ export default function App() {
           setSettingsTarget(network.id); setSearchOpen(false); setGlobalSettingsOpen(false); setSidebarOpen(false);
         } },
         { label: 'Join a channel', onSelect: () => {
-          setCollapsedNetworks((current) => current.filter((id) => id !== network.id));
+          removeSettingId('collapsedNetworks', network.id);
           setJoinNetworkId(network.id);
           setJoinError('');
         } },
@@ -991,8 +1420,8 @@ export default function App() {
         offline
           ? { label: 'Connect', onSelect: () => void setNetworkConnected(network.id, true) }
           : { label: 'Disconnect', onSelect: () => void setNetworkConnected(network.id, false) },
-        { label: mutedNetworks.includes(network.id) ? 'Unmute network' : 'Mute network',
-          onSelect: () => toggleId(setMutedNetworks, network.id) },
+        { label: syncedSettings.mutedNetworks.includes(network.id) ? 'Unmute network' : 'Mute network',
+          onSelect: () => toggleSettingId('mutedNetworks', network.id) },
         { label: 'Remove', danger: true, onSelect: () => void removeNetwork(network) },
       ] };
     }
@@ -1009,13 +1438,13 @@ export default function App() {
     const buffer = buffers.find((item) => item.id === target.bufferId);
     if (!buffer || buffer.kind === 'server') return null;
     const network = networks.find((item) => item.id === buffer.networkId);
-    const muteLabel = `${mutedBuffers.includes(buffer.id) ? 'Unmute' : 'Mute'} ${buffer.kind === 'channel' ? 'channel' : 'conversation'}`;
+    const muteLabel = `${syncedSettings.mutedBuffers.includes(buffer.id) ? 'Unmute' : 'Mute'} ${buffer.kind === 'channel' ? 'channel' : 'conversation'}`;
     if (buffer.kind === 'query') {
       return { label: `${buffer.name} actions`, items: [
         { label: buffer.name, heading: true, onSelect: () => selectBuffer(buffer.id) },
         { label: 'User info', onSelect: () => setDialog({ kind: 'whois', networkId: buffer.networkId, nick: buffer.name }) },
         { label: 'Clear history', onSelect: () => void clearHistory(buffer) },
-        { label: muteLabel, onSelect: () => toggleId(setMutedBuffers, buffer.id) },
+        { label: muteLabel, onSelect: () => toggleSettingId('mutedBuffers', buffer.id) },
         { label: 'Close conversation', onSelect: () => void closeBuffer(buffer) },
       ] };
     }
@@ -1026,7 +1455,7 @@ export default function App() {
       { label: 'Edit topic', disabled: !live, onSelect: () => beginTopicEdit(buffer) },
       { label: 'List banned users', disabled: !live, onSelect: () => setDialog({ kind: 'bans', bufferId: buffer.id }) },
       { label: 'Clear history', onSelect: () => void clearHistory(buffer) },
-      { label: muteLabel, onSelect: () => toggleId(setMutedBuffers, buffer.id) },
+      { label: muteLabel, onSelect: () => toggleSettingId('mutedBuffers', buffer.id) },
       joined
         ? { label: 'Leave', danger: true, onSelect: () => void part(buffer) }
         : { label: 'Rejoin', onSelect: () => void joinChannel(buffer.networkId, buffer.name) },
@@ -1051,9 +1480,8 @@ export default function App() {
   }
 
   function jumpTo(message: ChatMessage) {
-    hiddenBuffersRef.current = hiddenBuffersRef.current.filter((id) => id !== message.bufferId);
-    setHiddenBuffers(hiddenBuffersRef.current);
-    setCollapsedNetworks((current) => current.filter((id) => id !== message.networkId));
+    removeSettingId('hiddenBuffers', message.bufferId);
+    removeSettingId('collapsedNetworks', message.networkId);
     setMenu(null);
     setChannelListView(null);
     setJump({ bufferId: message.bufferId, messageId: message.id, serial: ++jumpSerial.current });
@@ -1076,19 +1504,42 @@ export default function App() {
         {auth === 'unavailable' && <>
           <p className="error-text" role="alert">{loginError || 'Could not reach the server.'}</p>
           <button className="button button-primary" type="button" onClick={() => {
+            setLoginError('');
             setAuth('checking');
-            void refreshBootstrap().then(() => setAuth('ready')).catch((error: unknown) => {
-              setAuth(error instanceof ApiError && error.status === 401 ? 'login' : 'unavailable');
-              setLoginError(errorText(error));
-            });
+            void openSession();
           }}>Try again</button>
         </>}
-        {auth === 'login' && <form className="auth-form" onSubmit={login}>
-          <label htmlFor="login-password">Password</label>
-          <input id="login-password" type="password" autoComplete="current-password" autoFocus required value={password}
-            onChange={(event) => setPassword(event.target.value)} placeholder="Enter your password" />
+        {auth === 'setup' && <form className="auth-form" onSubmit={setup}>
+          <h2>Create admin account</h2>
+          <p className="muted auth-help">This account manages Lingo and creates accounts for other users.</p>
+          <label htmlFor="setup-token">Setup token</label>
+          <input id="setup-token" type="text" autoComplete="off" autoCapitalize="none" spellCheck={false} required
+            value={setupToken} onChange={(event) => setSetupToken(event.target.value)} />
+          <label htmlFor="setup-username">Username</label>
+          <input id="setup-username" autoComplete="username" autoCapitalize="none" spellCheck={false} autoFocus required
+            maxLength={32} pattern="[A-Za-z0-9_.\-]+" title="Letters, numbers, dots, dashes, and underscores"
+            value={username} onChange={(event) => setUsername(event.target.value)} />
+          <label htmlFor="setup-password">Password</label>
+          <input id="setup-password" type="password" autoComplete="new-password" required minLength={8} maxLength={1024}
+            value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" />
+          <label htmlFor="setup-confirm">Confirm password</label>
+          <input id="setup-confirm" type="password" autoComplete="new-password" required minLength={8} maxLength={1024}
+            value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
           {loginError && <p className="error-text" role="alert">{loginError}</p>}
-          <button className="button button-primary" type="submit" disabled={loginPending || !password}>
+          <button className="button button-primary" type="submit"
+            disabled={loginPending || !setupToken || !username.trim() || !password || !confirmPassword}>
+            {loginPending ? 'Creating…' : 'Create account'}
+          </button>
+        </form>}
+        {auth === 'login' && <form className="auth-form" onSubmit={login}>
+          <label htmlFor="login-username">Username</label>
+          <input id="login-username" autoComplete="username" autoCapitalize="none" spellCheck={false} autoFocus={!username}
+            required value={username} onChange={(event) => setUsername(event.target.value)} />
+          <label htmlFor="login-password">Password</label>
+          <input id="login-password" type="password" autoComplete="current-password" autoFocus={!!username} required
+            value={password} onChange={(event) => setPassword(event.target.value)} />
+          {loginError && <p className="error-text" role="alert">{loginError}</p>}
+          <button className="button button-primary" type="submit" disabled={loginPending || !username.trim() || !password}>
             {loginPending ? 'Signing in…' : 'Sign in'}
           </button>
         </form>}
@@ -1132,7 +1583,8 @@ export default function App() {
           onClick={() => { setGlobalSettingsOpen((open) => !open); setSettingsTarget(null); setSearchOpen(false); setSidebarOpen(false); }}>
           Settings
         </button>
-        <button className="button button-quiet logout-button" type="button" onClick={() => void logout()}>Sign out</button>
+        <button className="button button-quiet logout-button" type="button" title={user ? `Signed in as ${user.username}` : undefined}
+          onClick={() => void logout()}>Sign out</button>
       </div>
     </header>
     <div className="workspace">
@@ -1152,18 +1604,17 @@ export default function App() {
           const state = status?.state ?? 'disconnected';
           const server = buffers.find((buffer) => buffer.networkId === network.id && buffer.kind === 'server');
           const networkBuffers = buffers.filter((buffer) => buffer.networkId === network.id
-            && buffer.kind !== 'server' && !hiddenBuffers.includes(buffer.id))
+            && buffer.kind !== 'server' && !syncedSettings.hiddenBuffers.includes(buffer.id))
             .sort((a, b) => a.name.localeCompare(b.name));
-          const collapsed = collapsedNetworks.includes(network.id);
-          const networkMuted = mutedNetworks.includes(network.id);
+          const collapsed = syncedSettings.collapsedNetworks.includes(network.id);
+          const networkMuted = syncedSettings.mutedNetworks.includes(network.id);
           return <section className={`network-group${networkMuted ? ' network-muted' : ''}`} key={network.id} aria-label={`${network.name} network`}>
             <div className="network-heading" onContextMenu={(event) => openMenu(event, { kind: 'network', networkId: network.id })}>
               <span className={`status-dot status-${state}`} title={status?.error || state} aria-label={state} />
               <button className="network-collapse" type="button" aria-expanded={!collapsed}
                 aria-controls={`network-buffers-${network.id}`}
                 aria-label={`${collapsed ? 'Expand' : 'Collapse'} ${network.name} channels`}
-                onClick={() => setCollapsedNetworks((current) => collapsed
-                  ? current.filter((id) => id !== network.id) : [...current, network.id])}>
+                onClick={() => toggleSettingId('collapsedNetworks', network.id)}>
                 <span aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
               </button>
               {server && <button className={`network-server${selectedId === server.id ? ' buffer-active' : ''}`}
@@ -1171,10 +1622,10 @@ export default function App() {
                 onClick={() => selectBuffer(server.id)}>
                 <span className="network-server-prefix" aria-hidden="true">⌁</span>
                 <span className="network-name">{network.name}</span>
-                {!!mentionUnread[server.id] && <span className="unread-badge mention-badge"
-                  aria-label={`${mentionUnread[server.id]} unread mentions`}>{mentionUnread[server.id]}</span>}
-                {!!unread[server.id] && <span className="unread-badge"
-                  aria-label={`${unread[server.id]} unread messages`}>{unread[server.id]}</span>}
+                {!networkMuted && !syncedSettings.mutedBuffers.includes(server.id) && !!unread[server.id]?.mentions && <span className="unread-badge mention-badge"
+                  aria-label={`${unread[server.id].mentions} unread mentions`}>{unread[server.id].mentions}</span>}
+                {!networkMuted && !syncedSettings.mutedBuffers.includes(server.id) && !!unread[server.id]?.messages && <span className="unread-badge"
+                  aria-label={`${unread[server.id].messages} unread messages`}>{unread[server.id].messages}</span>}
               </button>}
               <button className="icon-button network-action" type="button" aria-label={`Join channel on ${network.name}`} title="Join channel"
                 onClick={() => {
@@ -1208,17 +1659,17 @@ export default function App() {
               </div>}
               {networkBuffers.map((buffer) => {
                 const parted = buffer.kind === 'channel' && !isJoined(network, buffer.name);
-                const muted = networkMuted || mutedBuffers.includes(buffer.id);
+                const muted = networkMuted || syncedSettings.mutedBuffers.includes(buffer.id);
                 return <div className={`buffer-entry${muted ? ' buffer-muted' : ''}`} key={buffer.id}
                   onContextMenu={(event) => openMenu(event, { kind: 'buffer', bufferId: buffer.id })}>
                   <button type="button" className={`buffer-item${selectedId === buffer.id && channelListView === null ? ' buffer-active' : ''}`}
                     aria-current={selectedId === buffer.id && channelListView === null ? 'page' : undefined} onClick={() => selectBuffer(buffer.id)}>
                     <span className="buffer-prefix">{buffer.kind === 'channel' ? '#' : buffer.kind === 'query' ? '@' : '⌁'}</span>
                     <span className="buffer-name">{buffer.kind === 'channel' ? buffer.name.replace(/^#/, '') : buffer.name}</span>
-                    {!!mentionUnread[buffer.id] && <span className="unread-badge mention-badge"
-                      aria-label={`${mentionUnread[buffer.id]} unread mentions`}>{mentionUnread[buffer.id]}</span>}
-                    {!!unread[buffer.id] && <span className="unread-badge"
-                      aria-label={`${unread[buffer.id]} unread messages`}>{unread[buffer.id]}</span>}
+                    {!muted && !!unread[buffer.id]?.mentions && <span className="unread-badge mention-badge"
+                      aria-label={`${unread[buffer.id].mentions} unread mentions`}>{unread[buffer.id].mentions}</span>}
+                    {!muted && !!unread[buffer.id]?.messages && <span className="unread-badge"
+                      aria-label={`${unread[buffer.id].messages} unread messages`}>{unread[buffer.id].messages}</span>}
                   </button>
                   {parted && <button type="button" className="buffer-rejoin" disabled={joining}
                     aria-label={`Rejoin ${buffer.name} on ${network.name}`} onClick={() => void joinChannel(buffer.networkId, buffer.name)}>↻</button>}
@@ -1242,11 +1693,11 @@ export default function App() {
           onSave={saveNetwork} onDelete={deleteNetwork} onClose={() => setSettingsTarget(null)} /></div>
         : searchOpen ? <SearchPanel networks={networks} buffers={buffers} initialBufferId={selectedId ?? undefined}
           onClose={() => setSearchOpen(false)} onJump={jumpTo} />
-        : globalSettingsOpen ? <div className="panel-scroll"><GlobalSettings preferences={preferences}
+        : globalSettingsOpen && user ? <div className="panel-scroll"><GlobalSettings user={user} preferences={preferences}
+          settings={syncedSettings} onSettingsChange={updateSettings}
           onChange={setPreferences} onEnableNotifications={enableNotifications} onSoundChange={changeSound}
           onClose={() => setGlobalSettingsOpen(false)} onUnauthorized={() => {
-            setAuth('login');
-            setLoginError('Your session expired. Sign in again.');
+            sessionExpired();
             setGlobalSettingsOpen(false);
           }} /></div>
         : channelListNetwork ? <ChannelListPanel key={channelListNetwork.id} network={channelListNetwork}
@@ -1313,7 +1764,9 @@ export default function App() {
             error={showingView ? view.error : ''} jumpId={jump?.bufferId === selected.id ? jump.messageId : null}
             onLoadOlder={loadOlder} onRetry={() => setReloadSerial((current) => current + 1)}
             onRename={beginRename} onNickMenu={(nick, x, y) => setMenu({ kind: 'user', networkId: selected.networkId, nick, x, y })}
-            preferences={preferences} theme={preferences.theme} />
+            preferences={preferences} highlights={syncedSettings.highlights} theme={preferences.theme}
+            dividerAfter={divider?.bufferId === selected.id ? divider.after : null}
+            onBottomChange={onTranscriptBottom} />
           <MentionComposer buffer={selected} disabled={!selectedJoined || sending}
             knownChannels={buffers.filter((buffer) => buffer.networkId === selected.networkId && buffer.kind === 'channel')
               .map((buffer) => buffer.name)}
