@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ChannelListPage, ChannelListStatus, Network } from '../shared/contracts';
 import { api, ApiError, errorText } from './api';
+import Icon from './Icon';
+import PaneHeader from './PaneHeader';
 
 const PAGE_LIMIT = 500;
 
@@ -55,50 +57,67 @@ export default function ChannelListPanel({
     : state === 'complete' ? `${total.toLocaleString()} channels${updatedAt ? ` · updated ${new Date(updatedAt).toLocaleTimeString()}` : ''}`
       : connected ? 'No channel list loaded yet.' : 'Connect to this network to list its channels.';
 
-  return <section className="channel-list-panel" aria-label={`Channel list for ${network.name}`}>
-    <header className="search-panel__header">
-      <div>
-        <span className="conversation-overline">{network.name} <span className="divider">/</span> channel list</span>
-        <h2 className="search-panel__title">Channel list</h2>
+  return <section className="channel-list-view" aria-label={`Channel list for ${network.name}`}>
+    <PaneHeader overline={network.name} title="Channel list" actions={<>
+      <button className="button button-small" type="button" onClick={onRefresh}
+        disabled={!connected || state === 'loading'}>
+        <Icon name="rotate" />{state === 'idle' ? 'Load channels' : 'Refresh'}
+      </button>
+      <button className="icon-button" type="button" aria-label="Close channel list" title="Close" onClick={onClose}>
+        <Icon name="x" />
+      </button>
+    </>} />
+    <div className="channel-list-view__toolbar">
+      <div className="channel-list-view__column">
+        <div className="channel-list-view__filter">
+          <Icon name="search" className="channel-list-view__filter-icon" />
+          <label className="sr-only" htmlFor={`channel-list-filter-${network.id}`}>Filter channels by name or topic</label>
+          <input id={`channel-list-filter-${network.id}`} type="search" value={query} autoComplete="off" spellCheck={false}
+            placeholder="Filter by name or topic…" onChange={(event) => setQuery(event.target.value)} />
+        </div>
+        <span className="channel-list-view__summary" role="status">
+          {state === 'loading' && <span className="status-dot status-connecting" aria-hidden="true" />}
+          {summary}
+        </span>
       </div>
-      <div className="conversation-actions">
-        <button className="button button-quiet" type="button" onClick={onRefresh}
-          disabled={!connected || state === 'loading'}>{state === 'idle' ? 'Load channels' : 'Refresh'}</button>
-        <button className="search-panel__close" type="button" aria-label="Close channel list" onClick={onClose}>×</button>
-      </div>
-    </header>
-    <div className="channel-list-panel__controls">
-      <label className="sr-only" htmlFor={`channel-list-filter-${network.id}`}>Filter channels by name or topic</label>
-      <input id={`channel-list-filter-${network.id}`} type="search" value={query} autoComplete="off"
-        placeholder="Filter by name or topic…" onChange={(event) => setQuery(event.target.value)} />
-      <span className="channel-list-panel__summary" role="status">{summary}</span>
     </div>
-    {error && <p className="error-text" role="alert">{error}</p>}
-    <div className="channel-list-panel__results">
-      {page && page.channels.length > 0 ? <table className="channel-list-table">
-        <thead><tr><th scope="col">Channel</th><th scope="col">Users</th><th scope="col">Topic</th></tr></thead>
-        <tbody>
-          {page.channels.map((channel) => {
-            const joined = isJoined(channel.name);
-            return <tr key={channel.name}>
-              <td>
-                <button className="text-button channel-list-table__name" type="button"
-                  title={joined ? `Open ${channel.name}` : `Join ${channel.name}`} onClick={() => onJoin(channel.name)}>
-                  {channel.name}
-                </button>
-                {joined && <span className="channel-list-table__joined">joined</span>}
-              </td>
-              <td className="channel-list-table__users">{channel.users.toLocaleString()}</td>
-              <td className="channel-list-table__topic" title={channel.topic}>{channel.topic}</td>
-            </tr>;
-          })}
-        </tbody>
-      </table> : page && state !== 'idle' && <p className="search-panel__status">
-        {state === 'loading' ? 'Waiting for channels…' : debouncedQuery ? 'No matching channels.' : 'The server returned no channels.'}
-      </p>}
-      {page && page.matched > page.channels.length && <p className="search-panel__status">
-        Showing the {page.channels.length.toLocaleString()} largest of {page.matched.toLocaleString()} matching channels. Refine the filter to see more.
-      </p>}
+    <div className="pane-body channel-list-view__results">
+      <div className="channel-list-view__column">
+        {error && <p className="error-text channel-list-view__error" role="alert">{error}</p>}
+        {page && page.channels.length > 0 ? <table className="channel-list-table">
+          <thead><tr>
+            <th scope="col">Channel</th>
+            <th scope="col" className="channel-list-table__users">Users</th>
+            <th scope="col" className="channel-list-table__topic">Topic</th>
+            <th scope="col" className="channel-list-table__action"><span className="sr-only">Action</span></th>
+          </tr></thead>
+          <tbody>
+            {page.channels.map((channel) => {
+              const joined = isJoined(channel.name);
+              return <tr key={channel.name} className={joined ? 'channel-list-table__row--joined' : undefined}>
+                <td className="channel-list-table__channel">
+                  <span className="channel-list-table__name">{channel.name}</span>
+                  {joined && <span className="badge badge-accent channel-list-table__joined">joined</span>}
+                  {channel.topic && <span className="channel-list-table__topic-inline">{channel.topic}</span>}
+                </td>
+                <td className="channel-list-table__users">{channel.users.toLocaleString()}</td>
+                <td className="channel-list-table__topic" title={channel.topic}>{channel.topic}</td>
+                <td className="channel-list-table__action">
+                  <button className={joined ? 'button button-small button-quiet' : 'button button-small'} type="button"
+                    aria-label={joined ? `Open ${channel.name}` : `Join ${channel.name}`} onClick={() => onJoin(channel.name)}>
+                    {joined ? 'Open' : 'Join'}
+                  </button>
+                </td>
+              </tr>;
+            })}
+          </tbody>
+        </table> : page && state !== 'idle' && <p className="channel-list-view__status">
+          {state === 'loading' ? 'Waiting for channels…' : debouncedQuery ? 'No matching channels.' : 'The server returned no channels.'}
+        </p>}
+        {page && page.matched > page.channels.length && <p className="channel-list-view__status">
+          Showing the {page.channels.length.toLocaleString()} largest of {page.matched.toLocaleString()} matching channels. Refine the filter to see more.
+        </p>}
+      </div>
     </div>
   </section>;
 }

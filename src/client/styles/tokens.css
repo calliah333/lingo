@@ -1,0 +1,135 @@
+/* Theme tokens. Components use only these names; each theme defines every one. */
+:root {
+  --ui: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  --mono: ui-monospace, 'SFMono-Regular', 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --font-size: 13px;
+  --nick-width: 12ch;
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --ease: cubic-bezier(.2, .7, .3, 1);
+}
+
+:root,
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #11161b;
+  --bg-sidebar: #0c1014;
+  --bg-elevated: #182028;
+  --surface: #151b21;
+  --hover: #1a222a;
+  --active: #1d2d2a;
+  --active-text: #d8f7ea;
+  --border: #212a33;
+  --border-strong: #2e3944;
+  --text: #e3e9ee;
+  --text-muted: #95a3b0;
+  --text-faint: #66727e;
+  --accent: #5fd3a2;
+  --accent-hover: #7fe0b7;
+  --accent-contrast: #062418;
+  --accent-soft: #5fd3a21f;
+  --mention: #f0a53c;
+  --mention-contrast: #2a1703;
+  --mention-soft: #f0a53c17;
+  --danger: #f0877f;
+  --danger-soft: #f0877f1a;
+  --warning: #e3bd6d;
+  --online: #5fd3a2;
+  --pending: #e3bd6d;
+  --offline: #f0877f;
+  --idle: #5b6773;
+  --shadow: 0 1px 2px #0006, 0 12px 32px #0007;
+  --scrim: #05080bb3;
+  --scrollbar: #2c3640;
+  --message-text: #d3dbe2;
+  --system-text: #8b99a6;
+  --action-text: #c9c3a6;
+  --rank-owner: #d4a8f5;
+  --rank-admin: #f0a58a;
+  --rank-op: #5fd3a2;
+  --rank-halfop: #8cc3ea;
+  --rank-voice: #e3bd6d;
+}
+
+html[data-theme='light'] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --bg-sidebar: #f4f6f8;
+  --bg-elevated: #ffffff;
+  --surface: #ffffff;
+  --hover: #e9edf1;
+  --active: #dcefe6;
+  --active-text: #0b4a33;
+  --border: #e3e8ed;
+  --border-strong: #cdd5dd;
+  --text: #16202a;
+  --text-muted: #56636f;
+  --text-faint: #7d8893;
+  --accent: #0f7f58;
+  --accent-hover: #0b6a49;
+  --accent-contrast: #ffffff;
+  --accent-soft: #0f7f5814;
+  --mention: #b35a00;
+  --mention-contrast: #ffffff;
+  --mention-soft: #f59e0b17;
+  --danger: #b4322e;
+  --danger-soft: #b4322e12;
+  --warning: #93600a;
+  --online: #178a5b;
+  --pending: #b37a14;
+  --offline: #c2443e;
+  --idle: #9aa5b0;
+  --shadow: 0 1px 2px #16202a14, 0 12px 32px #16202a1f;
+  --scrim: #16202a59;
+  --scrollbar: #c9d1d9;
+  --message-text: #1f2b36;
+  --system-text: #5e6b77;
+  --action-text: #6b5d2c;
+  --rank-owner: #7a3f9e;
+  --rank-admin: #a4462a;
+  --rank-op: #0f7f58;
+  --rank-halfop: #1f5f8f;
+  --rank-voice: #93600a;
+}
+
+html[data-theme='gruber'] {
+  color-scheme: dark;
+  --bg: #181818;
+  --bg-sidebar: #111111;
+  --bg-elevated: #242424;
+  --surface: #1e1e1e;
+  --hover: #262626;
+  --active: #33301c;
+  --active-text: #ffed86;
+  --border: #2a2a2a;
+  --border-strong: #3d3d3d;
+  --text: #e4e4ef;
+  --text-muted: #a8a8b2;
+  --text-faint: #7a7a84;
+  --accent: #ffdd33;
+  --accent-hover: #ffe766;
+  --accent-contrast: #181818;
+  --accent-soft: #ffdd331a;
+  --mention: #f4a261;
+  --mention-contrast: #1d1206;
+  --mention-soft: #f4a26117;
+  --danger: #ff7a80;
+  --danger-soft: #f438411f;
+  --warning: #ffdd33;
+  --online: #73c936;
+  --pending: #ffdd33;
+  --offline: #f43841;
+  --idle: #6b6b72;
+  --shadow: 0 1px 2px #0008, 0 12px 32px #0009;
+  --scrim: #000b;
+  --scrollbar: #444444;
+  --message-text: #e4e4ef;
+  --system-text: #9f9fa8;
+  --action-text: #d9cfaa;
+  --rank-owner: #b4a6ea;
+  --rank-admin: #f4a261;
+  --rank-op: #73c936;
+  --rank-halfop: #96a6c8;
+  --rank-voice: #ffdd33;
+}

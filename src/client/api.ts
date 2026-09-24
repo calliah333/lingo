@@ -21,3 +21,8 @@ export function json(method: string, value: unknown): RequestInit {
 export function errorText(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.';
 }
+
+/** A 401 that ended the session; a wrong current password during a password change is also a 401 but keeps it. */
+export function isSessionExpired(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401 && error.message !== 'Invalid password';
+}

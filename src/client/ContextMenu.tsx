@@ -9,6 +9,12 @@ export type MenuItem = {
   danger?: boolean;
 };
 
+/** What a context menu acts on; App builds the items for each kind. */
+export type MenuSubject =
+  | { kind: 'network'; networkId: number }
+  | { kind: 'buffer'; bufferId: number }
+  | { kind: 'user'; networkId: number; nick: string };
+
 type ContextMenuProps = {
   x: number;
   y: number;

@@ -15,6 +15,8 @@ export type AppPreferences = {
   /** Custom networks sidebar width in px; `null` uses the responsive default. */
   sidebarWidth: number | null;
   sidebarCollapsed: boolean;
+  /** Hides the channel user list on wide screens; narrow screens always show it as a drawer on demand. */
+  userListHidden: boolean;
   browserNotifications: boolean;
   notificationSound: boolean;
 };
@@ -53,6 +55,7 @@ const defaults: AppPreferences = {
   nickWidth: 12,
   sidebarWidth: null,
   sidebarCollapsed: false,
+  userListHidden: false,
   browserNotifications: false,
   notificationSound: false,
 };
@@ -118,6 +121,7 @@ export function loadPreferences(): AppPreferences {
     sidebarWidth: typeof value.sidebarWidth === 'number' && Number.isFinite(value.sidebarWidth)
       ? clampSidebarWidth(value.sidebarWidth) : defaults.sidebarWidth,
     sidebarCollapsed: typeof value.sidebarCollapsed === 'boolean' ? value.sidebarCollapsed : defaults.sidebarCollapsed,
+    userListHidden: typeof value.userListHidden === 'boolean' ? value.userListHidden : defaults.userListHidden,
     browserNotifications: typeof value.browserNotifications === 'boolean' ? value.browserNotifications : defaults.browserNotifications,
     notificationSound: typeof value.notificationSound === 'boolean' ? value.notificationSound : defaults.notificationSound,
   };

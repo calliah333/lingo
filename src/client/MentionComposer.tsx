@@ -1,8 +1,16 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ChangeEvent, type KeyboardEvent } from 'react';
-import type { ChannelListEntry, ChannelListPage, ChatBuffer, MentionCandidate } from '../shared/contracts';
+import type { ChannelListEntry, ChannelListPage, ChatBuffer, ChatMessage, MentionCandidate, Network } from '../shared/contracts';
+import { displayIdentity } from '../shared/identity';
+import Icon from './Icon';
+import { recentChannels, recentMentions, rememberChannel, rememberMention, sessionStartedAt } from './sessionRecents';
 
 type MentionComposerProps = {
   buffer: ChatBuffer;
+  network: Network;
+  /** The buffer's loaded messages; recent speakers rank first in mention suggestions. */
+  messages: ChatMessage[];
+  /** Your own names, never ranked as recent speakers. */
+  ownNames: string[];
   disabled: boolean;
   autocomplete: boolean;
   /** Channel buffers already known on this network; offered first when they match. */
@@ -19,6 +27,22 @@ type ChannelContext = { kind: 'channel'; start: number; end: number; query: stri
 type ChannelSuggestion = Pick<ChannelListEntry, 'name'> & Partial<ChannelListEntry>;
 
 const CHANNEL_SUGGESTIONS = 20;
+
+/** Position in a most-recent-first list, or Infinity when absent, for ascending sorts. */
+function recency(list: readonly string[], key: string): number {
+  const index = list.indexOf(key);
+  return index < 0 ? Infinity : index;
+}
+
+/** Sorts by the first differing key, each ascending. */
+function byKeys<T>(keys: (item: T) => number[]): (left: T, right: T) => number {
+  return (left, right) => {
+    const a = keys(left);
+    const b = keys(right);
+    for (let index = 0; index < a.length; index += 1) if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+    return 0;
+  };
+}
 
 const commands = [
   { name: 'join', usage: '/join #channel', help: 'Join a channel' },
@@ -59,7 +83,7 @@ function channelContext(value: string, caret: number): ChannelContext | null {
 }
 
 export default function MentionComposer({
-  buffer, disabled, autocomplete, knownChannels, channelListUpdatedAt, onSend, onError,
+  buffer, network, messages, ownNames, disabled, autocomplete, knownChannels, channelListUpdatedAt, onSend, onError,
 }: MentionComposerProps) {
   const [value, setValue] = useState('');
   const [caret, setCaret] = useState(0);
@@ -82,29 +106,70 @@ export default function MentionComposer({
   const channelOpen = menuOpen && context.kind === 'channel';
   const channelQuery = context?.kind === 'channel' ? context.query : '';
   const listId = `${context?.kind ?? 'mention'}-options-${buffer.id}`;
+  const ownNamesKey = ownNames.join('\u0000').toLowerCase();
+  /** Who spoke here, newest first: rank among speakers and whether it was during this page session. */
+  const speakers = useMemo(() => {
+    const own = new Set(ownNamesKey.split('\u0000'));
+    const order = new Map<string, { rank: number; thisSession: boolean }>();
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.kind === 'system' || message.bufferId !== buffer.id) continue;
+      const identity = displayIdentity(message, network.relayNicks ?? [], network.displayNames ?? {});
+      const who = (identity.mentionTarget ?? identity.nick)?.toLowerCase();
+      if (!who || own.has(who) || order.has(who)) continue;
+      order.set(who, { rank: order.size, thisSession: message.time >= sessionStartedAt });
+    }
+    return order;
+  }, [messages, buffer.id, network.relayNicks, network.displayNames, ownNamesKey]);
+  // Ranking: exact match, people you mentioned this session, people talking this session, prefix matches,
+  // earlier speakers, then the server's order.
   const filtered = useMemo(() => {
     if (context?.kind !== 'mention') return [];
     const query = context.query.toLocaleLowerCase();
-    return candidates.filter((candidate) => candidate.name.toLocaleLowerCase().includes(query)
-      || candidate.mention.toLocaleLowerCase().includes(query));
-  }, [candidates, context?.kind, context?.query]);
+    const mentioned = recentMentions(buffer.networkId);
+    return candidates.flatMap((candidate, index) => {
+      const name = candidate.name.toLocaleLowerCase();
+      const mention = candidate.mention.toLocaleLowerCase();
+      if (!name.includes(query) && !mention.includes(query)) return [];
+      const spoke = speakers.get(mention);
+      return [{ candidate, keys: [
+        query !== '' && (name === query || mention === query) ? 0 : 1,
+        recency(mentioned, mention),
+        spoke?.thisSession ? spoke.rank : Infinity,
+        name.startsWith(query) || mention.startsWith(query) ? 0 : 1,
+        spoke ? spoke.rank : Infinity,
+        index,
+      ] }];
+    }).sort(byKeys((item) => item.keys)).map((item) => item.candidate);
+  }, [candidates, context?.kind, context?.query, speakers, buffer.networkId]);
   const matchingCommands = context?.kind === 'command'
     ? commands.filter((command) => command.name.startsWith(context.query.toLowerCase()))
     : [];
+  // Ranking: the exact typed name, channels you joined or talked in this session, your channels, then the
+  // network list (already ordered by users); prefix matches before substring matches within each group.
   const channelOptions = useMemo(() => {
     if (!channelOpen) return [];
     const needle = channelQuery.toLowerCase();
     const listed = new Map(channels.map((channel) => [channel.name.toLowerCase(), channel]));
+    const known = new Set(knownChannels.map((name) => name.toLowerCase()));
+    const recent = recentChannels(buffer.networkId);
     const options = new Map<string, ChannelSuggestion>();
     const add = (name: string) => {
       const key = name.toLowerCase();
       if (!options.has(key)) options.set(key, listed.get(key) ?? { name });
     };
-    if (listed.has(needle) || knownChannels.some((name) => name.toLowerCase() === needle)) add(channelQuery);
-    for (const name of knownChannels) if (name.toLowerCase().includes(needle)) add(name);
+    if (listed.has(needle) || known.has(needle)) add(channelQuery);
+    // Known names first so a recent channel keeps its real casing.
+    for (const name of [...knownChannels, ...recent]) if (name.toLowerCase().includes(needle)) add(name);
     for (const channel of channels) add(channel.name);
-    return [...options.values()].slice(0, CHANNEL_SUGGESTIONS);
-  }, [channelOpen, channelQuery, channels, knownChannels]);
+    return [...options.entries()].map(([key, option], index) => ({ option, keys: [
+      needle !== '' && key === needle ? 0 : 1,
+      recency(recent, key),
+      known.has(key) ? 0 : 1,
+      key.startsWith(needle) || key.slice(1).startsWith(needle.replace(/^[#&+!]/, '')) ? 0 : 1,
+      index,
+    ] })).sort(byKeys((item) => item.keys)).slice(0, CHANNEL_SUGGESTIONS).map((item) => item.option);
+  }, [channelOpen, channelQuery, channels, knownChannels, buffer.networkId]);
   const optionCount = context?.kind === 'mention' ? filtered.length
     : context?.kind === 'channel' ? channelOptions.length : matchingCommands.length;
   const activeIndex = Math.min(activeIndexState, Math.max(optionCount - 1, 0));
@@ -262,6 +327,20 @@ export default function MentionComposer({
     inputRef.current?.focus();
   }
 
+  /** Feeds session ranking: `/join` targets, the channel you talked in, and the people you @mentioned. */
+  function rememberSent(text: string) {
+    const join = /^\/join\s+(\S+)/i.exec(text);
+    if (join) {
+      for (const name of join[1].split(',')) if (/^[#&+!]./.test(name)) rememberChannel(buffer.networkId, name);
+      return;
+    }
+    if (text.startsWith('/') && !/^\/me\s/i.test(text)) return;
+    if (buffer.kind === 'channel') rememberChannel(buffer.networkId, buffer.name);
+    for (const match of text.matchAll(/(?:^|[\s([{])@([^\s@]+)/g)) {
+      rememberMention(buffer.networkId, match[1].replace(/[.,:;!?)\]}]+$/, ''));
+    }
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (menuOpen && context?.kind === 'mention' && filtered.length) {
@@ -282,6 +361,7 @@ export default function MentionComposer({
     setSending(true);
     try {
       await onSend(text);
+      rememberSent(text);
       setValue('');
       setCaret(0);
       setDismissed(false);
@@ -321,8 +401,7 @@ export default function MentionComposer({
     }
   }
 
-  return <form className="composer" onSubmit={submit}>
-    <span className="composer-prompt" aria-hidden="true">›</span>
+  return <form className={`composer${disabled ? ' is-disabled' : ''}`} onSubmit={submit}>
     <label className="sr-only" htmlFor={`message-input-${buffer.id}`}>Message to {buffer.name}</label>
     <input
       id={`message-input-${buffer.id}`}
@@ -339,7 +418,7 @@ export default function MentionComposer({
       onClick={(event) => updateCaret(event.currentTarget)}
       onKeyUp={(event) => updateCaret(event.currentTarget)}
       onKeyDown={handleKeyDown}
-      placeholder={buffer.kind === 'server' ? 'Type a command…' : `Message ${buffer.name} or /command…`}
+      placeholder={buffer.kind === 'server' ? 'Type a /command' : `Message ${buffer.name}`}
       disabled={disabled || sending}
     />
     {menuOpen && <ul
@@ -397,14 +476,15 @@ export default function MentionComposer({
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => chooseCommand(command)}
           >
-            <strong>{command.usage}</strong> — {command.help}
+            <code>{command.usage}</code><span className="mention-option__help">{command.help}</span>
           </button>
         </li>)}
         {!matchingCommands.length && <li className="mention-option" role="option" aria-selected="false">No matching commands</li>}
       </>}
     </ul>}
-    <button className="button button-primary send-button" type="submit" disabled={disabled || sending || !value.trim()}>
-      {sending ? 'Sending…' : 'Send ↵'}
+    <button className="composer__send" type="submit" disabled={disabled || sending || !value.trim()}
+      aria-label={sending ? 'Sending…' : 'Send message'} title="Send (Enter)">
+      <Icon name="send" />
     </button>
   </form>;
 }

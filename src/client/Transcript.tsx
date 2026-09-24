@@ -1,8 +1,9 @@
-import { useLayoutEffect, useMemo, useRef } from 'react';
-import type { ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { ChatBuffer, ChatMessage, Network } from '../shared/contracts';
 import { displayIdentity, mentionRanges } from '../shared/identity';
+import Icon from './Icon';
+import { parseFormatting, renderFormatted, withoutColors } from './ircFormat';
 import { nicknameColor } from './nickColor';
 import type { AppPreferences } from './preferences';
 import type { Theme } from './ThemePicker';
@@ -22,9 +23,10 @@ type TranscriptProps = {
   onBottomChange: (bufferId: number, atBottom: boolean) => void;
   onLoadOlder: () => Promise<void>;
   onRetry: () => void;
-  onRename: (mentionTarget: string, displayName: string) => void;
   /** Opens user actions for the IRC nick behind a message (the relayed nick for bridged users). */
   onNickMenu: (nick: string, x: number, y: number) => void;
+  /** Leaves a search jump and returns to the newest messages. */
+  onBackToLatest: () => void;
   preferences: AppPreferences;
   highlights: string[];
   theme: Theme;
@@ -33,13 +35,36 @@ type TranscriptProps = {
 type TranscriptRow =
   | { type: 'date'; key: string; date: Date }
   | { type: 'unread'; key: string }
-  | { type: 'message'; key: string; message: ChatMessage };
+  | { type: 'message'; key: string; message: ChatMessage }
+  /** Consecutive MOTD lines drawn as one block; anchored by its first line's id. */
+  | { type: 'motd'; key: string; messages: ChatMessage[] };
 
 type Anchor = { id: number; top: number };
 
 function localDay(time: number): string {
   const date = new Date(time);
   return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+}
+
+/** Local midnight of the current day; re-renders when the clock passes the next midnight. */
+function useToday(): number {
+  const [today, setToday] = useState(() => new Date().setHours(0, 0, 0, 0));
+  useEffect(() => {
+    const next = new Date(today);
+    next.setDate(next.getDate() + 1);
+    const timer = setTimeout(() => setToday(new Date().setHours(0, 0, 0, 0)), Math.max(0, next.getTime() - Date.now()) + 1000);
+    return () => clearTimeout(timer);
+  }, [today]);
+  return today;
+}
+
+/** "Today"/"Yesterday" for those local days, otherwise null. */
+function relativeDay(date: Date, today: number): string | null {
+  const day = localDay(date.getTime());
+  if (day === localDay(today)) return 'Today';
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  return day === localDay(yesterday.getTime()) ? 'Yesterday' : null;
 }
 
 function dateTimeLabel(time: number): string | undefined {
@@ -61,8 +86,8 @@ export default function Transcript({
   onBottomChange,
   onLoadOlder,
   onRetry,
-  onRename,
   onNickMenu,
+  onBackToLatest,
   preferences,
   highlights: highlightPhrases,
   theme,
@@ -80,6 +105,7 @@ export default function Transcript({
   const anchorCorrectionFrameRef = useRef<number | null>(null);
   const olderRequestFrameRef = useRef<number | null>(null);
   const currentBufferIdRef = useRef(buffer.id);
+  const [showLatest, setShowLatest] = useState(false);
   const relayNicks = network.relayNicks ?? [];
   const displayNames = network.displayNames ?? {};
   const ownNamesKey = ownNames.join('\u0000');
@@ -91,6 +117,7 @@ export default function Transcript({
     hour12: preferences.twelveHour,
   }), [preferences.showSeconds, preferences.twelveHour]);
   const dateFormatter = useMemo(() => new Intl.DateTimeFormat(undefined, { dateStyle: 'full' }), []);
+  const today = useToday();
   const rows = useMemo(() => {
     const result: TranscriptRow[] = [];
     let divided = false;
@@ -108,7 +135,11 @@ export default function Transcript({
         result.push({ type: 'unread', key: `unread:${message.id}` });
         divided = true;
       }
-      result.push({ type: 'message', key: `message:${message.id}`, message });
+      // A date or unread separator in between starts a new block.
+      const last = result.at(-1);
+      if (message.isMotd && last?.type === 'motd') last.messages.push(message);
+      else if (message.isMotd) result.push({ type: 'motd', key: `motd:${message.id}`, messages: [message] });
+      else result.push({ type: 'message', key: `message:${message.id}`, message });
     }
     return result;
   }, [messages, preferences.showMotd, preferences.statusMessages, dividerAfter]);
@@ -118,6 +149,7 @@ export default function Transcript({
     estimateSize: (index) => {
       const row = rows[index];
       return row?.type === 'date' ? 32 : row?.type === 'unread' ? 30
+        : row?.type === 'motd' ? row.messages.length * 20 + 40
         : row?.type === 'message' && row.message.connectionEvent ? 30 : 26;
     },
     getItemKey: (index) => rows[index]?.key ?? index,
@@ -143,14 +175,27 @@ export default function Transcript({
     }
   }
 
+  /** The row holding a message, including a line inside a MOTD block. */
+  function rowIndexOf(id: number): number {
+    return rows.findIndex((row) => row.type === 'message' ? row.message.id === id
+      : row.type === 'motd' && row.messages.some((message) => message.id === id));
+  }
+
+  /** The rendered element for a message (a row, or a MOTD line) and the virtual index of the row containing it. */
+  function renderedMessage(element: HTMLElement, id: number): { node: HTMLElement; index: number } | null {
+    const node = element.querySelector<HTMLElement>(`[data-message-id="${id}"]`);
+    const row = node?.closest<HTMLElement>('[data-index]');
+    return node && row ? { node, index: Number(row.dataset.index) } : null;
+  }
+
   function restoreAnchor(anchor: Anchor, forcePosition = false): void {
     const element = scrollRef.current;
     if (!element) return;
-    const index = rows.findIndex((row) => row.type === 'message' && row.message.id === anchor.id);
+    const index = rowIndexOf(anchor.id);
     if (index < 0) return;
-    const node = element.querySelector<HTMLElement>(`[data-message-id="${anchor.id}"]`);
-    if (!forcePosition && node && Number(node.dataset.index) === index) {
-      element.scrollTop += node.getBoundingClientRect().top - element.getBoundingClientRect().top - anchor.top;
+    const rendered = renderedMessage(element, anchor.id);
+    if (!forcePosition && rendered && rendered.index === index) {
+      element.scrollTop += rendered.node.getBoundingClientRect().top - element.getBoundingClientRect().top - anchor.top;
     } else {
       pendingAnchorRef.current = anchor;
       virtualizer.scrollToIndex(index, { align: 'start' });
@@ -174,7 +219,7 @@ export default function Transcript({
     }
 
     if (jumpId !== null && jumpId !== lastJumpRef.current) {
-      const index = rows.findIndex((row) => row.type === 'message' && row.message.id === jumpId);
+      const index = rowIndexOf(jumpId);
       if (index !== -1) {
         scrollReadyRef.current = false;
         pendingJumpRef.current = jumpId;
@@ -192,7 +237,7 @@ export default function Transcript({
       const anchor = anchorRef.current;
       if (anchor) restoreAnchor(anchor, true);
       else {
-        const index = rows.findIndex((row) => row.type === 'message' && row.message.id === oldFirstId);
+        const index = rowIndexOf(oldFirstId);
         if (index >= 0) virtualizer.scrollToIndex(index, { align: 'start' });
       }
       suppressTopScrollRef.current = true;
@@ -240,13 +285,13 @@ export default function Transcript({
         anchorCorrectionFrameRef.current = null;
         return;
       }
-      const index = rows.findIndex((row) => row.type === 'message' && row.message.id === currentAnchor.id);
-      const node = element.querySelector<HTMLElement>(`[data-message-id="${currentAnchor.id}"]`);
-      if (!node || Number(node.dataset.index) !== index) {
+      const index = rowIndexOf(currentAnchor.id);
+      const rendered = renderedMessage(element, currentAnchor.id);
+      if (!rendered || rendered.index !== index) {
         anchorCorrectionFrameRef.current = null;
         return;
       }
-      const offset = node.getBoundingClientRect().top - element.getBoundingClientRect().top;
+      const offset = rendered.node.getBoundingClientRect().top - element.getBoundingClientRect().top;
       if (Math.abs(offset - currentAnchor.top) > 0.5) element.scrollTop += offset - currentAnchor.top;
       if (framesRemaining > 0) {
         anchorCorrectionFrameRef.current = requestAnimationFrame(() => correctAnchor(framesRemaining - 1));
@@ -292,10 +337,31 @@ export default function Transcript({
       const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
       atBottomRef.current = atBottom;
       onBottomChange(buffer.id, !loading && jumpId === null && messages.length > 0 && atBottom);
+      updateLatestButton();
     });
     return () => cancelAnimationFrame(frame);
   }, [buffer.id, messages, loading, jumpId, totalSize, onBottomChange]);
-  return (
+
+  function updateLatestButton(): void {
+    const element = scrollRef.current;
+    if (!element) return;
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    setShowLatest(messages.length > 0 && (jumpId !== null || distance > 320));
+  }
+
+  function scrollToLatest(): void {
+    if (jumpId !== null) {
+      onBackToLatest();
+      return;
+    }
+    const element = scrollRef.current;
+    if (!element || !rows.length) return;
+    atBottomRef.current = true;
+    virtualizer.scrollToIndex(rows.length - 1, { align: 'end' });
+    element.scrollTop = element.scrollHeight;
+  }
+
+  return <div className="transcript">
     <div
       className={['message-scroll', preferences.showSeconds ? 'message-time-seconds' : '', preferences.twelveHour ? 'message-time-twelve-hour' : ''].filter(Boolean).join(' ')}
       ref={scrollRef}
@@ -304,6 +370,7 @@ export default function Transcript({
       aria-live="polite"
       onScroll={() => {
         captureAnchor();
+        updateLatestButton();
         const element = scrollRef.current;
         if (element) onBottomChange(buffer.id, !loading && jumpId === null && messages.length > 0
           && element.scrollHeight - element.scrollTop - element.clientHeight < 48);
@@ -316,14 +383,14 @@ export default function Transcript({
     >
       <div className="history-controls">
         {hasMore ? (
-          <button className="button button-quiet" type="button" disabled={olderPending || loading} onClick={() => {
+          <button className="button button-quiet button-small" type="button" disabled={olderPending || loading} onClick={() => {
             captureAnchor();
             requestedOldestRef.current = `${buffer.id}:${messages[0]?.id}`;
             void onLoadOlder();
           }}>
             {olderPending ? 'Loading older messages…' : 'Load older messages'}
           </button>
-        ) : null}
+        ) : !loading && messages.length > 0 ? <span className="history-start">Beginning of {buffer.name}</span> : null}
         {error ? (
           <div className="error-text">
             <span>{error}</span>
@@ -331,8 +398,11 @@ export default function Transcript({
           </div>
         ) : null}
       </div>
-      {loading && messages.length === 0 ? <div className="muted" role="status" style={{ padding: '12px 24px' }}>Loading messages…</div> : null}
-      {!loading && !error && messages.length === 0 ? <div className="muted" style={{ padding: '12px 24px' }}>No messages yet.</div> : null}
+      {loading && messages.length === 0 ? <div className="transcript-state" role="status">Loading messages…</div> : null}
+      {!loading && !error && messages.length === 0 ? <div className="transcript-state">
+        <strong>No messages yet</strong>
+        <span>{buffer.kind === 'server' ? 'Server notices and command output appear here.' : 'New messages will appear here as they arrive.'}</span>
+      </div> : null}
       <ul className="message-list" style={{ height: `${totalSize}px`, position: 'relative' }}>
         {virtualItems.map((virtualRow) => {
           const row = rows[virtualRow.index];
@@ -344,21 +414,46 @@ export default function Transcript({
             width: '100%',
             transform: `translateY(${virtualRow.start}px)`,
           };
-          if (row.type === 'date') return (
-            <li className="message-date-separator" key={virtualRow.key} data-index={virtualRow.index}
-              ref={virtualizer.measureElement} style={rowStyle}>
-              <time dateTime={`${row.date.getFullYear()}-${String(row.date.getMonth() + 1).padStart(2, '0')}-${String(row.date.getDate()).padStart(2, '0')}`}>
-                {dateFormatter.format(row.date)}
-              </time>
-            </li>
-          );
+          if (row.type === 'date') {
+            const fullDate = dateFormatter.format(row.date);
+            const relative = relativeDay(row.date, today);
+            return (
+              <li className="message-date-separator" key={virtualRow.key} data-index={virtualRow.index}
+                ref={virtualizer.measureElement} style={rowStyle}>
+                <time dateTime={`${row.date.getFullYear()}-${String(row.date.getMonth() + 1).padStart(2, '0')}-${String(row.date.getDate()).padStart(2, '0')}`}
+                  title={relative ? fullDate : undefined}>
+                  {relative ?? fullDate}
+                </time>
+              </li>
+            );
+          }
           if (row.type === 'unread') return (
             <li className="message-unread-divider" key={virtualRow.key} data-index={virtualRow.index}
               ref={virtualizer.measureElement} style={rowStyle}><span>New messages</span></li>
           );
+          if (row.type === 'motd') {
+            const first = row.messages[0];
+            return (
+              <li className="motd" key={virtualRow.key} data-index={virtualRow.index} data-message-id={first.id}
+                ref={virtualizer.measureElement} style={rowStyle}>
+                <section className="motd__box" aria-label="Message of the day">
+                  <header className="motd__header">
+                    <span>Message of the day</span>
+                    <time dateTime={dateTimeLabel(first.time)}>{timeFormatter.format(new Date(first.time))}</time>
+                  </header>
+                  <pre className="motd__body">{row.messages.map((line) => (
+                    <span key={line.id} data-message-id={line.id} className={jumpId === line.id ? 'motd__line message-highlight' : 'motd__line'}>
+                      {renderFormatted(withoutColors(parseFormatting(line.text)), { links: true })}
+                    </span>
+                  ))}</pre>
+                </section>
+              </li>
+            );
+          }
           const message = row.message;
           const identity = displayIdentity(message, relayNicks, displayNames);
-          const text = identity.text;
+          const formatted = parseFormatting(identity.text);
+          const text = formatted.plain;
           const isOwnMessage = Boolean(identity.mentionTarget && normalizedOwnNames.some((name) => name.toLowerCase() === identity.mentionTarget!.toLowerCase()));
           const ranges = message.kind !== 'system' && !isOwnMessage ? mentionRanges(text, normalizedOwnNames) : [];
           const hasOwnMention = ranges.length > 0 || message.kind !== 'system' && !isOwnMessage
@@ -375,14 +470,7 @@ export default function Transcript({
           const nick = identity.nick;
           const nickColor = preferences.coloredNicknames && nick && message.kind !== 'system'
             ? nicknameColor(identity.mentionTarget ?? nick, theme) : undefined;
-          let cursor = 0;
-          const body: ReactNode[] = [];
-          for (const range of ranges) {
-            if (range.start > cursor) body.push(text.slice(cursor, range.start));
-            body.push(<mark className="mention-token" key={`${range.start}-${range.end}`}>{text.slice(range.start, range.end)}</mark>);
-            cursor = range.end;
-          }
-          if (cursor < text.length || body.length === 0) body.push(text.slice(cursor));
+          const body = renderFormatted(formatted, { mentions: ranges, links: true });
           if (message.connectionEvent) return (
             <li className={`message-connection-marker message-connection-${message.connectionEvent}`} key={virtualRow.key}
               data-index={virtualRow.index} data-message-id={message.id} ref={virtualizer.measureElement} style={rowStyle}>
@@ -395,10 +483,13 @@ export default function Transcript({
               ref={virtualizer.measureElement} style={rowStyle}>
               <time className="message-time" dateTime={dateTimeLabel(message.time)}>{timeFormatter.format(new Date(message.time))}</time>
               {nick && message.kind !== 'system' ? (
-                <button className="message-nick" type="button" title={`Rename ${identity.mentionTarget ?? nick} (right-click for actions)`}
-                  style={{ color: nickColor, border: 0, padding: 0, background: 'transparent', font: 'inherit', cursor: 'pointer' }}
-                  onClick={() => onRename(identity.mentionTarget ?? nick, nick)}
-                  onContextMenu={message.fromNetwork ? undefined : (event) => {
+                <button className="message-nick" type="button" title={`${identity.mentionTarget ?? nick} — click for actions`}
+                  style={nickColor ? { color: nickColor } : undefined} aria-haspopup="menu"
+                  onClick={(event) => {
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    onNickMenu(identity.mentionTarget ?? nick, rect.left, rect.bottom + 4);
+                  }}
+                  onContextMenu={(event) => {
                     event.preventDefault();
                     const rect = event.currentTarget.getBoundingClientRect();
                     const pointer = event.clientX !== 0 || event.clientY !== 0;
@@ -406,7 +497,7 @@ export default function Transcript({
                   }}>{nick}</button>
               ) : <span className="message-nick">{message.kind === 'system' ? '*' : ''}</span>}
               <span className="message-text">
-                {message.fromNetwork ? <span className="message-network-info" role="img" aria-label="From IRC network" title="From IRC network">ⓘ</span> : null}
+                {message.fromNetwork ? <span className="message-network-info" role="img" aria-label="From IRC network" title="From IRC network"><Icon name="info" /></span> : null}
                 {body}
               </span>
             </li>
@@ -414,5 +505,8 @@ export default function Transcript({
         })}
       </ul>
     </div>
-  );
+    {showLatest && <button type="button" className="transcript-latest" onClick={scrollToLatest}>
+      <Icon name="arrowDown" />{jumpId !== null ? 'Back to latest' : 'Jump to latest'}
+    </button>}
+  </div>;
 }

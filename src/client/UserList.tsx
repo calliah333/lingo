@@ -1,5 +1,6 @@
 import { useMemo, useState, type MouseEvent } from 'react';
 import type { ChannelUser } from '../shared/contracts';
+import Icon from './Icon';
 import { nicknameColor } from './nickColor';
 import type { Theme } from './ThemePicker';
 
@@ -56,14 +57,17 @@ export default function UserList({ channel, users, message, open, nickTheme, onC
     onUserMenu(nick, pointer ? event.clientX : rect.left, pointer ? event.clientY : rect.bottom);
   }
 
-  return <aside className={`user-panel${open ? ' user-panel-open' : ''}`} aria-label={`${channel} users`}>
+  return <aside id="channel-users" className={`user-panel${open ? ' user-panel-open' : ''}`} aria-label={`${channel} users`}>
     <div className="user-panel__header">
-      <span>USERS{users ? ` · ${users.length}` : ''}</span>
-      <button className="icon-button user-panel__close" type="button" aria-label="Close users" onClick={onClose}>×</button>
+      <h2>Members{users && <span className="user-panel__count">{users.length}</span>}</h2>
+      <button className="icon-button icon-button-small" type="button" aria-label="Close users" title="Hide users" onClick={onClose}>
+        <Icon name="x" />
+      </button>
     </div>
     <div className="user-panel__search">
+      <Icon name="search" />
       <label className="sr-only" htmlFor="user-search">Search users in {channel}</label>
-      <input id="user-search" type="search" value={query} placeholder="Search users…" autoComplete="off"
+      <input id="user-search" type="search" value={query} placeholder="Find a member" autoComplete="off"
         disabled={!users} onChange={(event) => setQuery(event.target.value)} />
     </div>
     {!groups ? <p className="user-panel__status" role="status">{message}</p>
@@ -71,13 +75,13 @@ export default function UserList({ channel, users, message, open, nickTheme, onC
         : <div className="user-panel__list">
           {groups.map((group) => <section className="user-group" key={group.prefix}
             aria-label={`${group.label}: ${group.users.length}`}>
-            <h3 className="user-group__heading">{group.label} · {group.users.length}</h3>
+            <h3 className="user-group__heading">{group.label}<span>{group.users.length}</span></h3>
             <ul>
               {group.users.map((user) => <li key={user.nick}>
                 <button type="button" className="user-entry" title={`${user.nick} — click for actions`}
                   onContextMenu={(event) => openMenu(event, user.nick)}
                   onClick={(event) => openMenu(event, user.nick)}>
-                  <span className="channel-user-prefix" data-prefix={user.prefix}>{user.prefix}</span>
+                  <span className="user-entry__prefix" data-prefix={user.prefix}>{user.prefix}</span>
                   <span className="user-entry__nick"
                     style={nickTheme ? { color: nicknameColor(user.nick, nickTheme) } : undefined}>{user.nick}</span>
                 </button>

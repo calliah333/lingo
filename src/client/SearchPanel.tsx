@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { displayIdentity } from '../shared/identity';
 import type { ChatBuffer, ChatMessage, Network } from '../shared/contracts';
+import Icon from './Icon';
+import PaneHeader from './PaneHeader';
 
 type SearchResponse = {
   messages: ChatMessage[];
@@ -13,7 +15,6 @@ const TIME_RANGES = {
   month: 30 * 24 * 60 * 60 * 1000,
 } as const;
 
-
 type SearchPanelProps = {
   networks: Network[];
   initialBufferId?: number;
@@ -21,6 +22,12 @@ type SearchPanelProps = {
   onClose: () => void;
   onJump: (message: ChatMessage) => void;
 };
+
+/** Wraps case-insensitive occurrences of the query's words in <mark>; `pattern` must have one capturing group. */
+function emphasize(text: string, pattern: RegExp | null): ReactNode {
+  if (!pattern) return text;
+  return text.split(pattern).map((part, index) => index % 2 ? <mark key={index} className="search-result__match">{part}</mark> : part);
+}
 
 export default function SearchPanel({ networks, buffers, initialBufferId, onClose, onJump }: SearchPanelProps) {
   const [input, setInput] = useState('');
@@ -45,7 +52,7 @@ export default function SearchPanel({ networks, buffers, initialBufferId, onClos
   const rowVirtualizer = useVirtualizer({
     count: messages.length,
     getScrollElement: () => resultsRef.current,
-    estimateSize: () => 84,
+    estimateSize: () => 96,
     overscan: 6,
     getItemKey: (index) => messages[index]?.id ?? index,
   });
@@ -153,124 +160,144 @@ export default function SearchPanel({ networks, buffers, initialBufferId, onClos
   };
 
   const networkById = useMemo(() => new Map(networks.map((network) => [network.id, network])), [networks]);
-  const networkNames = useMemo(() => new Map(networks.map((network) => [network.id, network.name])), [networks]);
   const bufferById = useMemo(() => new Map(buffers.map((buffer) => [buffer.id, buffer])), [buffers]);
   const filteredBuffers = useMemo(
     () => networkId ? buffers.filter((buffer) => String(buffer.networkId) === networkId) : buffers,
     [buffers, networkId],
   );
+  const matchPattern = useMemo(() => {
+    // The server matches the input as one literal FTS phrase of whole words; emphasize those words, longest first.
+    const terms = [...new Set(query.match(/[\p{L}\p{N}]+/gu) ?? [])].sort((a, b) => b.length - a.length);
+    return terms.length ? new RegExp(`(?<![\\p{L}\\p{N}])(${terms.join('|')})(?![\\p{L}\\p{N}])`, 'giu') : null;
+  }, [query]);
 
   return (
-    <section className="search-panel" aria-label="Search history">
-      <header className="search-panel__header">
-        <h2 className="search-panel__title">Search history</h2>
-        <button className="search-panel__close" type="button" onClick={onClose} aria-label="Close search">×</button>
-      </header>
-      <div className="search-panel__controls">
-        <label className="search-panel__query-label">
-          <span>Search messages</span>
-          <input
-            className="search-panel__query"
-            type="search"
-            value={input}
-            onChange={(event) => {
-              resetResults();
-              setInput(event.target.value);
-            }}
-            placeholder="Search history"
-            autoFocus
-          />
-        </label>
-        <label className="search-panel__filter-label">
-          <span>Network</span>
-          <select
-            className="search-panel__filter"
-            value={networkId}
-            onChange={(event) => {
-              resetResults();
-              setNetworkId(event.target.value);
-              setBufferId('');
-            }}
-          >
-            <option value="">All networks</option>
-            {networks.map((network) => <option key={network.id} value={network.id}>{network.name}</option>)}
-          </select>
-        </label>
-        <label className="search-panel__filter-label">
-          <span>Channel or buffer</span>
-          <select
-            className="search-panel__filter"
-            value={bufferId}
-            onChange={(event) => {
-              resetResults();
-              setBufferId(event.target.value);
-            }}
-          >
-            <option value="">All channels and buffers</option>
-            {filteredBuffers.map((buffer) => (
-              <option key={buffer.id} value={buffer.id}>
-                {networkNames.get(buffer.networkId) ?? 'Network'} · {buffer.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="search-panel__filter-label">
-          <span>Time</span>
-          <select
-            className="search-panel__filter"
-            value={timeScope}
-            onChange={(event) => {
-              resetResults();
-              setTimeScope(event.target.value as typeof timeScope);
-            }}
-          >
-            <option value="any">Any time</option>
-            <option value="day">Past day</option>
-            <option value="week">Past week</option>
-            <option value="month">Past month</option>
-          </select>
-        </label>
+    <section className="search-view" aria-label="Search history">
+      <PaneHeader title="Search" actions={
+        <button className="icon-button" type="button" onClick={onClose} aria-label="Close search" title="Close">
+          <Icon name="x" />
+        </button>} />
+      <div className="search-view__controls">
+        <div className="search-view__column">
+          <label className="search-field">
+            <span className="sr-only">Search messages</span>
+            <Icon name="search" className="search-field__icon" />
+            <input
+              className="search-panel__query search-field__input"
+              type="search"
+              value={input}
+              onChange={(event) => {
+                resetResults();
+                setInput(event.target.value);
+              }}
+              placeholder="Search message history"
+              autoComplete="off"
+              spellCheck={false}
+              autoFocus
+            />
+          </label>
+          <div className="search-filters">
+            <label className="search-filter">
+              <span className="search-filter__label">Network</span>
+              <select
+                value={networkId}
+                onChange={(event) => {
+                  resetResults();
+                  setNetworkId(event.target.value);
+                  setBufferId('');
+                }}
+              >
+                <option value="">All networks</option>
+                {networks.map((network) => <option key={network.id} value={network.id}>{network.name}</option>)}
+              </select>
+            </label>
+            <label className="search-filter">
+              <span className="search-filter__label">Channel or buffer</span>
+              <select
+                value={bufferId}
+                onChange={(event) => {
+                  resetResults();
+                  setBufferId(event.target.value);
+                }}
+              >
+                <option value="">All channels and buffers</option>
+                {filteredBuffers.map((buffer) => (
+                  <option key={buffer.id} value={buffer.id}>
+                    {networkById.get(buffer.networkId)?.name ?? 'Network'} · {buffer.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="search-filter">
+              <span className="search-filter__label">Time</span>
+              <select
+                value={timeScope}
+                onChange={(event) => {
+                  resetResults();
+                  setTimeScope(event.target.value as typeof timeScope);
+                }}
+              >
+                <option value="any">Any time</option>
+                <option value="day">Past day</option>
+                <option value="week">Past week</option>
+                <option value="month">Past month</option>
+              </select>
+            </label>
+          </div>
+        </div>
       </div>
-      <div className="search-panel__results" ref={resultsRef} aria-live="polite" aria-busy={loading}>
-        {!input.trim() && <p className="search-panel__status">Enter a search phrase to find stored messages.</p>}
-        {input.trim() && query !== input.trim() && <p className="search-panel__status">Waiting to search…</p>}
-        {!loading && !error && query && messages.length === 0 && <p className="search-panel__status">No matching messages.</p>}
-        {messages.length > 0 && (
-          <ol className="search-panel__list" style={{ height: rowVirtualizer.getTotalSize(), position: 'relative' }}>
-            {rowVirtualizer.getVirtualItems().map((row) => {
-              const message = messages[row.index]!;
-              const buffer = bufferById.get(message.bufferId);
-              const network = networkById.get(message.networkId);
-              const identity = displayIdentity(message, network?.relayNicks ?? [], network?.displayNames);
-              return (
-                <li
-                  className="search-panel__item"
-                  key={row.key}
-                  data-index={row.index}
-                  ref={rowVirtualizer.measureElement}
-                  style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${row.start}px)` }}
-                >
-                  <button className="search-panel__result" type="button" onClick={() => onJump(message)}>
-                    <span className="search-panel__context">
-                      <time dateTime={new Date(message.time).toISOString()}>{new Date(message.time).toLocaleString()}</time>
-                      <span>{network?.name ?? 'Unknown network'}</span>
-                      <span>{buffer?.name ?? 'Unknown buffer'}</span>
-                      {identity.nick && <span>{identity.nick}</span>}
-                    </span>
-                    <span className="search-panel__text">{identity.text}</span>
-                  </button>
-                </li>
-              );
-            })}
-          </ol>
-        )}
-        {loading && <p className="search-panel__status">Searching…</p>}
-        {error && <p className="search-panel__error" role="alert">{error}</p>}
-        {hasMore && (
-          <button className="search-panel__more" type="button" onClick={() => void loadMore()} disabled={loading}>
-            {loading ? 'Loading…' : 'Load more'}
-          </button>
-        )}
+      <div className="pane-body search-results" ref={resultsRef} aria-live="polite" aria-busy={loading}>
+        <div className="search-view__column">
+          {!input.trim() && <div className="search-results__empty">
+            <Icon name="search" className="search-results__empty-icon" />
+            <p>Enter a search phrase to find stored messages.</p>
+          </div>}
+          {input.trim() && query !== input.trim() && <p className="search-results__status">Waiting to search…</p>}
+          {!loading && !error && query && query === input.trim() && messages.length === 0
+            && <p className="search-results__status">No matching messages.</p>}
+          {messages.length > 0 && (
+            <ol className="search-results__list" style={{ height: rowVirtualizer.getTotalSize(), position: 'relative' }}>
+              {rowVirtualizer.getVirtualItems().map((row) => {
+                const message = messages[row.index]!;
+                const buffer = bufferById.get(message.bufferId);
+                const network = networkById.get(message.networkId);
+                const identity = displayIdentity(message, network?.relayNicks ?? [], network?.displayNames);
+                return (
+                  <li
+                    className="search-results__item"
+                    key={row.key}
+                    data-index={row.index}
+                    ref={rowVirtualizer.measureElement}
+                    style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${row.start}px)` }}
+                  >
+                    <button className="search-result" type="button" onClick={() => onJump(message)}>
+                      <span className="search-result__context">
+                        <span className="search-result__network">{network?.name ?? 'Unknown network'}</span>
+                        <span className="search-result__divider" aria-hidden="true">·</span>
+                        <span className="search-result__buffer">{buffer?.name ?? 'Unknown buffer'}</span>
+                        <span className="search-result__divider" aria-hidden="true">·</span>
+                        <time dateTime={new Date(message.time).toISOString()}>{new Date(message.time).toLocaleString()}</time>
+                      </span>
+                      <span className="search-result__message">
+                        {identity.nick && <span className="search-result__nick">{identity.nick}</span>}
+                        <span className="search-result__text">{emphasize(identity.text, matchPattern)}</span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+          {loading && <p className="search-results__status">Searching…</p>}
+          {error && <p className="error-text search-results__error" role="alert">{error}</p>}
+          {hasMore && (
+            <div className="search-results__more">
+              <button className="button" type="button" onClick={() => void loadMore()} disabled={loading}>
+                {loading ? 'Loading…' : 'Load more'}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </section>
   );
