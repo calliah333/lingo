@@ -50,16 +50,10 @@
   color: inherit;
 }
 .sidebar__home:hover { background: var(--hover); }
-.sidebar__logo, .auth-brand__logo, .welcome__mark {
-  display: inline-grid;
-  place-items: center;
-  border-radius: 7px;
-  background: var(--accent);
-  color: var(--accent-contrast);
-  font: 700 11px/1 var(--mono);
-  letter-spacing: -.04em;
-}
-.sidebar__logo { width: 26px; height: 24px; }
+.logo { display: block; flex: none; }
+.logo__bubble { fill: var(--accent); }
+.logo__hash { fill: none; stroke: var(--accent-contrast); stroke-width: 4.4; stroke-linecap: round; }
+.sidebar__logo { width: 24px; height: 24px; }
 .sidebar__name { font-size: 15px; font-weight: 700; letter-spacing: -.02em; }
 .sidebar__brand .status-dot { width: 7px; height: 7px; margin-left: 1px; }
 
@@ -83,7 +77,7 @@
 .sidebar__search:hover, .sidebar__search.is-active { border-color: var(--border-strong); color: var(--text-muted); }
 .sidebar-drawer .sidebar__search kbd { display: none; }
 
-.sidebar__networks { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px 8px 16px; }
+.sidebar__networks { flex: 1; min-height: 0; overflow: hidden auto; overscroll-behavior: contain; padding: 4px 8px 16px; }
 .sidebar__empty { display: grid; justify-items: start; gap: 10px; padding: 12px 8px; color: var(--text-muted); font-size: 13px; }
 .sidebar__empty p { margin: 0; }
 
@@ -166,7 +160,7 @@
 .sidebar-add-network:hover { background: var(--hover); color: var(--text); }
 .sidebar-add-network .icon { font-size: 14px; }
 
-.sidebar-buffers { display: grid; gap: 1px; margin: 2px 0 0; padding: 0; list-style: none; }
+.sidebar-buffers { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; margin: 2px 0 0; padding: 0; list-style: none; }
 .sidebar-buffer {
   display: flex;
   align-items: center;
@@ -279,7 +273,8 @@
 .pane-header__title { flex: 1; min-width: 0; }
 .pane-header__title h1 {
   display: flex;
-  align-items: center;
+  /* Baseline, so the heading's baseline is its text's (a leading icon has none); the icon still centers itself. */
+  align-items: baseline;
   gap: 5px;
   min-width: 0;
   margin: 0;
@@ -288,7 +283,8 @@
   letter-spacing: -.01em;
   line-height: 1.3;
 }
-.pane-header__title h1 > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-header__title h1 > span { overflow: clip; text-overflow: ellipsis; white-space: nowrap; }
+.pane-header__title h1 > .icon { align-self: center; }
 .pane-header__overline {
   display: flex;
   align-items: center;
@@ -341,7 +337,7 @@
 
 /* Empty main pane */
 .welcome { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 32px; text-align: center; }
-.welcome__mark { width: 56px; height: 52px; margin-bottom: 14px; border-radius: 14px; font-size: 18px; box-shadow: 0 10px 30px var(--accent-soft); }
+.welcome__mark { width: 60px; height: 60px; margin-bottom: 14px; filter: drop-shadow(0 10px 24px var(--accent-soft)); }
 .welcome h2 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.015em; }
 .welcome p { max-width: 380px; margin: 4px 0 20px; color: var(--text-muted); line-height: 1.6; }
 
@@ -364,7 +360,7 @@
   box-shadow: var(--shadow);
 }
 .auth-brand { display: flex; align-items: center; gap: 11px; }
-.auth-brand__logo { width: 34px; height: 32px; border-radius: 9px; font-size: 13px; }
+.auth-brand__logo { width: 34px; height: 34px; }
 .auth-brand h1 { margin: 0; font-size: 26px; font-weight: 750; letter-spacing: -.035em; }
 .auth-tagline { margin: 6px 0 26px; color: var(--text-muted); }
 .auth-form { display: grid; gap: 14px; }

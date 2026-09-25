@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, ApiError, errorText, json } from './api';
+import { Logo } from './Icon';
 import ThemePicker, { type Theme } from './ThemePicker';
 
 export type AuthMode = 'checking' | 'setup' | 'login' | 'unavailable';
@@ -75,7 +76,7 @@ export default function AuthScreen({
   return <main className="auth-screen">
     <div className="auth-card">
       <div className="auth-brand">
-        <span className="auth-brand__logo" aria-hidden="true">&gt;_</span>
+        <Logo className="auth-brand__logo" />
         <h1>lingo</h1>
       </div>
       <p className="auth-tagline">A quieter place for IRC.</p>

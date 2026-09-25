@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { ChatBuffer, ChatMessage, Network } from '../shared/contracts';
 import { displayIdentity, mentionRanges } from '../shared/identity';
@@ -116,7 +116,19 @@ export default function Transcript({
     hour: 'numeric', minute: '2-digit', ...(preferences.showSeconds ? { second: '2-digit' } : {}),
     hour12: preferences.twelveHour,
   }), [preferences.showSeconds, preferences.twelveHour]);
+  /** Characters in the widest time this format produces (hour 10–12 or 22–23 with an AM/PM marker), for the time column. */
+  const timeWidth = useMemo(() => Math.max(...[10, 12, 22, 23].map((hour) =>
+    timeFormatter.format(new Date(2000, 0, 1, hour, 59, 59)).length)), [timeFormatter]);
   const dateFormatter = useMemo(() => new Intl.DateTimeFormat(undefined, { dateStyle: 'full' }), []);
+  /** Hover text for a timestamp: the full date and the time with seconds. */
+  const fullDateTimeFormatter = useMemo(() => new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'full', timeStyle: 'medium', hour12: preferences.twelveHour,
+  }), [preferences.twelveHour]);
+  function timeCell(time: number) {
+    const date = new Date(time);
+    return <time className="line__time" dateTime={dateTimeLabel(time)}
+      title={Number.isNaN(date.getTime()) ? undefined : fullDateTimeFormatter.format(date)}>{timeFormatter.format(date)}</time>;
+  }
   const today = useToday();
   const rows = useMemo(() => {
     const result: TranscriptRow[] = [];
@@ -131,7 +143,7 @@ export default function Transcript({
         result.push({ type: 'date', key: `date:${message.id}`, date: new Date(message.time) });
         previousDay = day;
       }
-      if (!divided && dividerAfter !== null && message.id > dividerAfter) {
+      if (!divided && dividerAfter !== null && message.id > dividerAfter && !message.membership) {
         result.push({ type: 'unread', key: `unread:${message.id}` });
         divided = true;
       }
@@ -149,8 +161,8 @@ export default function Transcript({
     estimateSize: (index) => {
       const row = rows[index];
       return row?.type === 'date' ? 32 : row?.type === 'unread' ? 30
-        : row?.type === 'motd' ? row.messages.length * 20 + 40
-        : row?.type === 'message' && row.message.connectionEvent ? 30 : 26;
+        : row?.type === 'motd' ? row.messages.length * 20 + 10
+        : row?.type === 'message' && row.message.connectionEvent ? 30 : 25;
     },
     getItemKey: (index) => rows[index]?.key ?? index,
     overscan: 12,
@@ -363,7 +375,7 @@ export default function Transcript({
 
   return <div className="transcript">
     <div
-      className={['message-scroll', preferences.showSeconds ? 'message-time-seconds' : '', preferences.twelveHour ? 'message-time-twelve-hour' : ''].filter(Boolean).join(' ')}
+      className="message-scroll"
       ref={scrollRef}
       role="log"
       aria-label={`${buffer.name} messages`}
@@ -403,105 +415,83 @@ export default function Transcript({
         <strong>No messages yet</strong>
         <span>{buffer.kind === 'server' ? 'Server notices and command output appear here.' : 'New messages will appear here as they arrive.'}</span>
       </div> : null}
-      <ul className="message-list" style={{ height: `${totalSize}px`, position: 'relative' }}>
+      <ul className="line-list" style={{ height: `${totalSize}px`, '--time-width': `${timeWidth}ch` } as CSSProperties}>
         {virtualItems.map((virtualRow) => {
           const row = rows[virtualRow.index];
           if (!row) return null;
-          const rowStyle = {
-            position: 'absolute' as const,
-            top: 0,
-            left: 0,
-            width: '100%',
-            transform: `translateY(${virtualRow.start}px)`,
+          const key = virtualRow.key;
+          const attributes = {
+            'data-index': virtualRow.index,
+            ref: virtualizer.measureElement,
+            style: { position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${virtualRow.start}px)` } satisfies CSSProperties,
           };
           if (row.type === 'date') {
             const fullDate = dateFormatter.format(row.date);
             const relative = relativeDay(row.date, today);
-            return (
-              <li className="message-date-separator" key={virtualRow.key} data-index={virtualRow.index}
-                ref={virtualizer.measureElement} style={rowStyle}>
-                <time dateTime={`${row.date.getFullYear()}-${String(row.date.getMonth() + 1).padStart(2, '0')}-${String(row.date.getDate()).padStart(2, '0')}`}
-                  title={relative ? fullDate : undefined}>
-                  {relative ?? fullDate}
-                </time>
-              </li>
-            );
+            return <li key={key} {...attributes} className="line-separator">
+              <time dateTime={`${row.date.getFullYear()}-${String(row.date.getMonth() + 1).padStart(2, '0')}-${String(row.date.getDate()).padStart(2, '0')}`}
+                title={relative ? fullDate : undefined}>{relative ?? fullDate}</time>
+            </li>;
           }
-          if (row.type === 'unread') return (
-            <li className="message-unread-divider" key={virtualRow.key} data-index={virtualRow.index}
-              ref={virtualizer.measureElement} style={rowStyle}><span>New messages</span></li>
-          );
+          if (row.type === 'unread') return <li key={key} {...attributes} className="line-separator line-separator--unread">
+            <span>New messages</span>
+          </li>;
           if (row.type === 'motd') {
             const first = row.messages[0];
-            return (
-              <li className="motd" key={virtualRow.key} data-index={virtualRow.index} data-message-id={first.id}
-                ref={virtualizer.measureElement} style={rowStyle}>
-                <section className="motd__box" aria-label="Message of the day">
-                  <header className="motd__header">
-                    <span>Message of the day</span>
-                    <time dateTime={dateTimeLabel(first.time)}>{timeFormatter.format(new Date(first.time))}</time>
-                  </header>
-                  <pre className="motd__body">{row.messages.map((line) => (
-                    <span key={line.id} data-message-id={line.id} className={jumpId === line.id ? 'motd__line message-highlight' : 'motd__line'}>
-                      {renderFormatted(withoutColors(parseFormatting(line.text)), { links: true })}
-                    </span>
-                  ))}</pre>
-                </section>
-              </li>
-            );
+            return <li key={key} {...attributes} className="line line--motd" data-message-id={first.id}>
+              {timeCell(first.time)}
+              <span className="line__from line__marker" title="Message of the day">motd</span>
+              <pre className="line__body line__motd" aria-label="Message of the day">{row.messages.map((line) => (
+                <span key={line.id} data-message-id={line.id} className={jumpId === line.id ? 'line__motd-line is-jump' : 'line__motd-line'}>
+                  {renderFormatted(withoutColors(parseFormatting(line.text)), { links: true })}
+                </span>
+              ))}</pre>
+            </li>;
           }
           const message = row.message;
+          const time = timeCell(message.time);
+          if (message.connectionEvent) return <li key={key} {...attributes} className="line line--connection" data-message-id={message.id}>
+            {time}
+            <span className="line__from" aria-hidden="true" />
+            <span className="line__body">{parseFormatting(message.text).plain}</span>
+          </li>;
           const identity = displayIdentity(message, relayNicks, displayNames);
           const formatted = parseFormatting(identity.text);
           const text = formatted.plain;
-          const isOwnMessage = Boolean(identity.mentionTarget && normalizedOwnNames.some((name) => name.toLowerCase() === identity.mentionTarget!.toLowerCase()));
-          const ranges = message.kind !== 'system' && !isOwnMessage ? mentionRanges(text, normalizedOwnNames) : [];
-          const hasOwnMention = ranges.length > 0 || message.kind !== 'system' && !isOwnMessage
-            && highlights.some((phrase) => text.toLowerCase().includes(phrase));
-          const rowClass = [
-            'message-row',
-            message.kind === 'system' ? 'message-system' : '',
-            message.kind === 'notice' ? 'message-notice' : '',
-            message.kind === 'action' ? 'message-action' : '',
-            message.kind === 'system' && !message.connectionEvent && preferences.statusMessages === 'compact' ? 'message-compact' : '',
-            hasOwnMention ? 'message-mention' : '',
-            jumpId === message.id ? 'message-highlight' : '',
+          const system = message.kind === 'system';
+          const mentionTarget = identity.mentionTarget;
+          const own = !!mentionTarget && normalizedOwnNames.some((name) => name.toLowerCase() === mentionTarget.toLowerCase());
+          const ranges = !system && !own ? mentionRanges(text, normalizedOwnNames) : [];
+          const mentioned = ranges.length > 0 || !system && !own && highlights.some((phrase) => text.toLowerCase().includes(phrase));
+          const className = [
+            'line',
+            `line--${message.kind}`,
+            system && preferences.statusMessages === 'compact' && 'line--compact',
+            mentioned && 'is-mention',
+            jumpId === message.id && 'is-jump',
           ].filter(Boolean).join(' ');
           const nick = identity.nick;
-          const nickColor = preferences.coloredNicknames && nick && message.kind !== 'system'
-            ? nicknameColor(identity.mentionTarget ?? nick, theme) : undefined;
-          const body = renderFormatted(formatted, { mentions: ranges, links: true });
-          if (message.connectionEvent) return (
-            <li className={`message-connection-marker message-connection-${message.connectionEvent}`} key={virtualRow.key}
-              data-index={virtualRow.index} data-message-id={message.id} ref={virtualizer.measureElement} style={rowStyle}>
-              <time dateTime={dateTimeLabel(message.time)}>{timeFormatter.format(new Date(message.time))}</time>
-              <span>{text}</span>
-            </li>
-          );
-          return (
-            <li className={rowClass} key={virtualRow.key} data-index={virtualRow.index} data-message-id={message.id}
-              ref={virtualizer.measureElement} style={rowStyle}>
-              <time className="message-time" dateTime={dateTimeLabel(message.time)}>{timeFormatter.format(new Date(message.time))}</time>
-              {nick && message.kind !== 'system' ? (
-                <button className="message-nick" type="button" title={`${identity.mentionTarget ?? nick} — click for actions`}
-                  style={nickColor ? { color: nickColor } : undefined} aria-haspopup="menu"
-                  onClick={(event) => {
-                    const rect = event.currentTarget.getBoundingClientRect();
-                    onNickMenu(identity.mentionTarget ?? nick, rect.left, rect.bottom + 4);
-                  }}
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    const rect = event.currentTarget.getBoundingClientRect();
-                    const pointer = event.clientX !== 0 || event.clientY !== 0;
-                    onNickMenu(identity.mentionTarget ?? nick, pointer ? event.clientX : rect.left, pointer ? event.clientY : rect.bottom);
-                  }}>{nick}</button>
-              ) : <span className="message-nick">{message.kind === 'system' ? '*' : ''}</span>}
-              <span className="message-text">
-                {message.fromNetwork ? <span className="message-network-info" role="img" aria-label="From IRC network" title="From IRC network"><Icon name="info" /></span> : null}
-                {body}
-              </span>
-            </li>
-          );
+          const target = identity.mentionTarget ?? nick;
+          return <li key={key} {...attributes} className={className} data-message-id={message.id}>
+            {time}
+            {nick && target && !system
+              ? <button className="line__from" type="button" title={`${target} — click for actions`} aria-haspopup="menu"
+                style={preferences.coloredNicknames ? { color: nicknameColor(target, theme) } : undefined}
+                onClick={(event) => {
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  onNickMenu(target, rect.left, rect.bottom + 4);
+                }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  const pointer = event.clientX !== 0 || event.clientY !== 0;
+                  onNickMenu(target, pointer ? event.clientX : rect.left, pointer ? event.clientY : rect.bottom);
+                }}>{nick}</button>
+              : message.fromNetwork
+                ? <span className="line__from line__marker" role="img" aria-label="From IRC network" title="From IRC network"><Icon name="info" /></span>
+                : <span className="line__from line__marker" aria-hidden="true">{system ? '•' : ''}</span>}
+            <span className="line__body">{renderFormatted(formatted, { mentions: ranges, links: true })}</span>
+          </li>;
         })}
       </ul>
     </div>

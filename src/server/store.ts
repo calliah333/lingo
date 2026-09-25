@@ -57,6 +57,7 @@ type MessageRow = {
   connection_event: ChatMessage['connectionEvent'] | null;
   is_motd: number;
   highlight: number;
+  membership: number;
 };
 
 /** A browser push subscription: its endpoint URL and the keys that encrypt payloads for it. */
@@ -119,6 +120,7 @@ function messageFromRow(row: MessageRow): ChatMessage {
     ...(row.connection_event ? { connectionEvent: row.connection_event } : {}),
     ...(row.is_motd ? { isMotd: true as const } : {}),
     ...(row.highlight ? { highlight: true } : {}),
+    ...(row.membership ? { membership: true as const } : {}),
   };
 }
 
@@ -165,8 +167,8 @@ export class Store {
       throw new Error('Could not read database schema version');
     }
     const version = versionRow.user_version;
-    if (version > 14) throw new Error(`Unsupported database schema version ${version}`);
-    if (version === 14) return;
+    if (version > 15) throw new Error(`Unsupported database schema version ${version}`);
+    if (version === 15) return;
 
     // Rebuilding tables that other tables reference requires foreign keys off outside the
     // transaction (https://sqlite.org/lang_altertable.html#otheralter); integrity is rechecked below.
@@ -195,11 +197,12 @@ export class Store {
         if (version < 11) this.migrateToV11();
         if (version < 12) this.migrateToV12();
         if (version < 13) this.migrateToV13();
-        this.migrateToV14();
+        if (version < 14) this.migrateToV14();
+        this.migrateToV15();
         if (this.db.query('PRAGMA foreign_key_check').all().length) {
           throw new Error('Database migration left dangling references');
         }
-        this.db.exec('PRAGMA user_version = 14');
+        this.db.exec('PRAGMA user_version = 15');
         this.db.exec('COMMIT');
       } catch (error) {
         this.db.exec('ROLLBACK');
@@ -386,6 +389,11 @@ export class Store {
       );
       CREATE INDEX uploads_user ON uploads(user_id, created_at);
     `);
+  }
+
+  /** Other members' joins, parts, quits, kicks, and nick changes: shown as status lines, never unread. */
+  private migrateToV15(): void {
+    this.db.exec('ALTER TABLE messages ADD COLUMN membership INTEGER NOT NULL DEFAULT 0 CHECK (membership IN (0, 1))');
   }
 
   private migrateToV3(version: number): void {
@@ -635,7 +643,7 @@ export class Store {
       nick: string; mention_aliases: string; relay_nicks: string;
     }>;
     const recent = this.db.query(`
-      SELECT kind, nick, text, from_network, highlight FROM messages
+      SELECT kind, nick, text, from_network, highlight, membership FROM messages
       WHERE buffer_id = ? AND id > ? ORDER BY id DESC LIMIT 1000
     `);
     for (const buffer of buffers) {
@@ -645,9 +653,10 @@ export class Store {
         .map(name => name.toLowerCase());
       const relayNicks = JSON.parse(buffer.relay_nicks) as string[];
       const rows = recent.all(buffer.id, buffer.last_read_id) as Array<
-        Pick<MessageRow, 'kind' | 'nick' | 'text' | 'from_network' | 'highlight'>
+        Pick<MessageRow, 'kind' | 'nick' | 'text' | 'from_network' | 'highlight' | 'membership'>
       >;
       for (const row of rows) {
+        if (row.membership) continue;
         const sender = row.nick && !row.from_network && row.kind !== 'system'
           ? displayIdentity(row, relayNicks).mentionTarget : null;
         if (sender && ownNames.includes(sender.toLowerCase())) continue;
@@ -681,8 +690,8 @@ export class Store {
   appendUniqueMessage(input: Omit<ChatMessage, 'id'>, msgid: string | null, replayed = false): ChatMessage | null {
     const row = this.db.query(`
       INSERT INTO messages (network_id, buffer_id, kind, nick, text, time,
-                            from_network, connection_event, is_motd, highlight, msgid)
-      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                            from_network, connection_event, is_motd, highlight, msgid, membership)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?13
       WHERE ?12 = 0 OR NOT EXISTS (
         SELECT 1 FROM messages
         WHERE network_id = ?1 AND time = ?6 AND buffer_id = ?2 AND nick IS ?4 AND text = ?5
@@ -691,7 +700,7 @@ export class Store {
       RETURNING id
     `).get(input.networkId, input.bufferId, input.kind, input.nick, input.text, input.time,
       Number(input.fromNetwork === true), input.connectionEvent ?? null, Number(input.isMotd === true),
-      Number(input.highlight === true), msgid, Number(replayed)) as { id: number } | null;
+      Number(input.highlight === true), msgid, Number(replayed), Number(input.membership === true)) as { id: number } | null;
     return row ? { id: row.id, ...input } : null;
   }
 

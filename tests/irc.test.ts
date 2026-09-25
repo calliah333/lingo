@@ -839,3 +839,101 @@ test('falls back from a taken nick, regains it through NickServ with SASL, and d
     store.close();
   }
 }, 15_000);
+
+test('rejoins an account-only channel after identifying and records members joining and leaving', async () => {
+  const updates = new EventEmitter();
+  const connections: Connection[] = [];
+  let vipJoins = 0;
+  const server = createServer(socket => {
+    const connection: Connection = {
+      socket, lines: [], pending: '', nick: '', hasUser: false, capEnded: false, welcomed: false,
+    };
+    connections.push(connection);
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string | Buffer) => {
+      connection.pending += chunk.toString();
+      let end: number;
+      while ((end = connection.pending.indexOf('\n')) !== -1) {
+        const line = connection.pending.slice(0, end).replace(/\r$/, '');
+        connection.pending = connection.pending.slice(end + 1);
+        connection.lines.push(line);
+        const nick = connection.nick;
+        if (line.startsWith('CAP LS ')) socket.write(':mock CAP * LS :\r\n');
+        else if (line.startsWith('NICK ')) connection.nick = line.slice('NICK '.length);
+        else if (line.startsWith('USER ')) connection.hasUser = true;
+        else if (line === 'CAP END') connection.capEnded = true;
+        else if (line === 'JOIN #vip' && ++vipJoins === 1) {
+          // Services identify us only after autojoin went out, as NickServ IDENTIFY in connect commands does.
+          socket.write(`:mock 477 ${nick} #vip :You need to be identified to a registered account to join this channel\r\n`);
+          socket.write(`:mock 900 ${nick} ${nick}!user@mock ${nick} :You are now logged in as ${nick}\r\n`);
+        } else if (line === 'JOIN #vip') {
+          socket.write(`:${nick}!user@mock JOIN #vip\r\n:mock 353 ${nick} = #vip :${nick} bob carol dave erin\r\n`);
+          socket.write(`:mock 366 ${nick} #vip :End of /NAMES list.\r\n`);
+          socket.write(':alice!user@mock JOIN #vip\r\n:bob!user@mock PART #vip :bye\r\n');
+          socket.write(':carol!user@mock QUIT :Ping timeout\r\n:op!user@mock KICK #vip dave :spam\r\n');
+          socket.write(':erin!user@mock NICK erin2\r\n');
+        } else if (line === 'JOIN #closed') {
+          socket.write(`:mock 474 ${nick} #closed :Cannot join channel (+b)\r\n`);
+        }
+        if (!connection.welcomed && connection.nick && connection.hasUser && connection.capEnded) {
+          connection.welcomed = true;
+          socket.write(`:mock 001 ${connection.nick} :Welcome\r\n`);
+        }
+        updates.emit('change');
+      }
+    });
+  });
+  const store = new Store(':memory:');
+  const manager = new IrcManager(store, () => updates.emit('change'));
+  try {
+    const listening = Promise.withResolvers<void>();
+    server.once('error', listening.reject);
+    server.listen(0, '127.0.0.1', listening.resolve);
+    await listening.promise;
+    server.off('error', listening.reject);
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected ephemeral TCP port');
+    const userId = store.createUser('tester', 'unused')!.id;
+    const network = store.createNetwork(userId, {
+      name: 'net', host: '127.0.0.1', port: address.port, tls: false,
+      nick: 'tester', username: 'tester', realname: 'Test User',
+      saslAccount: '', autojoin: ['#vip'], commands: [], relayNicks: [], mentionAliases: [], displayNames: {},
+      backfill: false, joinDelaySeconds: 0, regainNick: false,
+    });
+    manager.start();
+    const vip = () => store.getOrCreateBuffer(network.id, '#vip', 'channel');
+    const texts = (bufferId: number) => store.getMessages(bufferId).messages.map(message => message.text);
+    await waitFor(updates, () => texts(vip().id).includes('erin is now known as erin2'), 'rejoin and member events');
+
+    // RPL_LOGGEDIN retried the refused autojoin at once rather than leaving the channel half-joined.
+    expect(connections[0]!.lines.filter(line => line === 'JOIN #vip')).toHaveLength(2);
+    expect(texts(vip().id).filter(text => !['Connected', 'Joined #vip'].includes(text))).toEqual([
+      'Cannot join #vip: You need to be identified to a registered account to join this channel. ' +
+        'Retrying once you are identified.',
+      'alice joined', 'bob left (bye)', 'carol quit (Ping timeout)', 'dave was kicked by op (spam)',
+      'erin is now known as erin2',
+    ]);
+    expect(manager.channelState(vip().id).users.map(user => user.nick)).toEqual(['alice', 'erin2', 'tester']);
+    // Member lines are status lines: they never make the channel unread.
+    const memberLines = store.getMessages(vip().id).messages.filter(message => message.membership);
+    expect(memberLines).toHaveLength(5);
+    const unreadBefore = store.getUnread(userId)[vip().id]!.messages;
+    expect(unreadBefore).toBe(store.getMessages(vip().id).messages.length - memberLines.length);
+
+    // A refused explicit join is recorded and forgotten, so joining again sends JOIN again.
+    manager.join(network.id, '#closed');
+    const closed = store.getOrCreateBuffer(network.id, '#closed', 'channel');
+    await waitFor(updates, () => texts(closed.id).includes('Cannot join #closed: Cannot join channel (+b)'), 'ban refusal');
+    manager.join(network.id, '#closed');
+    await waitFor(updates, () => connections[0]!.lines.filter(line => line === 'JOIN #closed').length === 2, 'second join');
+  } finally {
+    manager.stop();
+    for (const connection of connections) connection.socket.destroy();
+    if (server.listening) {
+      const closed = Promise.withResolvers<void>();
+      server.close(() => closed.resolve());
+      await closed.promise;
+    }
+    store.close();
+  }
+}, 15_000);

@@ -48,13 +48,16 @@ export function showAttention({ mentions, unread }: Attention) {
     const context = canvas.getContext('2d');
     if (!context) return;
     context.drawImage(image, 0, 0, size, size);
+    // Clear a ring around the dot so it reads on light and dark tab strips alike.
+    context.globalCompositeOperation = 'destination-out';
     context.beginPath();
-    context.arc(49, 15, 13, 0, Math.PI * 2);
+    context.arc(50, 14, 17, 0, Math.PI * 2);
+    context.fill();
+    context.globalCompositeOperation = 'source-over';
+    context.beginPath();
+    context.arc(50, 14, 12, 0, Math.PI * 2);
     context.fillStyle = dotColor[kind];
     context.fill();
-    context.lineWidth = 4;
-    context.strokeStyle = '#0c1218';
-    context.stroke();
     setIcon(canvas.toDataURL('image/png'), 'image/png');
   }, () => {
     // Without the base icon, the title still carries the state.

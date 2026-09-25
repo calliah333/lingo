@@ -5,7 +5,7 @@ import type {
 import { errorText } from './api';
 import { isJoined, sidebarOrder } from './chat';
 import type { MenuSubject } from './ContextMenu';
-import Icon from './Icon';
+import Icon, { Logo } from './Icon';
 import { clampSidebarWidth, maxSidebarWidth, minSidebarWidth } from './preferences';
 import { commandKey } from './shortcuts';
 
@@ -60,7 +60,8 @@ function sameSubject(left: MenuSubject | null, right: MenuSubject): boolean {
 /** Mentions keep a count badge; other unread messages only brighten the row, so screen readers get a plain "unread" note. */
 function UnreadBadges({ unread, muted }: { unread: BufferUnread | undefined; muted: boolean }) {
   if (muted || !unread) return null;
-  if (unread.mentions) return <span className="badge badge-mention" aria-label={`${unread.mentions} unread mentions`}>{unread.mentions}</span>;
+  if (unread.mentions) return <span className="badge badge-mention"
+    aria-label={`${unread.mentions} unread ${unread.mentions === 1 ? 'mention' : 'mentions'}`}>{unread.mentions}</span>;
   if (unread.messages) return <span className="sr-only">, unread</span>;
   return null;
 }
@@ -135,14 +136,14 @@ export default function Sidebar(props: SidebarProps) {
     <div className="sidebar__top">
       <div className="sidebar__brand">
         <button type="button" className="sidebar__home" onClick={onHome} aria-label="Back to conversation" title="Back to conversation">
-          <span className="sidebar__logo" aria-hidden="true">&gt;_</span>
+          <Logo className="sidebar__logo" />
           <span className="sidebar__name" aria-hidden="true">lingo</span>
         </button>
         <span className={`status-dot status-${connection}`} role="status" aria-label={`Live updates: ${connectionLabel[connection]}`}
           title={`Live updates: ${connectionLabel[connection]}`} />
       </div>
       <button type="button" className="icon-button" aria-label="Hide networks" title="Hide networks" aria-controls="networks-sidebar"
-        aria-expanded onClick={onHide}><Icon name={drawer ? 'x' : 'sidebar'} /></button>
+        onClick={onHide}><Icon name={drawer ? 'x' : 'sidebar'} /></button>
     </div>
     <button type="button" className={`sidebar__search${searchOpen ? ' is-active' : ''}`} onClick={onSearch}>
       <Icon name="search" /><span>Search</span><kbd>{commandKey} F</kbd>

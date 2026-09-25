@@ -1,14 +1,17 @@
 /* Conversation view: header extras, transcript, context bars, composer, member list, and context menus. */
 
 /* Header */
+/* The topic shares the channel name's baseline. It clips rather than hides overflow: a hidden-overflow box is a scroll
+   container, whose baseline is its bottom edge, which lifted the topic above the name. */
 .conversation-header .pane-header__title { display: flex; align-items: baseline; gap: 12px; }
+.conversation-header .pane-header__title:has(.conversation-topic.is-expanded) { align-items: flex-start; }
 .conversation-header .pane-header__title h1 { flex: none; max-width: 45%; }
 .conversation-header .pane-header__subtitle { flex: 1; min-width: 0; margin-top: 0; }
 .conversation-title-icon { color: var(--text-faint); font-size: 17px; }
 .conversation-kind { color: var(--text-faint); }
 .conversation-topic {
   max-width: 100%;
-  overflow: hidden;
+  overflow: clip;
   color: var(--text-muted);
   font-size: 13px;
   text-overflow: ellipsis;
@@ -35,10 +38,16 @@
 .irc-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .irc-link:hover { text-decoration-thickness: 2px; }
 
-/* Transcript */
+/* Transcript
+
+   Every line is one grid of the same three columns (time, sender, body), drawn in one font, one size, and one line
+   height, with its cells aligned to the top. Because every cell has identical line metrics, top alignment puts every
+   first line on the same baseline, whatever the browser does with baselines of truncated or button cells. Nothing
+   inside a line changes the font size or adds horizontal padding, so the monospace columns stay exact. */
 .transcript { position: relative; display: flex; flex: 1; flex-direction: column; min-height: 0; }
 .message-scroll {
-  --time-col: 4.2ch;
+  --line-gutter: 22px;
+  --line-gap: 1.25ch;
   --nick-cap: 100%;
   flex: 1;
   min-height: 0;
@@ -46,122 +55,118 @@
   overscroll-behavior: contain;
   padding: 6px 0 14px;
 }
-.message-scroll.message-time-seconds, .message-scroll.message-time-twelve-hour { --time-col: 6.6ch; }
-.message-scroll.message-time-seconds.message-time-twelve-hour { --time-col: 9ch; }
-.message-list { position: relative; margin: 0; padding: 0; list-style: none; }
 .history-controls { display: grid; justify-items: center; gap: 6px; min-height: 26px; padding: 4px 20px 10px; }
 .history-start { color: var(--text-faint); font-size: 12px; }
 .history-controls .error-text { display: flex; gap: 9px; }
 .transcript-state { display: grid; justify-items: center; gap: 4px; padding: 48px 24px; color: var(--text-muted); font-size: 13px; text-align: center; }
 .transcript-state strong { color: var(--text); font-size: 14px; font-weight: 600; }
 
-.message-row {
-  display: grid;
-  grid-template-columns: var(--time-col) min(var(--nick-width), var(--nick-cap)) minmax(0, 1fr);
-  align-items: baseline;
-  gap: 10px;
-  min-height: 24px;
-  padding: 2px 22px;
-  font: var(--font-size)/1.55 var(--mono);
-  overflow-wrap: anywhere;
-}
-.message-row:hover { background: color-mix(in srgb, var(--hover) 55%, transparent); }
-.message-time { color: var(--text-faint); font-size: .78em; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.message-nick {
-  min-width: 0;
-  max-width: 100%;
+/* --time-width is set from the time format, in characters. */
+.line-list {
+  position: relative;
+  margin: 0;
   padding: 0;
+  color: var(--message-text);
+  font: var(--font-size)/1.55 var(--mono);
+  list-style: none;
+}
+/* Vertical padding spaces messages apart; wrapped lines inside a message keep the plain line height. */
+.line {
+  display: grid;
+  grid-template-columns: var(--time-width) min(var(--nick-width), var(--nick-cap)) minmax(0, 1fr);
+  align-items: start;
+  column-gap: var(--line-gap);
+  padding: .2em var(--line-gutter);
+}
+.line:hover { background: color-mix(in srgb, var(--hover) 55%, transparent); }
+.line__time {
   overflow: hidden;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  font: inherit;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.line__from {
+  min-width: 0;
+  overflow: hidden;
   font-weight: 600;
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-button.message-nick:hover { text-decoration: underline; text-underline-offset: 3px; }
-.message-text { min-width: 0; color: var(--message-text); white-space: pre-wrap; }
-.message-system .message-nick, .message-notice .message-nick { color: var(--text-faint); font-weight: 500; }
-.message-system .message-text { color: var(--system-text); }
-.message-notice .message-text { color: var(--text-muted); }
-.message-action .message-text { color: var(--action-text); font-style: italic; }
-.message-compact { min-height: 20px; padding-block: 0; font-size: calc(var(--font-size) - 2px); }
-.message-compact .message-text { color: var(--text-faint); }
-.message-mention { background: var(--mention-soft); box-shadow: inset 3px 0 var(--mention); }
-.message-mention:hover { background: var(--mention-soft); }
-.message-highlight { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+button.line__from {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  line-height: inherit;
+}
+button.line__from:hover { text-decoration: underline; text-underline-offset: 3px; }
+/* A glyph or icon in the sender column for lines without a sender, one line tall. */
+.line__marker {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: 1.55em;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+.line__marker .icon { color: var(--accent); }
+.line__body { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+.line--system .line__body { color: var(--system-text); }
+.line--notice .line__from { color: var(--text-muted); font-weight: 400; }
+.line--notice .line__body { color: var(--text-muted); }
+.line--action .line__body { color: var(--action-text); font-style: italic; }
+.line--compact .line__time, .line--compact .line__body { color: var(--text-faint); }
+/* The virtualizer measures border boxes only, so the gap around the dashed rules is padding, not margin;
+   a margin would overlap the next row and shift it up. */
+.line--connection {
+  position: relative;
+  padding-block: 7px;
+  color: var(--text-muted);
+}
+.line--connection::before {
+  position: absolute;
+  inset: 4px 0;
+  border-block: 1px dashed var(--border);
+  content: '';
+  pointer-events: none;
+}
+.line__motd { margin: 0; overflow-x: auto; font: inherit; white-space: pre; }
+.line__motd-line { display: block; }
+.line__motd-line:empty::before { content: '\00a0'; }
+
+.line.is-mention { background: var(--mention-soft); box-shadow: inset 3px 0 var(--mention); }
+.line.is-jump, .line__motd-line.is-jump { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+/* Side shadows widen the pill without padding, so the monospace text keeps its column. */
 .mention-token {
-  padding: 0 3px;
+  --token-bg: color-mix(in srgb, var(--mention) 24%, transparent);
   border-radius: 4px;
-  background: color-mix(in srgb, var(--mention) 24%, transparent);
+  background: var(--token-bg);
+  box-shadow: -3px 0 var(--token-bg), 3px 0 var(--token-bg);
   color: var(--text);
   font-weight: 600;
 }
-.message-network-info { display: inline-flex; margin-right: .45em; color: var(--accent); vertical-align: -.12em; }
 
-.message-date-separator, .message-unread-divider {
+/* Separators span the whole width and use the interface font. */
+.line-separator {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 22px 6px;
+  padding: 10px var(--line-gutter) 6px;
   color: var(--text-faint);
-  font-size: 11.5px;
-  font-weight: 600;
+  font: 600 11.5px/1.4 var(--ui);
 }
-.message-date-separator::before, .message-date-separator::after,
-.message-unread-divider::before, .message-unread-divider::after { flex: 1; height: 1px; content: ''; background: var(--border); }
-.message-date-separator time {
-  padding: 2px 10px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--bg);
-}
-.message-unread-divider { padding-block: 6px; color: var(--danger); }
-.message-unread-divider::before { display: none; }
-.message-unread-divider::after { order: -1; background: var(--danger); opacity: .6; }
-.message-connection-marker {
-  display: grid;
-  grid-template-columns: var(--time-col) minmax(0, 1fr);
-  align-items: baseline;
-  gap: 10px;
-  min-height: 26px;
-  margin: 4px 0;
-  padding: 3px 22px;
-  border-block: 1px dashed var(--border);
-  color: var(--text-muted);
-  font: calc(var(--font-size) - 1px)/1.5 var(--mono);
-  overflow-wrap: anywhere;
-}
-.message-connection-marker time { color: var(--text-faint); font-size: .8em; white-space: nowrap; }
-
-/* Message of the day: one preformatted block, like other clients */
-.motd { padding: 6px 22px 10px; }
-.motd__box { max-width: max-content; min-width: min(100%, 360px); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
-.motd__header {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 7px 14px;
-  border-bottom: 1px solid var(--border);
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 600;
-}
-.motd__header time { color: var(--text-faint); font-weight: 400; font-variant-numeric: tabular-nums; }
-.motd__body {
-  margin: 0;
-  padding: 10px 14px 12px;
-  overflow-x: auto;
-  color: var(--message-text);
-  font: var(--font-size)/1.45 var(--mono);
-  white-space: pre;
-}
-.motd__line { display: block; }
-.motd__line:empty::before { content: '\00a0'; }
-.motd__line.message-highlight { margin-inline: -14px; padding-inline: 14px; }
+.line-separator::before, .line-separator::after { flex: 1; height: 1px; content: ''; background: var(--border); }
+.line-separator time { padding: 2px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); }
+.line-separator--unread { padding-block: 6px; color: var(--danger); }
+.line-separator--unread::before { display: none; }
+.line-separator--unread::after { order: -1; background: var(--danger); opacity: .6; }
 
 .transcript-latest {
   position: absolute;
@@ -214,7 +219,7 @@ button.message-nick:hover { text-decoration: underline; text-underline-offset: 3
 }
 .upload-progress__fill { display: block; height: 100%; background: var(--accent); transition: width .15s linear; }
 .upload-progress__text { display: flex; align-items: baseline; gap: 8px; }
-.upload-progress__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-progress__name { min-width: 0; overflow: clip; text-overflow: ellipsis; white-space: nowrap; }
 .upload-progress__percent { flex: none; color: var(--text-faint); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 /* Shown while files are dragged over the conversation; it never takes pointer events, so drag tracking stays on the pane. */
@@ -250,7 +255,7 @@ button.message-nick:hover { text-decoration: underline; text-underline-offset: 3
   position: relative;
   display: flex;
   flex: none;
-  align-items: center;
+  align-items: flex-end;
   gap: 6px;
   margin: 0 18px 16px;
   padding: 5px 5px 5px 14px;
@@ -262,14 +267,19 @@ button.message-nick:hover { text-decoration: underline; text-underline-offset: 3
 .conversation-bar + .composer { border-top-left-radius: 0; border-top-right-radius: 0; }
 .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .composer.is-disabled { background: var(--bg-sidebar); }
-.composer input, .composer input:focus-visible {
+.composer .composer__input, .composer .composer__input:focus-visible {
   flex: 1;
-  height: 34px;
-  padding: 0;
+  /* One row fills the 34px of the buttons; longer drafts wrap and grow to a cap, then scroll. */
+  min-height: 34px;
+  max-height: min(40vh, 240px);
+  padding: calc((34px - 1.45em) / 2) 0;
   border: 0;
   background: transparent;
   box-shadow: none;
-  font: var(--font-size) var(--mono);
+  font: var(--font-size)/1.45 var(--mono);
+  resize: none;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
 }
 .composer__send {
   display: grid;
@@ -308,6 +318,7 @@ button.message-nick:hover { text-decoration: underline; text-underline-offset: 3
   field-sizing: content;
   max-width: 8.5em;
   height: 28px;
+  margin-bottom: 3px; /* Centred against the 34px bottom row. */
   padding: 0 4px;
   border-color: transparent;
   background: transparent;
@@ -371,7 +382,7 @@ button.mention-option:hover, .mention-option[aria-selected='true'] { background:
 .channel-option { display: flex; align-items: baseline; gap: 10px; }
 .channel-option strong { font-family: var(--mono); font-weight: 600; }
 .channel-option__users { flex: none; color: var(--text-faint); font-size: 11.5px; }
-.channel-option__topic { min-width: 0; overflow: hidden; color: var(--text-faint); font-size: 12px; text-overflow: ellipsis; }
+.channel-option__topic { min-width: 0; overflow: clip; color: var(--text-faint); font-size: 12px; text-overflow: ellipsis; }
 
 /* Member list */
 .user-panel {
@@ -431,7 +442,7 @@ button.mention-option:hover, .mention-option[aria-selected='true'] { background:
 .user-entry__prefix[data-prefix='@'] { color: var(--rank-op); }
 .user-entry__prefix[data-prefix='%'] { color: var(--rank-halfop); }
 .user-entry__prefix[data-prefix='+'] { color: var(--rank-voice); }
-.user-entry__nick { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-entry__nick { min-width: 0; overflow: clip; text-overflow: ellipsis; white-space: nowrap; }
 .user-panel__status { margin: 0; padding: 14px 18px; color: var(--text-muted); font-size: 13px; }
 .user-panel__footer { margin: 0; padding: 8px 16px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 12px; }
 
@@ -489,9 +500,7 @@ button.mention-option:hover, .mention-option[aria-selected='true'] { background:
   .user-panel-open { transform: none; visibility: visible; box-shadow: var(--shadow); }
 }
 @media (max-width: 640px) {
-  .message-scroll { --nick-cap: 26vw; }
-  .message-row { gap: 7px; padding-inline: 12px; }
-  .message-date-separator, .message-unread-divider, .message-connection-marker, .motd { padding-inline: 12px; }
+  .message-scroll { --nick-cap: 26vw; --line-gutter: 12px; --line-gap: 1ch; }
   .conversation-bar { margin-inline: 10px; }
   .composer { margin: 0 10px 10px; }
   .composer .composer__expiry { padding-inline: 2px; }
@@ -501,6 +510,5 @@ button.mention-option:hover, .mention-option[aria-selected='true'] { background:
   .conversation-edit-topic { display: none; }
 }
 @media (max-width: 430px) {
-  .message-row { gap: 5px; padding-inline: 8px; }
-  .message-scroll { --nick-cap: 24vw; }
+  .message-scroll { --nick-cap: 24vw; --line-gutter: 8px; --line-gap: .75ch; }
 }

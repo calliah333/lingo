@@ -221,11 +221,12 @@ export default function SearchPanel({ networks, buffers, initialBufferId, onClos
                 }}
               >
                 <option value="">All channels and buffers</option>
-                {filteredBuffers.map((buffer) => (
-                  <option key={buffer.id} value={buffer.id}>
-                    {networkById.get(buffer.networkId)?.name ?? 'Network'} · {buffer.name}
-                  </option>
-                ))}
+                {filteredBuffers.map((buffer) => {
+                  const name = buffer.kind === 'server' ? 'Server messages' : buffer.name;
+                  return <option key={buffer.id} value={buffer.id}>
+                    {networkId ? name : `${networkById.get(buffer.networkId)?.name ?? 'Network'} · ${name}`}
+                  </option>;
+                })}
               </select>
             </label>
             <label className="search-filter">
@@ -248,8 +249,8 @@ export default function SearchPanel({ networks, buffers, initialBufferId, onClos
       </div>
       <div className="pane-body search-results" ref={resultsRef} aria-live="polite" aria-busy={loading}>
         <div className="search-view__column">
-          {!input.trim() && <div className="search-results__empty">
-            <Icon name="search" className="search-results__empty-icon" />
+          {!input.trim() && <div className="empty-state">
+            <Icon name="search" className="empty-state__icon" />
             <p>Enter a search phrase to find stored messages.</p>
           </div>}
           {input.trim() && query !== input.trim() && <p className="search-results__status">Waiting to search…</p>}
@@ -274,7 +275,9 @@ export default function SearchPanel({ networks, buffers, initialBufferId, onClos
                       <span className="search-result__context">
                         <span className="search-result__network">{network?.name ?? 'Unknown network'}</span>
                         <span className="search-result__divider" aria-hidden="true">·</span>
-                        <span className="search-result__buffer">{buffer?.name ?? 'Unknown buffer'}</span>
+                        <span className="search-result__buffer">
+                          {!buffer ? 'Unknown buffer' : buffer.kind === 'server' ? 'Server messages' : buffer.name}
+                        </span>
                         <span className="search-result__divider" aria-hidden="true">·</span>
                         <time dateTime={new Date(message.time).toISOString()}>{new Date(message.time).toLocaleString()}</time>
                       </span>

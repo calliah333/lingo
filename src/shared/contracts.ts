@@ -53,6 +53,8 @@ export interface ChatMessage {
   connectionEvent?: 'connected' | 'disconnected';
   isMotd?: true;
   highlight?: boolean;
+  /** Another member joined, left, quit, was kicked, or changed nick; a status line that is never unread. */
+  membership?: true;
 }
 
 /** One line of a network history export (JSONL); buffer exports write plain `ChatMessage` lines. */
@@ -152,6 +154,12 @@ export interface PushKey {
 export interface PushSubscriptionInput {
   endpoint: string;
   keys: { p256dh: string; auth: string };
+}
+
+/** `POST /api/send` result; `joined` lists the channels a `/join` opened, in command order. */
+export interface SendResult {
+  ok: true;
+  joined: ChatBuffer[];
 }
 
 export type ServerEvent =

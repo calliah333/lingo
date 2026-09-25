@@ -53,6 +53,8 @@ type ChannelContext = { kind: 'channel'; start: number; end: number; query: stri
 type ChannelSuggestion = Pick<ChannelListEntry, 'name'> & Partial<ChannelListEntry>;
 
 const CHANNEL_SUGGESTIONS = 20;
+/** Ranked mention options shown at once; large channels send their whole roster. */
+const MENTION_SUGGESTIONS = 50;
 
 /** Position in a most-recent-first list, or Infinity when absent, for ascending sorts. */
 function recency(list: readonly string[], key: string): number {
@@ -123,7 +125,7 @@ export default function MentionComposer({
   const [navigated, setNavigated] = useState(false);
   const [dismissed, setDismissed] = useState(false);
   const [sending, setSending] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const sendingRef = useRef(false);
   const pendingCaret = useRef<number | null>(null);
   const listRequested = useRef(new Set<number>());
@@ -182,7 +184,7 @@ export default function MentionComposer({
         spoke ? spoke.rank : Infinity,
         index,
       ] }];
-    }).sort(byKeys((item) => item.keys)).map((item) => item.candidate);
+    }).sort(byKeys((item) => item.keys)).slice(0, MENTION_SUGGESTIONS).map((item) => item.candidate);
   }, [candidates, context?.kind, context?.query, speakers, buffer.networkId]);
   const matchingCommands = context?.kind === 'command'
     ? commands.filter((command) => command.name.startsWith(context.query.toLowerCase()))
@@ -325,17 +327,23 @@ export default function MentionComposer({
     setNavigated(false);
   }, [context?.kind, context?.query, context?.kind === 'mention' || context?.kind === 'channel' ? context.start : undefined]);
   useLayoutEffect(() => {
+    const input = inputRef.current;
+    if (input) {
+      // Grow with wrapped and multiline drafts; CSS caps the height and scrolls beyond it.
+      input.style.height = 'auto';
+      input.style.height = `${input.scrollHeight}px`;
+    }
     if (pendingCaret.current === null) return;
     const position = pendingCaret.current;
     pendingCaret.current = null;
-    inputRef.current?.setSelectionRange(position, position);
+    input?.setSelectionRange(position, position);
   }, [value]);
 
-  function updateCaret(input: HTMLInputElement) {
+  function updateCaret(input: HTMLTextAreaElement) {
     if (input.selectionStart !== input.selectionEnd) return;
     setCaret(input.selectionStart ?? input.value.length);
   }
-  function handleChange(event: ChangeEvent<HTMLInputElement>) {
+  function handleChange(event: ChangeEvent<HTMLTextAreaElement>) {
     setValue(event.currentTarget.value);
     setCaret(event.currentTarget.selectionStart ?? event.currentTarget.value.length);
     setDismissed(false);
@@ -407,6 +415,7 @@ export default function MentionComposer({
     inputRef.current?.focus();
   }
 
+
   /** Checks sizes, then queues the files; oversized ones are reported and skipped. */
   function uploadFiles(files: File[]) {
     const { upload: limits, disabled: off } = uploadState.current;
@@ -474,7 +483,7 @@ export default function MentionComposer({
     input.focus();
   }
 
-  function handlePaste(event: ClipboardEvent<HTMLInputElement>) {
+  function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
     // Pasted screenshots and copied files upload; plain text pastes as usual.
     if (!upload || !event.clipboardData.files.length) return;
     event.preventDefault();
@@ -516,59 +525,83 @@ export default function MentionComposer({
       chooseChannel(channelOptions[activeIndex]);
       return;
     }
-    const text = value.trim();
-    if (disabled || sendingRef.current || !text) return;
+    if (disabled || sendingRef.current) return;
+    // IRC messages are single lines: each non-blank line goes out as its own message, in order.
+    const lines = value.split(/\r\n|\r|\n/).map((line) => line.trimEnd()).filter(Boolean);
+    if (lines.length === 1) lines[0] = lines[0].trimStart();
+    if (!lines.length) return;
     sendingRef.current = true;
     setSending(true);
     const bufferId = buffer.id;
+    let sent = 0;
     try {
-      await onSend(text);
-      rememberSent(text);
-      // The message itself ends our typing state for everyone; `done` is only for unsent drafts.
-      const target = typingTargets.current.get(bufferId);
-      if (target) {
-        window.clearTimeout(target.timer);
-        target.timer = undefined;
-        target.active = false;
+      for (const line of lines) {
+        await onSend(line);
+        sent += 1;
+        rememberSent(line);
       }
-      setValue('');
-      setCaret(0);
-      setDismissed(false);
     } catch (error) {
       onError(error);
     } finally {
+      if (sent) {
+        // The message itself ends our typing state for everyone; `done` is only for unsent drafts.
+        const target = typingTargets.current.get(bufferId);
+        if (target) {
+          window.clearTimeout(target.timer);
+          target.timer = undefined;
+          target.active = false;
+        }
+        // A failed line stays in the composer with the ones after it; lines already sent are removed.
+        const rest = lines.slice(sent).join('\n');
+        setValue(rest);
+        setCaret(rest.length);
+        pendingCaret.current = rest.length;
+        setDismissed(false);
+      }
       sendingRef.current = false;
       setSending(false);
     }
   }
 
-  function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (handleMenuKey(event)) return;
+    // Enter sends; Shift+Enter starts a new line. IME composition keeps its own Enter.
+    if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
+  }
+
+  /** Suggestion navigation; returns whether the key was handled. */
+  function handleMenuKey(event: KeyboardEvent<HTMLTextAreaElement>): boolean {
     // Alt+↑/↓ switch buffers (App.tsx) even while suggestions are open.
-    if (!menuOpen || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown'))) return;
+    if (!menuOpen || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown'))) return false;
     if (event.key === 'Escape') {
       event.preventDefault();
       setDismissed(true);
-      return;
+      return true;
     }
     if (optionCount && event.key === 'ArrowDown') {
       event.preventDefault();
       setNavigated(true);
       setActiveIndex((index) => (index + 1) % optionCount);
-      return;
+      return true;
     }
     if (optionCount && event.key === 'ArrowUp') {
       event.preventDefault();
       setNavigated(true);
       setActiveIndex((index) => (index - 1 + optionCount) % optionCount);
-      return;
+      return true;
     }
     if (optionCount && (event.key === 'Enter' || event.key === 'Tab')) {
-      if (context?.kind === 'channel' && event.key === 'Enter' && !navigated) return;
+      if (context?.kind === 'channel' && event.key === 'Enter' && !navigated) return false;
       event.preventDefault();
       if (context?.kind === 'mention') choose(filtered[activeIndex]);
       else if (context?.kind === 'command') chooseCommand(matchingCommands[activeIndex]);
       else if (context?.kind === 'channel') chooseChannel(channelOptions[activeIndex]);
+      return true;
     }
+    return false;
   }
 
   return <>
@@ -587,10 +620,11 @@ export default function MentionComposer({
     <form className={`composer${disabled ? ' is-disabled' : ''}`} onSubmit={submit}>
       <label className="sr-only" htmlFor={`message-input-${buffer.id}`}>Message to {buffer.name}</label>
       <div className="typing-indicator" aria-live="polite">{typingText(typing)}</div>
-      <input
+      <textarea
         id={`message-input-${buffer.id}`}
         ref={inputRef}
-        type="text"
+        className="composer__input"
+        rows={1}
         role="combobox"
         aria-autocomplete={autocomplete ? 'list' : 'none'}
         aria-expanded={menuOpen}
@@ -604,7 +638,9 @@ export default function MentionComposer({
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
         placeholder={buffer.kind === 'server' ? 'Type a /command' : `Message ${buffer.name}`}
-        disabled={disabled || sending}
+        // Read-only rather than disabled while sending, so focus stays for the next message.
+        readOnly={sending}
+        disabled={disabled}
       />
       {menuOpen && <ul
         id={listId}
@@ -668,7 +704,7 @@ export default function MentionComposer({
         </>}
       </ul>}
       {upload && expiry && <>
-        <input ref={fileInputRef} className="composer__file" type="file" multiple hidden tabIndex={-1} onChange={handleFiles} />
+        <input ref={fileInputRef} type="file" multiple hidden tabIndex={-1} onChange={handleFiles} />
         <select className="composer__expiry" aria-label="Uploaded files expire after" title="Uploaded files expire after"
           value={expiry} disabled={disabled} onChange={(event) => onUploadExpiryChange(event.currentTarget.value as UploadExpiry)}>
           {upload.expiries.map((option) => <option key={option} value={option}>{expiryLabels[option]}</option>)}

@@ -37,3 +37,12 @@ export default function Icon({ name, className }: { name: IconName; className?: 
   return <svg className={className ? `icon ${className}` : 'icon'} viewBox="0 0 24 24" aria-hidden="true" focusable="false"
     fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
+
+/** Lingo's mark: a speech bubble holding an IRC channel hash. `public/favicon.svg` and the PNG app icons draw the same shapes. */
+export function Logo({ className }: { className?: string }) {
+  return <svg className={className ? `logo ${className}` : 'logo'} viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+    <path className="logo__bubble"
+      d="M20 6h24a14 14 0 0 1 14 14v14a14 14 0 0 1-14 14H23L10.6 57.3C8.6 58.8 6 57.4 6 55V20A14 14 0 0 1 20 6Z" />
+    <path className="logo__hash" d="M27.5 16.5 24.5 37.5M39.5 16.5l-3 21M20 23.5h24.5M19 31h24.5" />
+  </svg>;
+}

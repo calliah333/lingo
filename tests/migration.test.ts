@@ -350,7 +350,7 @@ test(`migrates v${version} accounts in place while retaining networks and messag
     expect(store.listAdminUsers(0)[1]).toMatchObject({ disabled: false, lastLoginAt: 600, networkCount: 2 });
     const migrated = new Database(path);
     try {
-      expect(migrated.query('PRAGMA user_version').get()).toEqual({ user_version: 14 });
+      expect(migrated.query('PRAGMA user_version').get()).toEqual({ user_version: 15 });
     } finally {
       migrated.close();
     }
@@ -392,7 +392,7 @@ test('v8 migration preserves v7 user data and keeps settings unconfigured until 
         DROP TABLE read_markers;
         ALTER TABLE messages DROP COLUMN highlight;
         DROP TABLE user_settings;
-        DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 7;
+        DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; ALTER TABLE messages DROP COLUMN membership; PRAGMA user_version = 7;
       `);
     } finally {
       legacy.close();
@@ -460,7 +460,7 @@ test('v9 migration seeds each buffer marker at its latest v8 message and cascade
       legacy.exec(`
         ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP INDEX messages_msgid; ALTER TABLE messages DROP COLUMN msgid;
         DROP TABLE push_subscriptions; DROP TABLE server_settings;
-        DROP TABLE read_markers; ALTER TABLE messages DROP COLUMN highlight; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 8;
+        DROP TABLE read_markers; ALTER TABLE messages DROP COLUMN highlight; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; ALTER TABLE messages DROP COLUMN membership; PRAGMA user_version = 8;
       `);
     } finally {
       legacy.close();
@@ -488,7 +488,7 @@ test('v9 migration seeds each buffer marker at its latest v8 message and cascade
         .toEqual({ last_read_id: otherLast.id });
       expect(db.query('SELECT * FROM read_markers WHERE buffer_id = ?').all(channel.id)).toEqual([]);
       expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
-      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 14 });
+      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 15 });
     } finally {
       db.close();
     }
@@ -516,7 +516,7 @@ test('v10 migration adds push storage whose subscriptions follow their session a
     try {
       legacy.exec(`
         ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP INDEX messages_msgid; ALTER TABLE messages DROP COLUMN msgid;
-        DROP TABLE push_subscriptions; DROP TABLE server_settings; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 9;
+        DROP TABLE push_subscriptions; DROP TABLE server_settings; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; ALTER TABLE messages DROP COLUMN membership; PRAGMA user_version = 9;
       `);
     } finally {
       legacy.close();
@@ -541,7 +541,7 @@ test('v10 migration adds push storage whose subscriptions follow their session a
     try {
       expect(db.query('SELECT COUNT(*) AS count FROM push_subscriptions').get()).toEqual({ count: 0 });
       expect(db.query('SELECT value FROM server_settings').all()).toEqual([{ value: 'first' }]);
-      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 14 });
+      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 15 });
     } finally {
       db.close();
     }
@@ -576,7 +576,7 @@ test('v11 migration keeps history and stores each msgid once per buffer', () => 
     store = undefined;
     const legacy = new Database(path);
     try {
-      legacy.exec('ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP INDEX messages_msgid; ALTER TABLE messages DROP COLUMN msgid; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 10');
+      legacy.exec('ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP INDEX messages_msgid; ALTER TABLE messages DROP COLUMN msgid; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; ALTER TABLE messages DROP COLUMN membership; PRAGMA user_version = 10');
     } finally {
       legacy.close();
     }
@@ -624,7 +624,7 @@ test('v12 migration opts existing networks into backfill and replays skip identi
     store = undefined;
     const legacy = new Database(path);
     try {
-      legacy.exec('ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 11');
+      legacy.exec('ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick; ALTER TABLE networks DROP COLUMN backfill; DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; ALTER TABLE messages DROP COLUMN membership; PRAGMA user_version = 11');
     } finally {
       legacy.close();
     }
@@ -668,7 +668,7 @@ test('v13 migration adds connect options off for existing networks', () => {
     try {
       legacy.exec(`
         ALTER TABLE networks DROP COLUMN join_delay_seconds; ALTER TABLE networks DROP COLUMN regain_nick;
-        DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; PRAGMA user_version = 12;
+        DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload; ALTER TABLE messages DROP COLUMN membership; PRAGMA user_version = 12;
       `);
     } finally {
       legacy.close();
@@ -702,7 +702,7 @@ test('v14 migration lets only the admin upload and upload rows follow their user
     try {
       legacy.exec(`
         DROP TABLE uploads; ALTER TABLE users DROP COLUMN can_upload;
-        PRAGMA user_version = 13;
+        ALTER TABLE messages DROP COLUMN membership; PRAGMA user_version = 13;
       `);
     } finally {
       legacy.close();

@@ -55,14 +55,14 @@ export default function ChannelListPanel({
   const updatedAt = status?.updatedAt ?? page?.updatedAt ?? null;
   const summary = state === 'loading' ? `Loading… ${total.toLocaleString()} channels so far`
     : state === 'complete' ? `${total.toLocaleString()} channels${updatedAt ? ` · updated ${new Date(updatedAt).toLocaleTimeString()}` : ''}`
-      : connected ? 'No channel list loaded yet.' : 'Connect to this network to list its channels.';
+      : '';
 
   return <section className="channel-list-view" aria-label={`Channel list for ${network.name}`}>
     <PaneHeader overline={network.name} title="Channel list" actions={<>
-      <button className="button button-small" type="button" onClick={onRefresh}
+      {state !== 'idle' && <button className="button button-small" type="button" onClick={onRefresh}
         disabled={!connected || state === 'loading'}>
-        <Icon name="rotate" />{state === 'idle' ? 'Load channels' : 'Refresh'}
-      </button>
+        <Icon name="rotate" />Refresh
+      </button>}
       <button className="icon-button" type="button" aria-label="Close channel list" title="Close" onClick={onClose}>
         <Icon name="x" />
       </button>
@@ -84,6 +84,12 @@ export default function ChannelListPanel({
     <div className="pane-body channel-list-view__results">
       <div className="channel-list-view__column">
         {error && <p className="error-text channel-list-view__error" role="alert">{error}</p>}
+        {state === 'idle' && <div className="empty-state">
+          <Icon name="list" className="empty-state__icon" />
+          <p>{connected ? `Load the channels on ${network.name} to browse and join them.`
+            : 'Connect to this network to list its channels.'}</p>
+          {connected && <button className="button button-primary" type="button" onClick={onRefresh}>Load channels</button>}
+        </div>}
         {page && page.channels.length > 0 ? <table className="channel-list-table">
           <thead><tr>
             <th scope="col">Channel</th>
@@ -94,7 +100,7 @@ export default function ChannelListPanel({
           <tbody>
             {page.channels.map((channel) => {
               const joined = isJoined(channel.name);
-              return <tr key={channel.name} className={joined ? 'channel-list-table__row--joined' : undefined}>
+              return <tr key={channel.name}>
                 <td className="channel-list-table__channel">
                   <span className="channel-list-table__name">{channel.name}</span>
                   {joined && <span className="badge badge-accent channel-list-table__joined">joined</span>}

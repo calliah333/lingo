@@ -7,8 +7,8 @@ import { secureHeaders } from 'hono/secure-headers';
 import type { WSContext } from 'hono/ws';
 import { z } from 'zod';
 import type {
-  AccountUser, Bootstrap, ChatBuffer, MentionCandidate, PushKey, ServerEvent, SetupStatus, UploadCapabilities, UploadExpiry,
-  UploadRecord,
+  AccountUser, Bootstrap, ChatBuffer, MentionCandidate, PushKey, SendResult, ServerEvent, SetupStatus, UploadCapabilities,
+  UploadExpiry, UploadRecord,
 } from '../shared/contracts.ts';
 import { exportFilename, exportResponse } from './export.ts';
 import type { IrcManager } from './irc.ts';
@@ -893,14 +893,20 @@ export function createApp(
     if (!buffer) return c.json({ error: 'Buffer not found' }, 404);
     const seen = new Set<string>();
     const participants: MentionCandidate[] = [];
-    for (const candidate of [...manager.listLiveParticipants(id), ...store.listRecentParticipants(id)]) {
+    const add = (candidate: MentionCandidate) => {
       const mention = candidate.mention.trim();
-      if (!mention) continue;
       const key = mention.toLowerCase();
-      if (seen.has(key)) continue;
+      if (!mention || seen.has(key)) return;
       seen.add(key);
       participants.push({ name: candidate.name, mention });
-      if (participants.length === 100) break;
+    };
+    // Everyone in the channel is offered, however large it is; the client filters and ranks the whole set.
+    // Past speakers who are no longer present add at most 100 more.
+    for (const candidate of manager.listLiveParticipants(id)) add(candidate);
+    const live = participants.length;
+    for (const candidate of store.listRecentParticipants(id)) {
+      if (participants.length - live === 100) break;
+      add(candidate);
     }
     return c.json({ participants });
   });
@@ -926,12 +932,13 @@ export function createApp(
   app.post('/api/send', async (c) => {
     const { bufferId, text } = await jsonBody(c, sendInput);
     if (!ownedBuffer(c, bufferId)) return c.json({ error: 'Buffer not found' }, 404);
+    let joined: ChatBuffer[];
     try {
-      manager.send(bufferId, text);
+      joined = manager.send(bufferId, text);
     } catch (error) {
       return c.json({ error: error instanceof Error ? error.message : 'Cannot send message' }, 400);
     }
-    return c.json({ ok: true });
+    return c.json({ ok: true, joined } satisfies SendResult);
   });
 
   app.put('/api/buffers/:id/read', async (c) => {

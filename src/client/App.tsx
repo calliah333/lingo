@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import type {
   AccountUser, Bootstrap, BufferUnread, ChannelListStatus, ChannelState, ChatBuffer, ChatMessage, Network, NetworkInput,
-  NetworkStatus, ServerEvent, SetupStatus, SyncedSettings, UploadCapabilities,
+  NetworkStatus, SendResult, ServerEvent, SetupStatus, SyncedSettings, UploadCapabilities,
 } from '../shared/contracts';
 import { displayIdentity } from '../shared/identity';
 import { api, ApiError, errorText, json } from './api';
@@ -11,7 +11,7 @@ import { attention, isJoined, mergeMessages, messagePage, orderedBuffers, ownNam
 import ContextMenu, { type MenuItem, type MenuSubject } from './ContextMenu';
 import ConversationHeader from './ConversationHeader';
 import { BanListDialog, DisplayNameDialog, ExportDialog, IgnoreListDialog, WhoisDialog } from './Dialogs';
-import Icon from './Icon';
+import Icon, { Logo } from './Icon';
 import MentionComposer, { type ComposerHandle } from './MentionComposer';
 import { playChime } from './notify';
 import PaneHeader, { SidebarContext, type SidebarControl } from './PaneHeader';
@@ -89,7 +89,6 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [view, setView] = useState<View>({ bufferId: null, messages: [], hasMore: false, loading: false, error: '' });
   const [olderPending, setOlderPending] = useState(false);
-  const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState('');
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting');
   const [settingsTarget, setSettingsTarget] = useState<number | 'new' | null>(null);
@@ -109,13 +108,16 @@ export default function App() {
   const [channelLists, setChannelLists] = useState<Record<number, ChannelListStatus>>({});
   const [joining, setJoining] = useState(false);
   const [channelDetails, setChannelDetails] = useState<ChannelDetails | null>(null);
+  /** Bumped on every event-socket (re)connect so the selected channel's roster is fetched again. */
+  const [channelResync, setChannelResync] = useState(0);
   const { typers, update: updateTyping, retain: retainTypers } = useTypers();
   const [usersPanelOpen, setUsersPanelOpen] = useState(false);
   const [topicEditing, setTopicEditing] = useState(false);
   const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences);
   const [unread, setUnread] = useState<Record<number, BufferUnread>>({});
   const [jump, setJump] = useState<Jump | null>(null);
-  const [divider, setDivider] = useState<{ bufferId: number; after: number } | null>(null);
+  /** `after: null` once dismissed with Esc; the entry still claims the visit so the divider does not return. */
+  const [divider, setDivider] = useState<{ bufferId: number; after: number | null } | null>(null);
   const [reloadSerial, setReloadSerial] = useState(0);
   /** `null` until fetched after sign-in; a failed fetch counts as unavailable. */
   const [uploadCapabilities, setUploadCapabilities] = useState<UploadCapabilities | null>(null);
@@ -428,8 +430,17 @@ export default function App() {
     setBuffers(data.buffers);
     setStatuses(data.statuses);
     setIgnores(data.ignores);
+    setChannelListTabs((current) => {
+      const kept = current.filter((id) => data.networks.some((network) => network.id === id));
+      return kept.length === current.length ? current : kept;
+    });
     setSelectedId((current) => {
-      if (current !== null && data.buffers.some((buffer) => buffer.id === current && !settingsRef.current.hiddenBuffers.includes(buffer.id))) return current;
+      const visible = (id: number) =>
+        data.buffers.some((buffer) => buffer.id === id && !settingsRef.current.hiddenBuffers.includes(buffer.id));
+      if (current !== null && visible(current)) return current;
+      // A fresh page load reopens the conversation this browser showed last.
+      const remembered = savedIds('lingo-last-buffer')[0];
+      if (current === null && remembered !== undefined && visible(remembered)) return remembered;
       return (data.buffers.find((buffer) => buffer.kind === 'server')
         ?? data.buffers.find((buffer) => !settingsRef.current.hiddenBuffers.includes(buffer.id)))?.id ?? null;
     });
@@ -571,6 +582,12 @@ export default function App() {
       localStorage.setItem('lingo-channel-lists', JSON.stringify(channelListTabs));
     } catch { /* Storage may be disabled. */ }
   }, [channelListTabs]);
+  useEffect(() => {
+    if (selectedId === null) return;
+    try {
+      localStorage.setItem('lingo-last-buffer', JSON.stringify([selectedId]));
+    } catch { /* Storage may be disabled. */ }
+  }, [selectedId]);
 
   async function authenticated() {
     await refreshBootstrap();
@@ -653,6 +670,8 @@ export default function App() {
           setSwitcherOpen(false);
           return;
         }
+        // Esc over the conversation also dismisses its "New messages" divider for this visit.
+        if (readVisibleRef.current) setDivider((current) => current?.after != null ? { ...current, after: null } : current);
         setSearchOpen(false);
         setSettingsTarget(null);
         setGlobalSettingsOpen(false);
@@ -689,7 +708,7 @@ export default function App() {
         }
       }
       if (event.key === '/' && !typing && !event.altKey && !event.ctrlKey && !event.metaKey) {
-        const input = document.querySelector<HTMLInputElement>('.composer input');
+        const input = document.querySelector<HTMLTextAreaElement>('.composer__input');
         if (input) {
           event.preventDefault();
           window.dispatchEvent(new Event('lingo:slash'));
@@ -772,7 +791,7 @@ export default function App() {
           const inbound = !own && !!sender && !event.message.fromNetwork
             && (event.message.kind === 'privmsg' || event.message.kind === 'action' || event.message.kind === 'notice');
           const highlight = inbound && (event.message.highlight === true || buffer?.kind === 'query');
-          if (!own) {
+          if (!own && !event.message.membership) {
             recentMessages.current.set(event.message.id, { bufferId: event.message.bufferId, mention: highlight });
             updateUnread((current) => {
               const previous = current[event.message.bufferId] ?? { messages: 0, mentions: 0, lastReadId: 0 };
@@ -910,6 +929,8 @@ export default function App() {
         attempt = 0;
         setConnection('live');
         void refreshBootstrap(controller.signal).then(() => {
+          // Roster and topic changes made while the socket was down were never delivered.
+          setChannelResync((serial) => serial + 1);
           const bufferId = selectedRef.current;
           if (bufferId !== null) return catchUp(bufferId);
         }).catch((error: unknown) => { if (!controller.signal.aborted) fail(error); });
@@ -982,15 +1003,20 @@ export default function App() {
     };
   }, [clearReadTimer, requestRead]);
   useEffect(() => {
-    const controller = new AbortController();
-    const version = ++channelStateVersion.current;
     setTopicEditing(false);
     setUsersPanelOpen(false);
+  }, [auth, selectedChannelId, channelJoined, channelConnected]);
+  useEffect(() => {
+    const controller = new AbortController();
+    const version = ++channelStateVersion.current;
     if (auth !== 'ready' || selectedChannelId === null || !channelJoined || !channelConnected) {
       setChannelDetails(null);
       return () => controller.abort();
     }
-    setChannelDetails({ bufferId: selectedChannelId, state: null, loading: true, error: '' });
+    // A resync keeps showing the current roster until the fresh one arrives.
+    setChannelDetails((current) => current?.bufferId === selectedChannelId && current.state
+      ? current
+      : { bufferId: selectedChannelId, state: null, loading: true, error: '' });
     void api<ChannelState>(`/api/buffers/${selectedChannelId}/channel`, { signal: controller.signal })
       .then((state) => {
         if (!controller.signal.aborted && channelStateVersion.current === version) {
@@ -1002,7 +1028,7 @@ export default function App() {
         }
       });
     return () => controller.abort();
-  }, [auth, selectedChannelId, channelJoined, channelConnected]);
+  }, [auth, selectedChannelId, channelJoined, channelConnected, channelResync]);
   useEffect(() => {
     const target = pendingTopicEdit.current;
     if (target === null || channelDetails?.bufferId !== target || !channelDetails.state) return;
@@ -1020,7 +1046,7 @@ export default function App() {
     setNotice('');
     readBottomRef.current = null;
     readPending.current = null;
-    document.querySelector<HTMLInputElement>('.composer input')?.focus();
+    document.querySelector<HTMLTextAreaElement>('.composer__input')?.focus();
   }
   const selectBufferRef = useRef(selectBuffer);
   selectBufferRef.current = selectBuffer;
@@ -1073,18 +1099,17 @@ export default function App() {
   }
 
   async function sendMessage(text: string) {
-    if (selectedId === null || sending || !text.trim()) return;
-    setSending(true);
+    if (selectedId === null || !text.trim()) return;
     setNotice('');
     try {
-      await api<{ ok: true }>('/api/send', json('POST', { bufferId: selectedId, text }));
+      const { joined } = await api<SendResult>('/api/send', json('POST', { bufferId: selectedId, text }));
       const networkId = buffers.find((buffer) => buffer.id === selectedId)?.networkId;
       if (networkId !== undefined && /^\/list(?:\s|$)/i.test(text.trim())) openChannelList(networkId, false);
+      // The join already happened; a failed refresh must not leave the command in the composer.
+      if (networkId !== undefined && joined.length) void openJoined(networkId, joined).catch(fail);
     } catch (error) {
       fail(error);
       throw error;
-    } finally {
-      setSending(false);
     }
   }
 
@@ -1139,6 +1164,12 @@ export default function App() {
   async function joinChannels(networkId: number, names: string[]) {
     const { buffers: joined } = await api<{ buffers: ChatBuffer[] }>('/api/buffers/batch',
       json('POST', { networkId, names }));
+    await openJoined(networkId, joined);
+    setJoinTarget(null);
+  }
+
+  /** Shows freshly joined channels (unhiding them and their network) and selects the last one. */
+  async function openJoined(networkId: number, joined: ChatBuffer[]) {
     setBuffers((current) => {
       const updated = [...current];
       for (const buffer of joined) {
@@ -1154,7 +1185,6 @@ export default function App() {
     if (stillHidden.length !== settingsRef.current.hiddenBuffers.length) updateSettings({ hiddenBuffers: stillHidden });
     removeSettingId('collapsedNetworks', networkId);
     await refreshBootstrap();
-    setJoinTarget(null);
     if (joined.length) selectBuffer(joined[joined.length - 1].id);
   }
 
@@ -1466,7 +1496,7 @@ export default function App() {
   };
 
   return <SidebarContext.Provider value={sidebarControl}>
-    <div className={`app-shell${preferences.sidebarCollapsed && !drawerSidebar ? ' is-sidebar-collapsed' : ''}`}>
+    <div className="app-shell">
       {drawerSidebar && sidebarOpen && <button className="sidebar-scrim" type="button" aria-label="Close networks"
         onClick={() => setSidebarOpen(false)} />}
       <Sidebar sidebarRef={sidebarRef} drawer={drawerSidebar} open={sidebarOpen}
@@ -1564,7 +1594,7 @@ export default function App() {
               onClick={() => void joinChannel(selected.networkId, selected.name)}>{joining ? 'Joining…' : 'Rejoin'}</button>
           </div>}
           <MentionComposer ref={composerRef} buffer={selected} network={activeNetwork} messages={messages}
-            ownNames={ownNames(activeNetwork, statuses[selected.networkId])} disabled={!selectedJoined || sending}
+            ownNames={ownNames(activeNetwork, statuses[selected.networkId])} disabled={!selectedJoined}
             knownChannels={buffers.filter((buffer) => buffer.networkId === selected.networkId && buffer.kind === 'channel')
               .map((buffer) => buffer.name)}
             channelListUpdatedAt={channelLists[selected.networkId]?.updatedAt ?? null}
@@ -1576,9 +1606,9 @@ export default function App() {
             onUploadLimitsChanged={() => void refreshUploadCapabilities()}
             onSend={sendMessage} onError={fail} autocomplete={preferences.autocomplete} />
         </> : <>
-          <PaneHeader title="lingo" />
+          <PaneHeader title="Home" />
           <div className="welcome">
-            <div className="welcome__mark" aria-hidden="true">&gt;_</div>
+            <Logo className="welcome__mark" />
             <h2>{networks.length ? 'Pick a conversation' : 'Welcome to Lingo'}</h2>
             <p>{networks.length
               ? 'Choose a channel from the sidebar, or join a new one from a network’s menu.'

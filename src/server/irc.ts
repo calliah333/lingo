@@ -1,3 +1,4 @@
+import type { Socket } from 'node:net';
 import { Client, type IrcBatch, type IrcEvent } from 'irc-framework';
 import type {
   BanEntry,
@@ -34,6 +35,14 @@ const TYPING_REPEAT_MS = 2_000;
 const TYPING_STATES: readonly string[] = ['active', 'paused', 'done'] satisfies TypingState[];
 /** Fallback nicks tried while registering under a taken nick; afterwards the server's timeout closes the link. */
 const NICK_ATTEMPTS = 10;
+/** irc-framework `irc error` names for a refused JOIN. */
+const JOIN_ERRORS = ['too_many_channels', 'channel_is_full', 'invite_only_channel', 'banned_from_channel', 'bad_channel_key'];
+/** ERR_NEEDREGGEDNICK: the channel admits only users identified to an account. */
+const ERR_NEEDREGGEDNICK = '477';
+/** Refused-JOIN numerics irc-framework does not handle: no such channel, account, TLS, or oper only. */
+const JOIN_NUMERICS = ['403', ERR_NEEDREGGEDNICK, '489', '520'];
+/** Retry for account-only channels when services never send RPL_LOGGEDIN after identifying. */
+const ACCOUNT_JOIN_RETRY_MS = 10_000;
 
 type Pending<T> = {
   key: string;
@@ -74,6 +83,11 @@ type Runtime = {
   joinTimer: NodeJS.Timeout | null;
   /** Fallback nicks tried during the current registration. */
   nickAttempts: number;
+  /** Account-only channels refused on this connection, rejoined once services identify us. */
+  accountJoins: Map<string, string>;
+  accountJoinTimer: NodeJS.Timeout | null;
+  /** Channels already retried after an account refusal on this connection; each retries once. */
+  retriedJoins: Set<string>;
 };
 
 function isChannel(name: string): boolean {
@@ -104,6 +118,11 @@ function eventTime(event: IrcEvent): number {
 
 function isReplay(event: IrcEvent): boolean {
   return !!event.batch && HISTORY_BATCHES.includes(event.batch.type);
+}
+
+/** ` (reason)` for part, quit, and kick lines, or nothing when none was given. */
+function reason(message: string | undefined): string {
+  return message?.trim() ? ` (${message.trim()})` : '';
 }
 
 /** Registration fallbacks for a taken nick: `nick_`, `nick__`, then a short numbered variant. */
@@ -175,10 +194,16 @@ export class IrcManager {
       typingSent: new Map(),
       joinTimer: null,
       nickAttempts: 0,
+      accountJoins: new Map(),
+      accountJoinTimer: null,
+      retriedJoins: new Set(),
     };
     this.connections.set(network.id, runtime);
     this.setStatus(runtime, 'connecting');
     this.serverBuffer(network.id);
+    // irc-framework also arms a 150 s socket idle timeout, but Bun never refreshes it on traffic,
+    // so it closed healthy links every 150 s. The library's PING/PONG timeout detects dead links.
+    client.on<Socket>('raw socket connected', socket => socket.setTimeout(0));
 
     client.on('registered', (event: IrcEvent) => {
       if (!runtime.active || runtime.registered) return;
@@ -247,6 +272,7 @@ export class IrcManager {
       if (!runtime.joined.has(key)) return;
       this.liveChannel(runtime, key).users.set(event.nick.toLowerCase(), { nick: event.nick, modes: [] });
       this.publishChannel(runtime, event.channel);
+      if (!self) this.membership(runtime, event.channel, event.nick, `${event.nick} joined`, event);
     });
     client.on('part', (event: IrcEvent) => {
       if (!runtime.active || !event.channel || !event.nick) return;
@@ -254,14 +280,17 @@ export class IrcManager {
       if (client.caseCompare(event.nick, client.user.nick)) {
         runtime.joined.delete(key);
         this.clearChannel(runtime, key);
-      } else if (this.deleteNick(client, runtime.channels.get(key)?.users, event.nick)) {
-        this.publishChannel(runtime, event.channel);
+      } else if (runtime.joined.has(key)) {
+        if (this.deleteNick(client, runtime.channels.get(key)?.users, event.nick)) this.publishChannel(runtime, event.channel);
+        this.membership(runtime, event.channel, event.nick, `${event.nick} left${reason(event.message)}`, event);
       }
     });
     client.on('quit', (event: IrcEvent) => {
       if (!runtime.active || !event.nick) return;
       for (const [channel, state] of runtime.channels) {
-        if (this.deleteNick(client, state.users, event.nick)) this.publishChannel(runtime, channel);
+        if (!this.deleteNick(client, state.users, event.nick)) continue;
+        this.publishChannel(runtime, channel);
+        this.membership(runtime, channel, event.nick, `${event.nick} quit${reason(event.message)}`, event);
       }
     });
     client.on('kick', (event: IrcEvent) => {
@@ -270,23 +299,44 @@ export class IrcManager {
       if (client.caseCompare(event.kicked, client.user.nick)) {
         runtime.joined.delete(key);
         this.clearChannel(runtime, key);
-      } else if (this.deleteNick(client, runtime.channels.get(key)?.users, event.kicked)) {
-        this.publishChannel(runtime, event.channel);
+        const buffer = this.storedBuffer(network.id, event.channel, 'channel');
+        if (buffer) this.system(buffer, `You were kicked by ${event.nick ?? 'the server'}${reason(event.message)}`,
+          eventTime(event), true);
+      } else if (runtime.joined.has(key)) {
+        if (this.deleteNick(client, runtime.channels.get(key)?.users, event.kicked)) this.publishChannel(runtime, event.channel);
+        this.membership(runtime, event.channel, event.kicked,
+          `${event.kicked} was kicked by ${event.nick ?? 'the server'}${reason(event.message)}`, event);
       }
     });
     client.on('nick', (event: IrcEvent) => {
       if (!runtime.active || !event.nick || !event.new_nick) return;
+      const self = client.caseCompare(event.nick, runtime.status.nick);
       for (const [channel, state] of runtime.channels) {
         const user = this.deleteNick(client, state.users, event.nick);
         if (user) {
           state.users.set(event.new_nick.toLowerCase(), { ...user, nick: event.new_nick });
           this.publishChannel(runtime, channel);
+          if (!self) this.membership(runtime, channel, event.nick, `${event.nick} is now known as ${event.new_nick}`, event);
         }
       }
-      if (client.caseCompare(event.nick, runtime.status.nick)) {
+      if (self) {
         this.setStatus(runtime, runtime.status.state, event.new_nick);
         this.system(this.serverBuffer(network.id), `You are now known as ${event.new_nick}`, eventTime(event), true);
       }
+    });
+    client.on('irc error', (event: { error?: string; channel?: string; reason?: string }) => {
+      if (runtime.active && event.channel && event.error && JOIN_ERRORS.includes(event.error))
+        this.joinFailed(runtime, event.channel, event.reason, false);
+    });
+    // irc-framework has no handler for these join refusals and reports them as unknown commands.
+    client.on<{ command: string; params: string[] }>('unknown command', (command) => {
+      const channel = command.params[1];
+      if (runtime.active && channel && JOIN_NUMERICS.includes(command.command))
+        this.joinFailed(runtime, channel, command.params[2], command.command === ERR_NEEDREGGEDNICK);
+    });
+    // RPL_LOGGEDIN: services identified us, so channels that required an account can be joined now.
+    client.on('loggedin', () => {
+      if (runtime.active) this.retryAccountJoins(runtime);
     });
     client.on('mode', (event: IrcEvent) => {
       if (!runtime.active || !event.target || !event.modes) return;
@@ -782,7 +832,8 @@ export class IrcManager {
     if (runtime) this.clearChannel(runtime, key);
   }
 
-  send(bufferId: number, text: string): void {
+  /** Sends a line or command; returns the channel buffers a `/join` opened. */
+  send(bufferId: number, text: string): ChatBuffer[] {
     const buffer = this.store.getBuffer(bufferId);
     if (!buffer) throw new Error('Buffer not found');
     const runtime = this.connections.get(buffer.networkId);
@@ -790,10 +841,10 @@ export class IrcManager {
     if (!safeText(text)) throw new Error('Enter a single-line message');
     if (!runtime.registered && !/^\/(?:join|part)(?:\s|$)/i.test(text))
       throw new Error('Network is not connected');
-    this.sendText(runtime, buffer, text, true);
+    return this.sendText(runtime, buffer, text, true) ?? [];
   }
 
-  private sendText(runtime: Runtime, buffer: ChatBuffer, text: string, record: boolean): void {
+  private sendText(runtime: Runtime, buffer: ChatBuffer, text: string, record: boolean): ChatBuffer[] | void {
     if (text.startsWith('//')) {
       this.sendTo(runtime, buffer, 'privmsg', text.slice(1), record);
       return;
@@ -807,10 +858,8 @@ export class IrcManager {
     const command = (space < 0 ? text.slice(1) : text.slice(1, space)).toLowerCase();
     const args = space < 0 ? '' : text.slice(space + 1).trim();
     switch (command) {
-      case 'join': {
-        this.joinMany(runtime.network.id, channelsFrom(args));
-        return;
-      }
+      case 'join':
+        return this.joinMany(runtime.network.id, channelsFrom(args));
       case 'list': {
         this.requestChannelList(runtime.network.id, args || undefined);
         return;
@@ -992,9 +1041,52 @@ export class IrcManager {
     }
   }
 
+  /** Drops this connection's pending autojoin and account-only rejoins. */
   private cancelJoin(runtime: Runtime): void {
     clearTimeout(runtime.joinTimer ?? undefined);
     runtime.joinTimer = null;
+    clearTimeout(runtime.accountJoinTimer ?? undefined);
+    runtime.accountJoinTimer = null;
+    runtime.accountJoins.clear();
+    runtime.retriedJoins.clear();
+  }
+
+  /**
+   * Records why the server refused a JOIN we sent, so the channel can be joined again. A channel that
+   * needs an account (services usually identify us just after autojoin) is retried once, as soon as
+   * RPL_LOGGEDIN arrives or after ACCOUNT_JOIN_RETRY_MS.
+   */
+  private joinFailed(runtime: Runtime, channel: string, why: string | undefined, needsAccount: boolean): void {
+    const key = channel.toLowerCase();
+    // Only an unconfirmed JOIN: some of these numerics also answer other commands on joined channels.
+    if (!runtime.joined.has(key) || runtime.channels.has(key)) return;
+    runtime.joined.delete(key);
+    const retry = needsAccount && !runtime.retriedJoins.has(key);
+    const buffer = this.storedBuffer(runtime.network.id, channel, 'channel');
+    if (buffer) {
+      this.system(buffer, `Cannot join ${channel}: ${why?.trim() || 'refused by the server'}` +
+        (retry ? '. Retrying once you are identified.' : ''), Date.now(), true);
+    }
+    if (!retry) return;
+    runtime.retriedJoins.add(key);
+    runtime.accountJoins.set(key, channel);
+    runtime.accountJoinTimer ??= setTimeout(() => {
+      runtime.accountJoinTimer = null;
+      this.retryAccountJoins(runtime);
+    }, ACCOUNT_JOIN_RETRY_MS);
+  }
+
+  /** Rejoins refused account-only channels that are still autojoined and not joined meanwhile. */
+  private retryAccountJoins(runtime: Runtime): void {
+    clearTimeout(runtime.accountJoinTimer ?? undefined);
+    runtime.accountJoinTimer = null;
+    if (!runtime.registered) return;
+    for (const [key, channel] of runtime.accountJoins) {
+      if (runtime.joined.has(key) || !runtime.network.autojoin.some(name => name.toLowerCase() === key)) continue;
+      runtime.joined.add(key);
+      runtime.client.join(channel);
+    }
+    runtime.accountJoins.clear();
   }
 
   /** Asks services for the configured nick when registration fell back to another one; SASL identified us. */
@@ -1131,7 +1223,7 @@ export class IrcManager {
     nick: string | null,
     text: string,
     time: number,
-    metadata: Pick<ChatMessage, 'fromNetwork' | 'connectionEvent' | 'isMotd' | 'highlight'> = {},
+    metadata: Pick<ChatMessage, 'fromNetwork' | 'connectionEvent' | 'isMotd' | 'highlight' | 'membership'> = {},
     msgid: string | null = null,
     replayed = false,
   ): ChatMessage | null {
@@ -1144,6 +1236,13 @@ export class IrcManager {
 
   private system(buffer: ChatBuffer, text: string, time: number, fromNetwork = false): void {
     this.message(buffer, 'system', null, text, time, fromNetwork ? { fromNetwork: true } : {});
+  }
+
+  /** Stores another member's join/part/quit/kick/nick line; ignored nicks and replays leave none. */
+  private membership(runtime: Runtime, channel: string, nick: string, text: string, event: IrcEvent): void {
+    if (isReplay(event) || this.ignoreList(runtime.network.id).some(ignored => runtime.client.caseCompare(ignored, nick))) return;
+    const buffer = this.storedBuffer(runtime.network.id, channel, 'channel');
+    if (buffer) this.message(buffer, 'system', null, text, eventTime(event), { membership: true });
   }
 
   private setStatus(runtime: Runtime, state: NetworkStatus['state'], nick = runtime.status.nick, error?: string): void {
