@@ -383,6 +383,8 @@ button.mention-option:hover, .mention-option[aria-selected='true'] { background:
 .channel-option strong { font-family: var(--mono); font-weight: 600; }
 .channel-option__users { flex: none; color: var(--text-faint); font-size: 11.5px; }
 .channel-option__topic { min-width: 0; overflow: clip; color: var(--text-faint); font-size: 12px; text-overflow: ellipsis; }
+.emoji-option { display: flex; align-items: center; gap: 10px; }
+.emoji-option__glyph { flex: none; width: 1.4em; font-size: 17px; line-height: 1; text-align: center; }
 
 /* Member list */
 .user-panel {

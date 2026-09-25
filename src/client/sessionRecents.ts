@@ -1,10 +1,12 @@
 /**
- * What you did in this page session, per network, most recent first: whom you mentioned and which channels you
- * joined or talked in. Suggestions rank these first; nothing is persisted, so a reload starts fresh.
+ * What you did in this page session, most recent first: per network, whom you mentioned and which channels you
+ * joined or talked in; across networks, which emoji you picked. Suggestions rank these first; nothing is
+ * persisted, so a reload starts fresh.
  */
 const LIMIT = 50;
 const mentions = new Map<number, string[]>();
 const channels = new Map<number, string[]>();
+let emojis: string[] = [];
 
 export const sessionStartedAt = Date.now();
 
@@ -30,4 +32,13 @@ export function recentMentions(networkId: number): readonly string[] {
 /** Lowercased channel names, most recently used first. */
 export function recentChannels(networkId: number): readonly string[] {
   return channels.get(networkId) ?? [];
+}
+
+export function rememberEmoji(emoji: string): void {
+  emojis = [emoji, ...emojis.filter((item) => item !== emoji)].slice(0, LIMIT);
+}
+
+/** Emoji characters, most recently picked first. */
+export function recentEmojis(): readonly string[] {
+  return emojis;
 }

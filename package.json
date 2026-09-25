@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.14.13",
+    "gemoji": "^8.1.0",
     "hono": "^4.8.0",
     "irc-framework": "^4.13.0",
     "react": "^19.1.0",

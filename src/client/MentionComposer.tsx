@@ -8,8 +8,11 @@ import type {
 } from '../shared/contracts';
 import { displayIdentity } from '../shared/identity';
 import { ApiError } from './api';
+import { emojiContext, loadEmoji, loadedEmoji, matchEmoji, type Emoji } from './emoji';
 import Icon from './Icon';
-import { recentChannels, recentMentions, rememberChannel, rememberMention, sessionStartedAt } from './sessionRecents';
+import {
+  recentChannels, recentEmojis, recentMentions, rememberChannel, rememberEmoji, rememberMention, sessionStartedAt,
+} from './sessionRecents';
 import { TYPING_INTERVAL_MS, typingText } from './typing';
 import { expiryLabels, formatBytes, postUpload, UploadCancelled } from './uploads';
 
@@ -50,11 +53,13 @@ type UploadProgress = { name: string; percent: number; queued: number };
 type MentionContext = { kind: 'mention'; start: number; end: number; query: string };
 type CommandContext = { kind: 'command'; end: number; query: string };
 type ChannelContext = { kind: 'channel'; start: number; end: number; query: string };
+type EmojiContext = { kind: 'emoji'; start: number; end: number; query: string };
 type ChannelSuggestion = Pick<ChannelListEntry, 'name'> & Partial<ChannelListEntry>;
 
 const CHANNEL_SUGGESTIONS = 20;
 /** Ranked mention options shown at once; large channels send their whole roster. */
 const MENTION_SUGGESTIONS = 50;
+const EMOJI_SUGGESTIONS = 20;
 
 /** Position in a most-recent-first list, or Infinity when absent, for ascending sorts. */
 function recency(list: readonly string[], key: string): number {
@@ -110,6 +115,12 @@ function channelContext(value: string, caret: number): ChannelContext | null {
   return { kind: 'channel', start, end, query: value.slice(start, caret) };
 }
 
+/** Checked after the others, so `/join` tokens stay channels and `@nick` stays a mention. */
+function emojiShortcodeContext(value: string, caret: number): EmojiContext | null {
+  const match = emojiContext(value, caret);
+  return match && { kind: 'emoji', ...match };
+}
+
 export default function MentionComposer({
   buffer, network, messages, ownNames, disabled, autocomplete, knownChannels, channelListUpdatedAt, sendTyping, typing,
   onSend, onError, uploads, uploadExpiry, onUploadExpiryChange, onUploadLimitsChanged, ref,
@@ -121,6 +132,7 @@ export default function MentionComposer({
   const [channels, setChannels] = useState<ChannelListEntry[]>([]);
   const [channelsLoading, setChannelsLoading] = useState(false);
   const [activeIndexState, setActiveIndex] = useState(0);
+  const [emojiList, setEmojiList] = useState<Emoji[] | null>(loadedEmoji);
   // Enter only accepts a channel suggestion after arrow navigation; otherwise it sends what was typed.
   const [navigated, setNavigated] = useState(false);
   const [dismissed, setDismissed] = useState(false);
@@ -144,10 +156,19 @@ export default function MentionComposer({
   // The queue outlives the render that started it; it reads the current limits and expiry from here.
   const uploadState = useRef({ upload, expiry, disabled, onUploadLimitsChanged });
   uploadState.current = { upload, expiry, disabled, onUploadLimitsChanged };
-  const context = mentionContext(value, caret) ?? commandContext(value, caret) ?? channelContext(value, caret);
-  const menuOpen = !!context && !dismissed && !disabled && autocomplete;
+  const context = mentionContext(value, caret) ?? commandContext(value, caret) ?? channelContext(value, caret)
+    ?? emojiShortcodeContext(value, caret);
+  const emojiQuery = context?.kind === 'emoji' ? context.query : '';
+  const emojiOptions = useMemo(
+    () => emojiList && emojiQuery ? matchEmoji(emojiList, emojiQuery, recentEmojis(), EMOJI_SUGGESTIONS) : [],
+    [emojiList, emojiQuery],
+  );
+  // A `:word` with no matching emoji is ordinary text, so its menu stays closed and Enter sends.
+  const menuOpen = !!context && !dismissed && !disabled && autocomplete
+    && !(context.kind === 'emoji' && emojiList && !emojiOptions.length);
   const mentionOpen = menuOpen && context.kind === 'mention';
   const channelOpen = menuOpen && context.kind === 'channel';
+  const emojiOpen = menuOpen && context.kind === 'emoji';
   const channelQuery = context?.kind === 'channel' ? context.query : '';
   const listId = `${context?.kind ?? 'mention'}-options-${buffer.id}`;
   const ownNamesKey = ownNames.join('\u0000').toLowerCase();
@@ -215,7 +236,8 @@ export default function MentionComposer({
     ] })).sort(byKeys((item) => item.keys)).slice(0, CHANNEL_SUGGESTIONS).map((item) => item.option);
   }, [channelOpen, channelQuery, channels, knownChannels, buffer.networkId]);
   const optionCount = context?.kind === 'mention' ? filtered.length
-    : context?.kind === 'channel' ? channelOptions.length : matchingCommands.length;
+    : context?.kind === 'channel' ? channelOptions.length
+    : context?.kind === 'emoji' ? emojiOptions.length : matchingCommands.length;
   const activeIndex = Math.min(activeIndexState, Math.max(optionCount - 1, 0));
   const activeOptionId = menuOpen && optionCount ? `${listId}-${activeIndex}` : undefined;
 
@@ -223,6 +245,21 @@ export default function MentionComposer({
   onErrorRef.current = onError;
 
   useImperativeHandle(ref, () => ({ upload: uploadFiles }));
+
+  useEffect(() => {
+    if (!emojiOpen || emojiList) return;
+    let current = true;
+    loadEmoji().then((list) => {
+      if (current) setEmojiList(list);
+    }).catch((error: unknown) => {
+      if (current) onErrorRef.current(error);
+    });
+    return () => { current = false; };
+  }, [emojiOpen, emojiList]);
+
+  useEffect(() => {
+    if (activeOptionId) document.getElementById(activeOptionId)?.scrollIntoView({ block: 'nearest' });
+  }, [activeOptionId]);
 
   useEffect(() => {
     function handleSlash() {
@@ -325,7 +362,7 @@ export default function MentionComposer({
   useEffect(() => {
     setActiveIndex(0);
     setNavigated(false);
-  }, [context?.kind, context?.query, context?.kind === 'mention' || context?.kind === 'channel' ? context.start : undefined]);
+  }, [context?.kind, context?.query, context && 'start' in context ? context.start : undefined]);
   useLayoutEffect(() => {
     const input = inputRef.current;
     if (input) {
@@ -415,6 +452,18 @@ export default function MentionComposer({
     inputRef.current?.focus();
   }
 
+  function chooseEmoji(emoji: Emoji) {
+    if (context?.kind !== 'emoji') return;
+    const insertion = `${emoji.emoji} `;
+    const next = value.slice(0, context.start) + insertion + value.slice(context.end);
+    const nextCaret = context.start + insertion.length;
+    rememberEmoji(emoji.emoji);
+    setValue(next);
+    setCaret(nextCaret);
+    pendingCaret.current = nextCaret;
+    setDismissed(true);
+    inputRef.current?.focus();
+  }
 
   /** Checks sizes, then queues the files; oversized ones are reported and skipped. */
   function uploadFiles(files: File[]) {
@@ -521,6 +570,10 @@ export default function MentionComposer({
       chooseCommand(matchingCommands[activeIndex]);
       return;
     }
+    if (menuOpen && context?.kind === 'emoji' && emojiOptions.length) {
+      chooseEmoji(emojiOptions[activeIndex]);
+      return;
+    }
     if (menuOpen && context?.kind === 'channel' && navigated && channelOptions.length) {
       chooseChannel(channelOptions[activeIndex]);
       return;
@@ -599,6 +652,7 @@ export default function MentionComposer({
       if (context?.kind === 'mention') choose(filtered[activeIndex]);
       else if (context?.kind === 'command') chooseCommand(matchingCommands[activeIndex]);
       else if (context?.kind === 'channel') chooseChannel(channelOptions[activeIndex]);
+      else if (context?.kind === 'emoji') chooseEmoji(emojiOptions[activeIndex]);
       return true;
     }
     return false;
@@ -646,8 +700,9 @@ export default function MentionComposer({
         id={listId}
         className="mention-menu"
         role="listbox"
-        aria-label={context.kind === 'command' ? 'Slash commands' : context.kind === 'channel' ? 'Channels' : 'Mention participants'}
-        aria-busy={(mentionOpen && loading) || (channelOpen && channelsLoading)}
+        aria-label={context.kind === 'command' ? 'Slash commands' : context.kind === 'channel' ? 'Channels'
+          : context.kind === 'emoji' ? 'Emoji' : 'Mention participants'}
+        aria-busy={(mentionOpen && loading) || (channelOpen && channelsLoading) || (emojiOpen && !emojiList)}
       >
         {context.kind === 'channel' ? <>
           {channelOptions.map((channel, index) => <li key={channel.name.toLowerCase()} role="presentation">
@@ -669,6 +724,22 @@ export default function MentionComposer({
           {!channelOptions.length && <li className="mention-option" role="option" aria-selected="false">
             {channelsLoading ? 'Loading channels…' : 'No matching channels'}
           </li>}
+        </> : context.kind === 'emoji' ? <>
+          {emojiOptions.map((emoji, index) => <li key={emoji.emoji} role="presentation">
+            <button
+              id={`${listId}-${index}`}
+              className="mention-option emoji-option"
+              type="button"
+              role="option"
+              aria-selected={index === activeIndex}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => chooseEmoji(emoji)}
+            >
+              <span className="emoji-option__glyph" aria-hidden="true">{emoji.emoji}</span>
+              <span>:{emoji.names.find((name) => name.includes(emojiQuery.toLowerCase())) ?? emoji.names[0]}:</span>
+            </button>
+          </li>)}
+          {!emojiList && <li className="mention-option" role="option" aria-selected="false">Loading emoji…</li>}
         </> : context.kind === 'mention' ? <>
           {filtered.map((candidate, index) => <li key={`${candidate.mention.toLocaleLowerCase()}-${index}`} role="presentation">
             <button
